@@ -198,7 +198,7 @@ impl TryFrom<RuleElement> for OptionalRule {
                 user: None,
                 ..
             }) => {
-                // see: https://github.com/dbus2/busd/pull/146#issuecomment-2408429760
+                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
                 Ok(None)
             }
             RuleElement::Allow(
@@ -211,12 +211,12 @@ impl TryFrom<RuleElement> for OptionalRule {
                     ..
                 },
             ) => {
-                // see: https://github.com/dbus2/busd/pull/146#issuecomment-2408429760
+                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
                 Ok(None)
             }
             RuleElement::Allow(attrs) => {
                 // if attrs.eavesdrop == Some(true) {
-                // see: https://github.com/dbus2/busd/pull/146#issuecomment-2408429760
+                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
                 // }
                 match OptionalOperation::try_from(attrs)? {
                     Some(some) => Ok(Some((Access::Allow, some))),
@@ -227,7 +227,7 @@ impl TryFrom<RuleElement> for OptionalRule {
                 eavesdrop: Some(true),
                 ..
             }) => {
-                // see: https://github.com/dbus2/busd/pull/146#issuecomment-2408429760
+                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
                 Ok(None)
             }
             RuleElement::Deny(
@@ -240,7 +240,7 @@ impl TryFrom<RuleElement> for OptionalRule {
                     ..
                 },
             ) => {
-                // see: https://github.com/dbus2/busd/pull/146#issuecomment-2408429760
+                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
                 Ok(None)
             }
             RuleElement::Deny(attrs) => match OptionalOperation::try_from(attrs)? {

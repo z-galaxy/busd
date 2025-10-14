@@ -7,7 +7,7 @@ edition = "2021"
 license = "MIT"
 readme = "README.md"
 rust-version = "1.74"
-repository = "https://github.com/dbus2/busd"
+repository = "https://github.com/z-galaxy/busd"
 keywords = ["D-Bus", "DBus", "IPC"]
 categories = ["network-programming"]
 exclude = ["LICENSE"]
@@ -22,7 +22,7 @@ path = "src/bin/busd.rs"
 
 [dependencies]
 #zbus = { version = "5.0", features = [
-zbus = { git = "https://github.com/dbus2/zbus/", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus/", features = [
     "tokio",
     "bus-impl",
 ], default-features = false }

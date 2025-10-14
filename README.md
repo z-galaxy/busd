@@ -1,6 +1,6 @@
 <img alt="Project logo: a bus" src="data/logo.svg" width="200">
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/dbus2/busd/ci.yml?branch=main)](https://github.com/dbus2/busd/actions?query=branch%3Amain)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/z-galaxy/busd/ci.yml?branch=main)](https://github.com/z-galaxy/busd/actions?query=branch%3Amain)
 [![crates.io](https://img.shields.io/crates/v/busd.svg)](https://crates.io/crates/busd)
 
 # busd
@@ -60,4 +60,4 @@ addition of [peer credentials] on every message, which can avoid round-trips on 
 [MIT](LICENSE-MIT)
 
 [specification]: https://dbus.freedesktop.org/doc/dbus-specification.html
-[peer credentials]: https://github.com/dbus2/busd/issues/29
+[peer credentials]: https://github.com/z-galaxy/busd/issues/29
