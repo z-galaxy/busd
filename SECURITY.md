@@ -74,7 +74,7 @@ We request that you:
 Published security advisories will be available through:
 
 - GitHub Security Advisories on the
-  [busd repository](https://github.com/dbus2/busd/security/advisories)
+  [busd repository](https://github.com/z-galaxy/busd/security/advisories)
 - [RustSec Advisory Database](https://rustsec.org/)
 - Release notes and changelog entries
 

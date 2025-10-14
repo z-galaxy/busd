@@ -82,7 +82,7 @@ async fn become_monitor_client(address: &str, tx: Sender<()>) -> anyhow::Result<
 
     // Now a client that calls a method that triggers a signal.
     let conn = connection::Builder::address(address)?.build().await?;
-    let name = "org.dbus2.MonitorTest";
+    let name = "org.z-galaxy.MonitorTest";
     DBusProxy::builder(&conn)
         .cache_properties(CacheProperties::No)
         .build()
