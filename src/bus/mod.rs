@@ -255,7 +255,7 @@ fn default_address() -> String {
         .unwrap_or_else(|| {
             Path::new("/run")
                 .join("user")
-                .join(format!("{}", nix::unistd::Uid::current()))
+                .join(format!("{}", rustix::process::getuid()))
         });
 
     format!("unix:dir={}", runtime_dir.display())

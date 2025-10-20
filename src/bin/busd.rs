@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     let address = if let Some(address) = args.address {
         Some(address)
     } else {
-        config.listen.map(|address| format!("{address}"))
+        config.listen.as_ref().map(ToString::to_string)
     };
 
     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
