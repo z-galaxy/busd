@@ -209,15 +209,16 @@ impl DBus {
     async fn get_connection_credentials(
         &self,
         bus_name: BusName<'_>,
-    ) -> Result<ConnectionCredentials> {
+    ) -> Result<Arc<ConnectionCredentials>> {
         let owner = self.get_name_owner(bus_name.clone()).await?;
         let peers = self.peers()?;
         let peers = peers.peers().await;
-        let peer = peers
+
+        let peer_info = peers
             .get(&owner)
             .ok_or_else(|| Error::Failed(format!("Peer `{bus_name}` not found")))?;
 
-        peer.conn().peer_credentials().await.map_err(|e| {
+        peer_info.conn().peer_creds().await.cloned().map_err(|e| {
             Error::Failed(format!(
                 "Failed to get peer credentials for `{bus_name}`: {e}"
             ))
@@ -233,7 +234,7 @@ impl DBus {
         self.get_connection_credentials(bus_name)
             .await
             .and_then(|c| {
-                c.into_linux_security_label().ok_or_else(|| {
+                c.linux_security_label().cloned().ok_or_else(|| {
                     Error::SELinuxSecurityContextUnknown("Unimplemented".to_string())
                 })
             })

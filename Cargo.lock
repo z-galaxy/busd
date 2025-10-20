@@ -773,9 +773,9 @@ checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.9.4"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
+checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "log"
@@ -855,7 +855,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
- "memoffset",
 ]
 
 [[package]]
@@ -1156,15 +1155,15 @@ checksum = "719b953e2095829ee67db738b3bfa9fa368c94900df327b3f07fe6e794d2fe1f"
 
 [[package]]
 name = "rustix"
-version = "1.0.7"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c71e83d6afe7ff64890ec6b71d6a69bb8a610ab78ce364b3352876bb4c801266"
+checksum = "cd15f8a2c5551a84d56efdc1cd049089e409ac19a3072d5037a17fd70719ff3e"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1805,8 +1804,8 @@ dependencies = [
 
 [[package]]
 name = "zbus"
-version = "5.11.0"
-source = "git+https://github.com/z-galaxy/zbus/#a00e93c314867a3370f6bc55cdedb8ac8ddde08b"
+version = "5.13.0"
+source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
 dependencies = [
  "async-broadcast",
  "async-recursion",
@@ -1816,8 +1815,9 @@ dependencies = [
  "futures-core",
  "futures-lite",
  "hex",
- "nix",
+ "libc",
  "ordered-stream",
+ "rustix",
  "serde",
  "serde_repr",
  "tokio",
@@ -1833,8 +1833,8 @@ dependencies = [
 
 [[package]]
 name = "zbus_macros"
-version = "5.11.0"
-source = "git+https://github.com/z-galaxy/zbus/#a00e93c314867a3370f6bc55cdedb8ac8ddde08b"
+version = "5.13.0"
+source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1848,7 +1848,7 @@ dependencies = [
 [[package]]
 name = "zbus_names"
 version = "4.2.0"
-source = "git+https://github.com/z-galaxy/zbus/#a00e93c314867a3370f6bc55cdedb8ac8ddde08b"
+source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
 dependencies = [
  "serde",
  "winnow",
@@ -1877,8 +1877,8 @@ dependencies = [
 
 [[package]]
 name = "zvariant"
-version = "5.7.0"
-source = "git+https://github.com/z-galaxy/zbus/#a00e93c314867a3370f6bc55cdedb8ac8ddde08b"
+version = "5.8.0"
+source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
 dependencies = [
  "endi",
  "enumflags2",
@@ -1890,8 +1890,8 @@ dependencies = [
 
 [[package]]
 name = "zvariant_derive"
-version = "5.7.0"
-source = "git+https://github.com/z-galaxy/zbus/#a00e93c314867a3370f6bc55cdedb8ac8ddde08b"
+version = "5.8.0"
+source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1903,7 +1903,7 @@ dependencies = [
 [[package]]
 name = "zvariant_utils"
 version = "3.2.1"
-source = "git+https://github.com/z-galaxy/zbus/#a00e93c314867a3370f6bc55cdedb8ac8ddde08b"
+source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
 dependencies = [
  "proc-macro2",
  "quote",
