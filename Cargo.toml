@@ -54,7 +54,6 @@ event-listener = "5.3.0"
 fastrand = "2.2.0"
 quick-xml = { version = "0.38.0", features = ["serialize"] }
 
-nix = { version = "0.30.0", features = ["user"] }
 rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 
 [features]
