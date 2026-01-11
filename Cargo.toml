@@ -52,7 +52,7 @@ console-subscriber = { version = "0.5.0", optional = true }
 xdg-home = "1.1.0"
 event-listener = "5.3.0"
 fastrand = "2.2.0"
-quick-xml = { version = "0.38.0", features = ["serialize"] }
+quick-xml = { version = "0.39.0", features = ["serialize"] }
 
 rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 
