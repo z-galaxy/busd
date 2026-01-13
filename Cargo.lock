@@ -1640,8 +1640,9 @@ dependencies = [
 
 [[package]]
 name = "zbus"
-version = "5.13.0"
-source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
+version = "5.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17f79257df967b6779afa536788657777a0001f5b42524fcaf5038d4344df40b"
 dependencies = [
  "async-broadcast",
  "async-recursion",
@@ -1669,8 +1670,9 @@ dependencies = [
 
 [[package]]
 name = "zbus_macros"
-version = "5.13.0"
-source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
+version = "5.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aad23e2d2f91cae771c7af7a630a49e755f1eb74f8a46e9f6d5f7a146edf5a37"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1683,8 +1685,9 @@ dependencies = [
 
 [[package]]
 name = "zbus_names"
-version = "4.2.0"
-source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
+version = "4.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffd8af6d5b78619bab301ff3c560a5bd22426150253db278f164d6cf3b72c50f"
 dependencies = [
  "serde",
  "winnow",
@@ -1713,8 +1716,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant"
-version = "5.8.0"
-source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
+version = "5.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "326aaed414f04fe839777b4c443d4e94c74e7b3621093bd9c5e649ac8aa96543"
 dependencies = [
  "endi",
  "enumflags2",
@@ -1726,8 +1730,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant_derive"
-version = "5.8.0"
-source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
+version = "5.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba44e1f8f4da9e6e2d25d2a60b116ef8b9d0be174a7685e55bb12a99866279a7"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1738,8 +1743,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant_utils"
-version = "3.2.1"
-source = "git+https://github.com/z-galaxy/zbus/#efa406b237c750ac878088da4cbe5685ffde5655"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f75c23a64ef8f40f13a6989991e643554d9bef1d682a281160cf0c1bc389c5e9"
 dependencies = [
  "proc-macro2",
  "quote",

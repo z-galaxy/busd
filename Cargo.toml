@@ -21,8 +21,7 @@ name = "busd"
 path = "src/bin/busd.rs"
 
 [dependencies]
-#zbus = { version = "5.0", features = [
-zbus = { git = "https://github.com/z-galaxy/zbus/", features = [
+zbus = { version = "5.0", features = [
     "tokio",
     "bus-impl",
 ], default-features = false }
