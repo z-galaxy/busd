@@ -34,13 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ⬆️ Update console-subscriber to 0.5.0 (#273).
 - ➖ Drop now redundant `nix` dep.
 - ➕ Use `rustix` instead of `nix`.
-- ⬆️  Update zbus dep.
+- ⬆️  Update zbus to 5.13.1.
 - ⬆️ Update enumflags2 to v0.7.12 (#232).
 - ⬆️ Update nix to 0.30.0 (#225).
 - ➕ Add the "quick-xml" crate.
 - ⬆️ Update fastrand to v2.3.0 (#180).
 - ➕ Add "fastrand" crate.
-- 📌 Switch to git main of zbus.
 - ➖ Drop hex dependency.
 - ➖ rand now a dev-dependency.
 
@@ -55,7 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 - 🤖 Automate releasing with release-plz.
-- 👽️ Update zbus to latest main & adapt.
 - 🚨 Make latest clippy happy.
 - 🔊 Make errors and warnings a little bit more descriptive.
 - 🚩 Drop `fs` feature of tokio.
