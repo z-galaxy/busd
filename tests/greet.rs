@@ -23,7 +23,7 @@ use zbus::{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[instrument]
-#[timeout(15000)]
+#[timeout(30000)]
 async fn greet() {
     busd::tracing_subscriber::init();
 

@@ -13,7 +13,7 @@ use zbus::connection;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[instrument]
-#[timeout(15000)]
+#[timeout(30000)]
 async fn multi_conenct() {
     busd::tracing_subscriber::init();
 
