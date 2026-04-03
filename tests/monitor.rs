@@ -19,7 +19,7 @@ use zbus::{
 async fn become_monitor() {
     busd::tracing_subscriber::init();
 
-    let address = "tcp:host=127.0.0.1,port=4242".to_string();
+    let address = "tcp:host=127.0.0.1,port=4244".to_string();
     let mut bus = Bus::for_address(Some(&address)).await.unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
