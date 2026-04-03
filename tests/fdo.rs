@@ -216,7 +216,7 @@ async fn name_ownership_changes_client(address: &str, tx: Sender<()>) -> anyhow:
 
     let mut unique_name_signaled = false;
     let mut well_known_name_signaled = false;
-    while !unique_name_signaled && !well_known_name_signaled {
+    while !unique_name_signaled || !well_known_name_signaled {
         let changed = name_changed_stream.next().await.unwrap();
         if *changed.args()?.name() == *conn2_unique_name {
             ensure!(
