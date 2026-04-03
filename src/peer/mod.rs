@@ -30,7 +30,7 @@ impl Peer {
         id: usize,
         socket: BoxedSplit,
         auth_mechanism: AuthMechanism,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Stream)> {
         let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
         let conn = connection::Builder::socket(socket)
             .server(guid)?
@@ -38,28 +38,37 @@ impl Peer {
             .auth_mechanism(auth_mechanism)
             .build()
             .await?;
-        trace!("created: {:?}", conn);
-
-        Ok(Self {
+        // Activate the message stream receiver immediately after building the connection.
+        // The socket reader task (spawned during build) may have already read pipelined
+        // messages (e.g. Hello sent after BEGIN). With `async_broadcast`'s
+        // `InactiveReceiver` and `set_await_active(false)`, any messages broadcast before
+        // activation are silently dropped.
+        let peer = Self {
             conn,
             unique_name,
             match_rules: MatchRules::default(),
             greeted: false,
             canceled_event: Event::new(),
-        })
+        };
+        let stream = Stream::for_peer(&peer);
+        trace!("created: {:?}", peer.conn);
+
+        Ok((peer, stream))
     }
 
     // This the the bus itself, serving the FDO D-Bus API.
-    pub async fn new_us(conn: Connection) -> Self {
+    pub async fn new_us(conn: Connection) -> (Self, Stream) {
         let unique_name = OwnedUniqueName::try_from(fdo::BUS_NAME).unwrap();
 
-        Self {
+        let peer = Self {
             conn,
             unique_name,
             match_rules: MatchRules::default(),
             greeted: true,
             canceled_event: Event::new(),
-        }
+        };
+        let stream = Stream::for_peer(&peer);
+        (peer, stream)
     }
 
     pub fn unique_name(&self) -> &OwnedUniqueName {
@@ -68,10 +77,6 @@ impl Peer {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    pub fn stream(&self) -> Stream {
-        Stream::for_peer(self)
     }
 
     pub fn listen_cancellation(&self) -> EventListener {
