@@ -21,7 +21,9 @@ name = "busd"
 path = "src/bin/busd.rs"
 
 [dependencies]
-zbus = { version = "5.0", features = [
+# TODO: Switch back to a crates-io version once zbus releases a version with
+# `Builder::build_message_stream`. See https://github.com/z-galaxy/zbus/pull/1760.
+zbus = { git = "https://github.com/z-galaxy/zbus", features = [
     "tokio",
     "bus-impl",
 ], default-features = false }
