@@ -52,7 +52,7 @@ impl Peers {
         auth_mechanism: AuthMechanism,
     ) -> Result<()> {
         let mut peers = self.peers_mut().await;
-        let peer = Peer::new(guid.clone(), id, socket, auth_mechanism).await?;
+        let (peer, peer_stream) = Peer::new(guid.clone(), id, socket, auth_mechanism).await?;
         let unique_name = peer.unique_name().clone();
         match peers.get(&unique_name) {
             Some(peer) => panic!(
@@ -60,7 +60,6 @@ impl Peers {
                 peer.unique_name()
             ),
             None => {
-                let peer_stream = peer.stream();
                 let listener = peer.listen_cancellation();
                 tokio::spawn(
                     self.clone()
@@ -73,9 +72,9 @@ impl Peers {
         Ok(())
     }
 
-    pub async fn add_us(self: &Arc<Self>, conn: zbus::Connection) {
+    pub async fn add_us(self: &Arc<Self>, msg_stream: zbus::MessageStream) {
         let mut peers = self.peers_mut().await;
-        let peer = Peer::new_us(conn).await;
+        let (peer, peer_stream) = Peer::new_us(msg_stream).await;
         let unique_name = peer.unique_name().clone();
         match peers.get(&unique_name) {
             Some(peer) => panic!(
@@ -83,7 +82,6 @@ impl Peers {
                 peer.unique_name()
             ),
             None => {
-                let peer_stream = peer.stream();
                 let listener = peer.listen_cancellation();
                 tokio::spawn(
                     self.clone()

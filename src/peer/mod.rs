@@ -9,7 +9,7 @@ use tracing::trace;
 use zbus::{
     connection::{self, socket::BoxedSplit},
     names::{BusName, OwnedUniqueName},
-    AuthMechanism, Connection, OwnedGuid, OwnedMatchRule,
+    AuthMechanism, Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
 
 use crate::{fdo, match_rules::MatchRules, name_registry::NameRegistry};
@@ -30,36 +30,46 @@ impl Peer {
         id: usize,
         socket: BoxedSplit,
         auth_mechanism: AuthMechanism,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Stream)> {
         let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
-        let conn = connection::Builder::socket(socket)
+        // Use `build_message_stream` to activate a message receiver before the socket reader
+        // task is spawned, so that messages the client pipelines right after authentication
+        // (notably `Hello`) are never dropped in the race window between `build()` and stream
+        // creation. See https://github.com/z-galaxy/zbus/pull/1760.
+        let msg_stream = connection::Builder::socket(socket)
             .server(guid)?
             .p2p()
             .auth_mechanism(auth_mechanism)
-            .build()
+            .build_message_stream()
             .await?;
+        let conn = Connection::from(&msg_stream);
         trace!("created: {:?}", conn);
 
-        Ok(Self {
+        let peer = Self {
             conn,
             unique_name,
             match_rules: MatchRules::default(),
             greeted: false,
             canceled_event: Event::new(),
-        })
+        };
+        let stream = Stream::for_peer(&peer, msg_stream);
+        Ok((peer, stream))
     }
 
     // This the the bus itself, serving the FDO D-Bus API.
-    pub async fn new_us(conn: Connection) -> Self {
+    pub async fn new_us(msg_stream: MessageStream) -> (Self, Stream) {
         let unique_name = OwnedUniqueName::try_from(fdo::BUS_NAME).unwrap();
+        let conn = Connection::from(&msg_stream);
 
-        Self {
+        let peer = Self {
             conn,
             unique_name,
             match_rules: MatchRules::default(),
             greeted: true,
             canceled_event: Event::new(),
-        }
+        };
+        let stream = Stream::for_peer(&peer, msg_stream);
+        (peer, stream)
     }
 
     pub fn unique_name(&self) -> &OwnedUniqueName {
@@ -68,10 +78,6 @@ impl Peer {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    pub fn stream(&self) -> Stream {
-        Stream::for_peer(self)
     }
 
     pub fn listen_cancellation(&self) -> EventListener {
