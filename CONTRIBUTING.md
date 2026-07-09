@@ -40,6 +40,14 @@ Same rules apply here as for bug reports and feature requests. Plus:
   [`git-revise`](https://github.com/mystor/git-revise) extremely useful, especially if you're not
   very familiar with interactive rebasing and modifying commits in git.
 
+### Code layout
+
+Within a module, order items top-down, [as rustls does](https://github.com/rustls/rustls/blob/main/CONTRIBUTING.md#top-down-ordering-within-modules):
+items depend on items defined *below* them, not above. In practice: the
+public API sits near the top of the file, private helpers below the code
+that calls them, simple `const`s below their users, and `#[cfg(test)] mod
+tests` at the very bottom.
+
 ### Legal Notice
 
 When contributing to this project, you **implicitly** declare that:
