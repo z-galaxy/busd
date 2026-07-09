@@ -51,16 +51,20 @@ impl Peers {
         socket: BoxedSplit,
         auth_mechanism: AuthMechanism,
     ) -> Result<()> {
-        let mut peers = self.peers_mut().await;
+        // Perform the connection build and SASL handshake without holding the peers lock, as it
+        // involves async I/O and would otherwise block all other peer operations (Hello
+        // handling, etc.).
         let (peer, peer_stream) = Peer::new(guid.clone(), id, socket, auth_mechanism).await?;
         let unique_name = peer.unique_name().clone();
+        let listener = peer.listen_cancellation();
+
+        let mut peers = self.peers_mut().await;
         match peers.get(&unique_name) {
             Some(peer) => panic!(
                 "Unique name `{}` re-used. We're in deep trouble if this happens",
                 peer.unique_name()
             ),
             None => {
-                let listener = peer.listen_cancellation();
                 tokio::spawn(
                     self.clone()
                         .serve_peer(peer_stream, listener, unique_name.clone()),
@@ -73,16 +77,17 @@ impl Peers {
     }
 
     pub async fn add_us(self: &Arc<Self>, msg_stream: zbus::MessageStream) {
-        let mut peers = self.peers_mut().await;
         let (peer, peer_stream) = Peer::new_us(msg_stream).await;
         let unique_name = peer.unique_name().clone();
+        let listener = peer.listen_cancellation();
+
+        let mut peers = self.peers_mut().await;
         match peers.get(&unique_name) {
             Some(peer) => panic!(
                 "Unique name `{}` re-used. We're in deep trouble if this happens",
                 peer.unique_name()
             ),
             None => {
-                let listener = peer.listen_cancellation();
                 tokio::spawn(
                     self.clone()
                         .serve_peer(peer_stream, listener, unique_name.clone()),

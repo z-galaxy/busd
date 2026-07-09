@@ -133,7 +133,7 @@ impl Document {
                         Err(err) => {
                             let msg = format!(
                                 "cannot resolve '<include>{}</include>' to an absolute path: {}",
-                                &file_path.display(),
+                                file_path.display(),
                                 err
                             );
                             if ignore_missing {
