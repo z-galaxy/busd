@@ -4,7 +4,7 @@ use busd::config::{
     Access, BusType, Config, ConnectOperation, MessageType, Name, NameOwnership, Operation, Policy,
     ReceiveOperation, SendOperation,
 };
-use zbus::{Address, AuthMechanism};
+use zbus::{connection::AuthMechanism, Address};
 
 #[test]
 fn config_read_file_with_includes_ok() {

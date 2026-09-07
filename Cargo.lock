@@ -836,11 +836,11 @@ dependencies = [
 
 [[package]]
 name = "nu-ansi-term"
-version = "0.50.1"
+version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4a28e057d01f97e61255210fcff094d74ed0466038633e95017f5beb68e4399"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1035,7 +1035,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1840,12 +1840,13 @@ dependencies = [
 
 [[package]]
 name = "zbus"
-version = "5.14.0"
-source = "git+https://github.com/z-galaxy/zbus#c127e4d88ce8519394ed7d509d33771724d43945"
+version = "6.0.0"
+source = "git+https://github.com/z-galaxy/zbus?rev=72c72193355dfed210f16990bd495b1b671a1968#72c72193355dfed210f16990bd495b1b671a1968"
 dependencies = [
  "async-broadcast",
  "async-recursion",
  "async-trait",
+ "endi",
  "enumflags2",
  "event-listener",
  "futures-core",
@@ -1863,67 +1864,38 @@ dependencies = [
  "windows-sys 0.61.2",
  "winnow 1.0.1",
  "zbus_macros",
- "zbus_names",
- "zvariant",
+ "zbus_utils",
+ "zcheapstr",
 ]
 
 [[package]]
 name = "zbus_macros"
-version = "5.14.0"
-source = "git+https://github.com/z-galaxy/zbus#c127e4d88ce8519394ed7d509d33771724d43945"
+version = "6.0.0"
+source = "git+https://github.com/z-galaxy/zbus?rev=72c72193355dfed210f16990bd495b1b671a1968#72c72193355dfed210f16990bd495b1b671a1968"
 dependencies = [
- "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
- "zbus_names",
- "zvariant",
- "zvariant_utils",
+ "syn 3.0.0",
+ "zbus_utils",
 ]
 
 [[package]]
-name = "zbus_names"
-version = "4.3.1"
-source = "git+https://github.com/z-galaxy/zbus#c127e4d88ce8519394ed7d509d33771724d43945"
-dependencies = [
- "serde",
- "winnow 1.0.1",
- "zvariant",
-]
-
-[[package]]
-name = "zvariant"
-version = "5.10.0"
-source = "git+https://github.com/z-galaxy/zbus#c127e4d88ce8519394ed7d509d33771724d43945"
-dependencies = [
- "endi",
- "enumflags2",
- "serde",
- "winnow 1.0.1",
- "zvariant_derive",
- "zvariant_utils",
-]
-
-[[package]]
-name = "zvariant_derive"
-version = "5.10.0"
-source = "git+https://github.com/z-galaxy/zbus#c127e4d88ce8519394ed7d509d33771724d43945"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
- "zvariant_utils",
-]
-
-[[package]]
-name = "zvariant_utils"
-version = "3.3.0"
-source = "git+https://github.com/z-galaxy/zbus#c127e4d88ce8519394ed7d509d33771724d43945"
+name = "zbus_utils"
+version = "6.0.0"
+source = "git+https://github.com/z-galaxy/zbus?rev=72c72193355dfed210f16990bd495b1b671a1968#72c72193355dfed210f16990bd495b1b671a1968"
 dependencies = [
  "proc-macro2",
  "quote",
  "serde",
- "syn 2.0.117",
+ "syn 3.0.0",
  "winnow 1.0.1",
+]
+
+[[package]]
+name = "zcheapstr"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1afec51604565183aeb5c54c20aeab286120d4e4460f7f76e3e8bb8c0d99473"
+dependencies = [
+ "serde",
 ]

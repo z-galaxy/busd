@@ -1,8 +1,8 @@
 use std::pin::Pin;
 
+use crate::trace;
 use anyhow::{bail, Error, Result};
 use futures_util::{Stream as FutureStream, TryStream, TryStreamExt};
-use tracing::trace;
 use zbus::{message, Message, MessageStream};
 
 use crate::peer::Peer;
@@ -45,7 +45,7 @@ impl Stream {
                             .fds()
                             .iter()
                             .map(|fd| fd.try_clone().map(Into::into))
-                            .collect::<zbus::zvariant::Result<Vec<_>>>()?;
+                            .collect::<zbus::Result<Vec<_>>>()?;
                         let builder =
                             message::Builder::from(header.clone()).sender(&unique_name)?;
                         let new_msg =

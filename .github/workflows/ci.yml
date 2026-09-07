@@ -66,3 +66,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check common mistakes
         run: cargo --locked clippy --all -- -D warnings
+      - name: Check common mistakes (no default features)
+        run: cargo --locked clippy --all --no-default-features -- -D warnings

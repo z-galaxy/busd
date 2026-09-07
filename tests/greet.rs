@@ -17,8 +17,7 @@ use zbus::{
     object_server::SignalEmitter,
     proxy,
     proxy::CacheProperties,
-    zvariant::ObjectPath,
-    AsyncDrop, Connection, MatchRule, MessageStream,
+    AsyncDrop, Connection, MatchRule, MessageStream, ObjectPath,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

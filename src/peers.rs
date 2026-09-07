@@ -1,3 +1,4 @@
+use crate::{debug, trace, warn};
 use anyhow::{bail, Context, Result};
 use event_listener::EventListener;
 use futures_util::{
@@ -10,13 +11,11 @@ use std::{
     sync::Arc,
 };
 use tokio::{spawn, sync::RwLock};
-use tracing::{debug, trace, warn};
 use zbus::{
-    connection::socket::BoxedSplit,
+    connection::{socket::BoxedSplit, AuthMechanism},
     message,
     names::{BusName, OwnedUniqueName, UniqueName},
-    zvariant::Optional,
-    AuthMechanism, Message, OwnedGuid,
+    Message, Optional, OwnedGuid,
 };
 
 use crate::{

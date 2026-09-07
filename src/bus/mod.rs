@@ -1,14 +1,14 @@
+use crate::{debug, info, trace, warn};
 use anyhow::{bail, Ok, Result};
 use std::{env, path::Path, str::FromStr, sync::Arc};
 use tokio::{fs::remove_file, spawn};
-use tracing::{debug, info, trace, warn};
 use zbus::{
     address::{
         transport::{Tcp, Unix, UnixSocket},
         Transport,
     },
-    connection::{self, socket::BoxedSplit},
-    Address, AuthMechanism, Connection, Guid, OwnedGuid,
+    connection::{self, socket::BoxedSplit, AuthMechanism},
+    Address, Connection, Guid, OwnedGuid,
 };
 
 use crate::{

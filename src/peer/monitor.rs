@@ -1,7 +1,7 @@
 use std::future::Future;
 
+use crate::warn;
 use futures_util::StreamExt;
-use tracing::warn;
 use zbus::{
     names::{BusName, OwnedUniqueName},
     Connection, MessageStream,

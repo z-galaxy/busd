@@ -23,24 +23,23 @@ path = "src/bin/busd.rs"
 [dependencies]
 # TODO: Switch back to a crates-io version once zbus releases a version with
 # `Builder::build_message_stream`. See https://github.com/z-galaxy/zbus/pull/1760.
-zbus = { git = "https://github.com/z-galaxy/zbus", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "72c72193355dfed210f16990bd495b1b671a1968", features = [
     "tokio",
     "bus-impl",
+    "service",
 ], default-features = false }
 tokio = { version = "1.37.0", features = [
     "macros",
     "rt-multi-thread",
     "signal",
-    "tracing",
 ] }
 clap = { version = "4.5.4", features = [
     "derive",
     "std",
     "help",
 ], default-features = false }
-tracing = "0.1.40"
+tracing = { version = "0.1.40", optional = true }
 tracing-subscriber = { version = "0.3.18", features = [
-    "env-filter",
     "fmt",
     "ansi",
 ], default-features = false, optional = true }
@@ -59,11 +58,19 @@ rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 
 [features]
 default = ["tracing-subscriber"]
+tracing = ["dep:tracing", "zbus/tracing", "tokio/tracing"]
+tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
+console-subscriber = ["tracing", "dep:console-subscriber"]
 
 [dev-dependencies]
+# The tests drive the bus through proxies, which the binary itself does not need.
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "72c72193355dfed210f16990bd495b1b671a1968", features = [
+    "proxy",
+], default-features = false }
 ntest = "0.9.2"
 rand = "0.10.0"
 futures-util = { version = "0.3.30", default-features = true }
+tracing = "0.1.40"
 
 [profile.release]
 lto = "fat"

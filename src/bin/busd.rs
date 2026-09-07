@@ -2,12 +2,11 @@ extern crate busd;
 
 use std::{fs::File, io::Write, os::fd::FromRawFd, path::PathBuf};
 
-use busd::{bus, config::Config};
+use busd::{bus, config::Config, error, info, warn};
 
 use anyhow::Result;
 use clap::Parser;
 use tokio::{select, signal::unix::SignalKind};
-use tracing::{error, info, warn};
 
 /// A simple D-Bus broker.
 #[derive(Parser, Debug)]
