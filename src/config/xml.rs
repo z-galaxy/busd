@@ -6,9 +6,9 @@ use std::{
     str::FromStr,
 };
 
+use crate::{error, warn};
 use anyhow::{Error, Result};
 use serde::Deserialize;
-use tracing::{error, warn};
 
 use super::{BusType, MessageType};
 
@@ -131,31 +131,30 @@ impl Document {
                     let file_path = match file_path.canonicalize().map_err(Error::msg) {
                         Ok(ok) => ok,
                         Err(err) => {
-                            let msg = format!(
+                            if ignore_missing {
+                                warn!(
+                                    "cannot resolve '<include>{}</include>' to an absolute path: {}",
+                                    file_path.display(),
+                                    err
+                                );
+                                continue;
+                            }
+                            error!(
                                 "cannot resolve '<include>{}</include>' to an absolute path: {}",
                                 file_path.display(),
                                 err
                             );
-                            if ignore_missing {
-                                warn!(msg);
-                                continue;
-                            }
-                            error!(msg);
                             return Err(err);
                         }
                     };
                     let mut included = match Document::read_file(&file_path) {
                         Ok(ok) => ok,
                         Err(err) => {
-                            let msg = format!(
-                                "'{}' should contain valid XML",
-                                include.file_path.display()
-                            );
                             if ignore_missing {
-                                warn!(msg);
+                                warn!("'{}' should contain valid XML", include.file_path.display());
                                 continue;
                             }
-                            error!(msg);
+                            error!("'{}' should contain valid XML", include.file_path.display());
                             return Err(err);
                         }
                     };

@@ -17,8 +17,7 @@ use zbus::{
     object_server::SignalEmitter,
     proxy,
     proxy::CacheProperties,
-    zvariant::ObjectPath,
-    AsyncDrop, Connection, MatchRule, MessageStream,
+    AsyncDrop, Connection, MatchRule, MessageStream, ObjectPath,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -105,9 +104,9 @@ async fn greet_service(socket_addr: &str) -> anyhow::Result<Connection> {
     }
 
     let greeter = Greeter { count: 0 };
-    connection::Builder::address(socket_addr)?
-        .name("org.zbus.MyGreeter")?
-        .serve_at("/org/zbus/MyGreeter", greeter)?
+    connection::Builder::address(socket_addr)
+        .name("org.zbus.MyGreeter")
+        .serve_at("/org/zbus/MyGreeter", greeter)
         .build()
         .await
         .map_err(Into::into)
@@ -126,10 +125,10 @@ async fn greet_client(socket_addr: &str) -> anyhow::Result<()> {
         async fn greeted(name: &str, count: u64, path: ObjectPath<'_>);
     }
 
-    let conn = connection::Builder::address(socket_addr)?.build().await?;
+    let conn = connection::Builder::address(socket_addr).build().await?;
 
     let proxy = MyGreeterProxy::builder(&conn)
-        .destination("org.zbus.MyGreeter")?
+        .destination("org.zbus.MyGreeter")
         .cache_properties(CacheProperties::No)
         .build()
         .await?;
@@ -167,11 +166,11 @@ async fn greet_client(socket_addr: &str) -> anyhow::Result<()> {
 
     // Now let's try a manual subscription.
     let match_rule = MatchRule::builder()
-        .interface("org.zbus.MyGreeter1")?
-        .member("Greeted")?
-        .add_arg("Maria")?
-        .arg_path(2, "/org/zbus/MyGreeter")?
-        .build();
+        .interface("org.zbus.MyGreeter1")
+        .member("Greeted")
+        .add_arg("Maria")
+        .arg_path(2, "/org/zbus/MyGreeter")
+        .build()?;
     DBusProxy::new(&conn)
         .await?
         .add_match_rule(match_rule)

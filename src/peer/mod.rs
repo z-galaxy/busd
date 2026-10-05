@@ -4,12 +4,12 @@ pub use stream::*;
 mod monitor;
 pub use monitor::*;
 
+use crate::trace;
 use anyhow::Result;
-use tracing::trace;
 use zbus::{
-    connection::{self, socket::BoxedSplit},
+    connection::{self, AuthMechanism},
     names::{BusName, OwnedUniqueName},
-    AuthMechanism, Connection, MessageStream, OwnedGuid, OwnedMatchRule,
+    Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
 
 use crate::{fdo, match_rules::MatchRules, name_registry::NameRegistry};
@@ -28,7 +28,7 @@ impl Peer {
     pub async fn new(
         guid: OwnedGuid,
         id: usize,
-        socket: BoxedSplit,
+        builder: connection::Builder<'_>,
         auth_mechanism: AuthMechanism,
     ) -> Result<(Self, Stream)> {
         let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
@@ -36,8 +36,8 @@ impl Peer {
         // task is spawned, so that messages the client pipelines right after authentication
         // (notably `Hello`) are never dropped in the race window between `build()` and stream
         // creation. See https://github.com/z-galaxy/zbus/pull/1760.
-        let msg_stream = connection::Builder::socket(socket)
-            .server(guid)?
+        let msg_stream = builder
+            .server(guid)
             .p2p()
             .auth_mechanism(auth_mechanism)
             .build_message_stream()

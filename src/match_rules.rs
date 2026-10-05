@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use serde::Deserialize;
-use zbus::{names::BusName, zvariant::Type, OwnedMatchRule};
+use zbus::{names::BusName, OwnedMatchRule, Type};
 
 use crate::name_registry::NameRegistry;
 
@@ -24,7 +24,7 @@ impl MatchRules {
                 Ok(false) => return false,
                 Ok(true) => (),
                 Err(e) => {
-                    tracing::warn!("error matching rule: {}", e);
+                    crate::warn!("error matching rule: {}", e);
 
                     return false;
                 }

@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Error, Result};
 use policy::OptionalPolicy;
 use serde::Deserialize;
-use zbus::{Address, AuthMechanism};
+use zbus::{conn::AuthMechanism, Address};
 
 pub mod policy;
 pub mod rule;

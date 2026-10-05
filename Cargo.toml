@@ -6,7 +6,7 @@ description = "A D-Bus bus (broker) implementation"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
-rust-version = "1.74"
+rust-version = "1.89"
 repository = "https://github.com/z-galaxy/busd"
 keywords = ["D-Bus", "DBus", "IPC"]
 categories = ["network-programming"]
@@ -21,26 +21,25 @@ name = "busd"
 path = "src/bin/busd.rs"
 
 [dependencies]
-# TODO: Switch back to a crates-io version once zbus releases a version with
-# `Builder::build_message_stream`. See https://github.com/z-galaxy/zbus/pull/1760.
-zbus = { git = "https://github.com/z-galaxy/zbus", features = [
+# TODO: Switch back to a crates-io version once zbus 6.0 is released. Until then, depend on a
+# pinned revision of zbus's git main branch, where the 6.0 API is being developed.
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "47dd4d10a1e775564f861d03a17fa736550c0592", features = [
     "tokio",
     "bus-impl",
+    "service",
 ], default-features = false }
 tokio = { version = "1.37.0", features = [
     "macros",
     "rt-multi-thread",
     "signal",
-    "tracing",
 ] }
 clap = { version = "4.5.4", features = [
     "derive",
     "std",
     "help",
 ], default-features = false }
-tracing = "0.1.40"
+tracing = { version = "0.1.40", optional = true }
 tracing-subscriber = { version = "0.3.18", features = [
-    "env-filter",
     "fmt",
     "ansi",
 ], default-features = false, optional = true }
@@ -48,7 +47,6 @@ anyhow = "1.0.82"
 # Explicitly depend on serde to enable `rc` feature.
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false }
-enumflags2 = "0.7.9"
 console-subscriber = { version = "0.5.0", optional = true }
 xdg-home = "1.1.0"
 event-listener = "5.3.0"
@@ -59,11 +57,19 @@ rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 
 [features]
 default = ["tracing-subscriber"]
+tracing = ["dep:tracing", "zbus/tracing", "tokio/tracing"]
+tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
+console-subscriber = ["tracing", "dep:console-subscriber"]
 
 [dev-dependencies]
+# The tests drive the bus through proxies, which the binary itself does not need.
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "47dd4d10a1e775564f861d03a17fa736550c0592", features = [
+    "proxy",
+], default-features = false }
 ntest = "0.10.0"
 rand = "0.10.0"
 futures-util = { version = "0.3.30", default-features = true }
+tracing = "0.1.40"
 
 [profile.release]
 lto = "fat"
