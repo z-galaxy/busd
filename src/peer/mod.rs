@@ -4,8 +4,8 @@ pub use stream::*;
 mod monitor;
 pub use monitor::*;
 
+use crate::trace;
 use anyhow::Result;
-use tracing::trace;
 use zbus::{
     connection::{self, AuthMechanism},
     names::{BusName, OwnedUniqueName},

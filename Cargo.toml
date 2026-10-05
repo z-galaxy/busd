@@ -27,20 +27,18 @@ zbus = { git = "https://github.com/z-galaxy/zbus", rev = "47dd4d10a1e775564f861d
     "tokio",
     "bus-impl",
     "service",
-    "tracing",
 ], default-features = false }
 tokio = { version = "1.37.0", features = [
     "macros",
     "rt-multi-thread",
     "signal",
-    "tracing",
 ] }
 clap = { version = "4.5.4", features = [
     "derive",
     "std",
     "help",
 ], default-features = false }
-tracing = "0.1.40"
+tracing = { version = "0.1.40", optional = true }
 tracing-subscriber = { version = "0.3.18", features = [
     "env-filter",
     "fmt",
@@ -60,6 +58,9 @@ rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 
 [features]
 default = ["tracing-subscriber"]
+tracing = ["dep:tracing", "zbus/tracing", "tokio/tracing"]
+tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
+console-subscriber = ["tracing", "dep:console-subscriber"]
 
 [dev-dependencies]
 # The tests drive the bus through proxies, which the binary itself does not need.
@@ -69,6 +70,7 @@ zbus = { git = "https://github.com/z-galaxy/zbus", rev = "47dd4d10a1e775564f861d
 ntest = "0.10.0"
 rand = "0.10.0"
 futures-util = { version = "0.3.30", default-features = true }
+tracing = "0.1.40"
 
 [profile.release]
 lto = "fat"

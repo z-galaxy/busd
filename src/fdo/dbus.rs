@@ -3,8 +3,8 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use crate::warn;
 use tokio::spawn;
-use tracing::warn;
 use zbus::{
     fdo::{
         ConnectionCredentials, Error, ReleaseNameReply, RequestNameFlags, RequestNameReply, Result,

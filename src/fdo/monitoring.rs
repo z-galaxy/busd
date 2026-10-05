@@ -1,7 +1,7 @@
 use std::sync::{Arc, Weak};
 
+use crate::{debug, warn};
 use tokio::spawn;
-use tracing::{debug, warn};
 use zbus::{
     fdo::{Error, Result},
     interface, message,

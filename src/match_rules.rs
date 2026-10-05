@@ -24,7 +24,7 @@ impl MatchRules {
                 Ok(false) => return false,
                 Ok(true) => (),
                 Err(e) => {
-                    tracing::warn!("error matching rule: {}", e);
+                    crate::warn!("error matching rule: {}", e);
 
                     return false;
                 }
