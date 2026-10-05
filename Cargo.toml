@@ -40,7 +40,6 @@ clap = { version = "4.5.4", features = [
 ], default-features = false }
 tracing = { version = "0.1.40", optional = true }
 tracing-subscriber = { version = "0.3.18", features = [
-    "env-filter",
     "fmt",
     "ansi",
 ], default-features = false, optional = true }
