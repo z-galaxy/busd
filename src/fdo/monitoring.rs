@@ -6,7 +6,7 @@ use zbus::{
     fdo::{Error, Result},
     interface, message,
     object_server::{ResponseDispatchNotifier, SignalEmitter},
-    zvariant::Optional,
+    Optional,
 };
 
 use super::msg_sender;

@@ -55,7 +55,7 @@ async fn multi_conenct_(socket_addr: &str) {
 async fn multi_clients_connect(socket_addr: &str) -> anyhow::Result<()> {
     // Create 10 connections simultaneously.
     let conns: Vec<_> = (0..10)
-        .map(|_| connection::Builder::address(socket_addr).unwrap().build())
+        .map(|_| connection::Builder::address(socket_addr).build())
         .collect();
     join_all(conns).await;
 

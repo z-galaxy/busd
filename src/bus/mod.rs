@@ -7,8 +7,8 @@ use zbus::{
         transport::{Tcp, Unix, UnixSocket},
         Transport,
     },
-    connection::{self, socket::BoxedSplit},
-    Address, AuthMechanism, Connection, Guid, OwnedGuid,
+    connection::{self, AuthMechanism},
+    Address, Connection, Guid, OwnedGuid,
 };
 
 use crate::{
@@ -83,15 +83,15 @@ impl Bus {
         // Create a peer for ourselves.
         trace!("Creating self-dial connection.");
         let (client_socket, peer_socket) = zbus::connection::socket::Channel::pair();
-        let service_conn = connection::Builder::authenticated_socket(client_socket, guid.clone())?
+        let service_conn = connection::Builder::authenticated_socket(client_socket, guid.clone())
             .p2p()
-            .unique_name(fdo::BUS_NAME)?
-            .name(fdo::BUS_NAME)?
-            .serve_at(fdo::DBus::PATH, dbus)?
-            .serve_at(fdo::Monitoring::PATH, monitoring)?
+            .unique_name(fdo::BUS_NAME)
+            .name(fdo::BUS_NAME)
+            .serve_at(fdo::DBus::PATH, dbus)
+            .serve_at(fdo::Monitoring::PATH, monitoring)
             .build()
             .await?;
-        let peer_stream = connection::Builder::authenticated_socket(peer_socket, guid.clone())?
+        let peer_stream = connection::Builder::authenticated_socket(peer_socket, guid.clone())
             .p2p()
             .build_message_stream()
             .await?;
@@ -205,12 +205,16 @@ impl Bus {
         let id = self.next_id();
         let inner = self.inner.clone();
         spawn(async move {
-            if let Err(e) = inner
-                .peers
-                .clone()
-                .add(&inner.guid, id, socket, inner.auth_mechanism)
-                .await
-            {
+            let add_peer = async {
+                let builder = socket.into_builder()?;
+
+                inner
+                    .peers
+                    .clone()
+                    .add(&inner.guid, id, builder, inner.auth_mechanism)
+                    .await
+            };
+            if let Err(e) = add_peer.await {
                 warn!("Failed to establish connection: {}", e);
             }
         });
@@ -218,14 +222,22 @@ impl Bus {
         Ok(())
     }
 
-    async fn accept(&mut self) -> Result<BoxedSplit> {
-        let stream = match &mut self.listener {
-            Listener::Unix(listener) => listener.accept().await.map(|(stream, _)| stream.into())?,
-            Listener::Tcp(listener) => listener.accept().await.map(|(stream, _)| stream.into())?,
+    async fn accept(&mut self) -> Result<AcceptedSocket> {
+        let socket = match &mut self.listener {
+            Listener::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+
+                AcceptedSocket::Unix(stream)
+            }
+            Listener::Tcp(listener) => {
+                let (stream, _) = listener.accept().await?;
+
+                AcceptedSocket::Tcp(stream)
+            }
         };
         debug!("Accepted connection on address `{}`", self.inner.address);
 
-        Ok(stream)
+        Ok(socket)
     }
 
     pub fn peers(&self) -> &Arc<Peers> {
@@ -244,6 +256,31 @@ impl Bus {
         self.inner.next_id += 1;
 
         self.inner.next_id
+    }
+}
+
+/// A socket accepted by the bus's listener, not yet handed over to zbus.
+#[derive(Debug)]
+enum AcceptedSocket {
+    Unix(tokio::net::UnixStream),
+    Tcp(tokio::net::TcpStream),
+}
+
+impl AcceptedSocket {
+    /// Create a builder for a connection over this socket.
+    ///
+    /// zbus is given the standard library stream that the Tokio one wraps, and the connection
+    /// then drives it on the runtime it is built on (Tokio, in our case). Taking the stream out of
+    /// Tokio's hands can fail, so call this from the task that sets up the connection, where an
+    /// error costs only this connection, and not from the accept loop, where it would stop the
+    /// bus.
+    fn into_builder(self) -> Result<connection::Builder<'static>> {
+        let builder = match self {
+            AcceptedSocket::Unix(stream) => connection::Builder::unix_stream(stream.into_std()?),
+            AcceptedSocket::Tcp(stream) => connection::Builder::tcp_stream(stream.into_std()?),
+        };
+
+        Ok(builder)
     }
 }
 

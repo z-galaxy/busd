@@ -12,11 +12,10 @@ use std::{
 use tokio::{spawn, sync::RwLock};
 use tracing::{debug, trace, warn};
 use zbus::{
-    connection::socket::BoxedSplit,
+    connection::{self, AuthMechanism},
     message,
     names::{BusName, OwnedUniqueName, UniqueName},
-    zvariant::Optional,
-    AuthMechanism, Message, OwnedGuid,
+    Message, Optional, OwnedGuid,
 };
 
 use crate::{
@@ -48,13 +47,13 @@ impl Peers {
         self: &Arc<Self>,
         guid: &OwnedGuid,
         id: usize,
-        socket: BoxedSplit,
+        builder: connection::Builder<'_>,
         auth_mechanism: AuthMechanism,
     ) -> Result<()> {
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
-        let (peer, peer_stream) = Peer::new(guid.clone(), id, socket, auth_mechanism).await?;
+        let (peer, peer_stream) = Peer::new(guid.clone(), id, builder, auth_mechanism).await?;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
 
@@ -154,9 +153,7 @@ impl Peers {
 
         // First broadcast the name change signal.
         let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameOwnerChanged")
-            .unwrap()
             .sender(fdo::BUS_NAME)
-            .unwrap()
             .build(&(
                 &name,
                 Optional::from(old_owner.clone()),
@@ -167,11 +164,8 @@ impl Peers {
         // Now unicast the appropriate signal to the old and new owners.
         if let Some(old_owner) = old_owner {
             let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameLost")
-                .unwrap()
                 .sender(fdo::BUS_NAME)
-                .unwrap()
                 .destination(old_owner.clone())
-                .unwrap()
                 .build(&name)?;
             if let Err(e) = self.send_msg_to_unique_name(msg, old_owner.clone()).await {
                 warn!("Couldn't notify inexistant peer {old_owner} about loosing name {name}: {e}")
@@ -179,11 +173,8 @@ impl Peers {
         }
         if let Some(new_owner) = new_owner {
             let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameAcquired")
-                .unwrap()
                 .sender(fdo::BUS_NAME)
-                .unwrap()
                 .destination(new_owner.clone())
-                .unwrap()
                 .build(&name)?;
             if let Err(e) = self.send_msg_to_unique_name(msg, new_owner.clone()).await {
                 warn!("Couldn't notify peer {new_owner} about acquiring name {name}: {e}")

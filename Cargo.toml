@@ -21,11 +21,13 @@ name = "busd"
 path = "src/bin/busd.rs"
 
 [dependencies]
-# TODO: Switch back to a crates-io version once zbus releases a version with
-# `Builder::build_message_stream`. See https://github.com/z-galaxy/zbus/pull/1760.
-zbus = { git = "https://github.com/z-galaxy/zbus", features = [
+# TODO: Switch back to a crates-io version once zbus 6.0 is released. Until then, depend on a
+# pinned revision of zbus's git main branch, where the 6.0 API is being developed.
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "47dd4d10a1e775564f861d03a17fa736550c0592", features = [
     "tokio",
     "bus-impl",
+    "service",
+    "tracing",
 ], default-features = false }
 tokio = { version = "1.37.0", features = [
     "macros",
@@ -61,6 +63,10 @@ rustix = { version = "1.1.2", default-features = false, features = ["process"] }
 default = ["tracing-subscriber"]
 
 [dev-dependencies]
+# The tests drive the bus through proxies, which the binary itself does not need.
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "47dd4d10a1e775564f861d03a17fa736550c0592", features = [
+    "proxy",
+], default-features = false }
 ntest = "0.10.0"
 rand = "0.10.0"
 futures-util = { version = "0.3.30", default-features = true }

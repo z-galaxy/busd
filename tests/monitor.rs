@@ -44,7 +44,7 @@ async fn become_monitor() {
 #[instrument]
 async fn become_monitor_client(address: &str, tx: Sender<()>) -> anyhow::Result<()> {
     // Create a monitor that wants all messages.
-    let conn = connection::Builder::address(address)?.build().await?;
+    let conn = connection::Builder::address(address).build().await?;
     let mut msg_stream = MessageStream::from(&conn);
     MonitoringProxy::builder(&conn)
         .cache_properties(CacheProperties::No)
@@ -81,7 +81,7 @@ async fn become_monitor_client(address: &str, tx: Sender<()>) -> anyhow::Result<
     );
 
     // Now a client that calls a method that triggers a signal.
-    let conn = connection::Builder::address(address)?.build().await?;
+    let conn = connection::Builder::address(address).build().await?;
     let name = "org.z-galaxy.MonitorTest";
     DBusProxy::builder(&conn)
         .cache_properties(CacheProperties::No)
@@ -89,7 +89,7 @@ async fn become_monitor_client(address: &str, tx: Sender<()>) -> anyhow::Result<
         .await?
         .request_name(
             name.try_into()?,
-            RequestNameFlags::ReplaceExisting | RequestNameFlags::DoNotQueue,
+            RequestNameFlags::REPLACE_EXISTING | RequestNameFlags::DO_NOT_QUEUE,
         )
         .await?;
 

@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use enumflags2::BitFlags;
 use tokio::spawn;
 use tracing::warn;
 use zbus::{
@@ -14,8 +13,7 @@ use zbus::{
     interface, message,
     names::{BusName, InterfaceName, OwnedBusName, OwnedUniqueName, UniqueName, WellKnownName},
     object_server::{ResponseDispatchNotifier, SignalEmitter},
-    zvariant::Optional,
-    OwnedGuid, OwnedMatchRule,
+    Optional, OwnedGuid, OwnedMatchRule,
 };
 
 use super::msg_sender;
@@ -111,7 +109,7 @@ impl DBus {
     async fn request_name(
         &self,
         name: WellKnownName<'_>,
-        flags: BitFlags<RequestNameFlags>,
+        flags: RequestNameFlags,
         #[zbus(header)] hdr: message::Header<'_>,
     ) -> Result<RequestNameReply> {
         let unique_name = msg_sender(&hdr);

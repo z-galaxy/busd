@@ -2,7 +2,6 @@ use std::env::temp_dir;
 
 use anyhow::ensure;
 use busd::bus::Bus;
-use enumflags2::BitFlag;
 use futures_util::stream::StreamExt;
 use ntest::timeout;
 use rand::{
@@ -59,7 +58,7 @@ async fn name_ownership_changes_(address: &str) {
 
 #[instrument]
 async fn name_ownership_changes_client(address: &str, tx: Sender<()>) -> anyhow::Result<()> {
-    let conn = connection::Builder::address(address)?.build().await?;
+    let conn = connection::Builder::address(address).build().await?;
     let conn_unique_name = conn.unique_name().unwrap().to_owned();
     let dbus_proxy = DBusProxy::builder(&conn)
         .cache_properties(CacheProperties::No)
@@ -71,7 +70,7 @@ async fn name_ownership_changes_client(address: &str, tx: Sender<()>) -> anyhow:
     let mut name_acquired_stream = dbus_proxy.receive_name_acquired().await?;
     // This should work.
     let ret = dbus_proxy
-        .request_name(name.clone(), RequestNameFlags::AllowReplacement.into())
+        .request_name(name.clone(), RequestNameFlags::ALLOW_REPLACEMENT)
         .await?;
     ensure!(
         ret == RequestNameReply::PrimaryOwner,
@@ -113,7 +112,7 @@ async fn name_ownership_changes_client(address: &str, tx: Sender<()>) -> anyhow:
 
     // This shouldn't and we should be told we already own the name.
     let ret = dbus_proxy
-        .request_name(name.clone(), RequestNameFlags::AllowReplacement.into())
+        .request_name(name.clone(), RequestNameFlags::ALLOW_REPLACEMENT)
         .await?;
     ensure!(
         ret == RequestNameReply::AlreadyOwner,
@@ -121,7 +120,7 @@ async fn name_ownership_changes_client(address: &str, tx: Sender<()>) -> anyhow:
     );
 
     // Now we try with another connection and we should be queued.
-    let conn2 = connection::Builder::address(address)?.build().await?;
+    let conn2 = connection::Builder::address(address).build().await?;
     let conn2_unique_name = conn2.unique_name().unwrap().to_owned();
     let changed = name_changed_stream.next().await.unwrap();
     ensure!(

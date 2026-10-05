@@ -1,4 +1,3 @@
-use enumflags2::BitFlags;
 use std::collections::{HashMap, VecDeque};
 use zbus::{
     fdo::{ReleaseNameReply, RequestNameFlags, RequestNameReply},
@@ -45,20 +44,20 @@ impl NameRegistry {
         &mut self,
         name: WellKnownName<'_>,
         unique_name: UniqueName<'_>,
-        flags: BitFlags<RequestNameFlags>,
+        flags: RequestNameFlags,
     ) -> (RequestNameReply, Option<NameOwnerChanged>) {
         match self.names.get_mut(&*name) {
             Some(entry) => {
                 if entry.owner.unique_name == unique_name {
                     (RequestNameReply::AlreadyOwner, None)
-                } else if flags.contains(RequestNameFlags::ReplaceExisting)
+                } else if flags.contains(RequestNameFlags::REPLACE_EXISTING)
                     && entry.owner.allow_replacement
                 {
                     let old_owner = entry.owner.unique_name.clone();
                     let unique_name = OwnedUniqueName::from(unique_name.clone());
                     entry.owner = NameOwner {
                         unique_name: unique_name.clone(),
-                        allow_replacement: flags.contains(RequestNameFlags::AllowReplacement),
+                        allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
                     };
 
                     (
@@ -69,10 +68,10 @@ impl NameRegistry {
                             new_owner: Some(unique_name),
                         }),
                     )
-                } else if !flags.contains(RequestNameFlags::DoNotQueue) {
+                } else if !flags.contains(RequestNameFlags::DO_NOT_QUEUE) {
                     let owner = NameOwner {
                         unique_name: OwnedUniqueName::from(unique_name.clone()),
-                        allow_replacement: flags.contains(RequestNameFlags::AllowReplacement),
+                        allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
                     };
                     entry.waiting_list.push_back(owner);
 
@@ -86,7 +85,7 @@ impl NameRegistry {
                 let name = OwnedWellKnownName::from(name);
                 let owner = NameOwner {
                     unique_name: unique_name.clone(),
-                    allow_replacement: flags.contains(RequestNameFlags::AllowReplacement),
+                    allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
                 };
 
                 self.names.insert(
