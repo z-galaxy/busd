@@ -364,9 +364,9 @@ checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
 name = "futures-io"
-version = "0.3.31"
+version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e5c1b78ca4aae1ac06c48a526a655760685149f0d465d21f37abfe57ce075c6"
+checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
 name = "futures-lite"
@@ -1786,7 +1786,7 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=7761b684afdde8dff915bdf281fc87726dfae0be#7761b684afdde8dff915bdf281fc87726dfae0be"
+source = "git+https://github.com/z-galaxy/zbus?rev=34e8ab8447c1a6da34be50c043eb126b45af6b2e#34e8ab8447c1a6da34be50c043eb126b45af6b2e"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -1815,7 +1815,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=7761b684afdde8dff915bdf281fc87726dfae0be#7761b684afdde8dff915bdf281fc87726dfae0be"
+source = "git+https://github.com/z-galaxy/zbus?rev=34e8ab8447c1a6da34be50c043eb126b45af6b2e#34e8ab8447c1a6da34be50c043eb126b45af6b2e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1826,7 +1826,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=7761b684afdde8dff915bdf281fc87726dfae0be#7761b684afdde8dff915bdf281fc87726dfae0be"
+source = "git+https://github.com/z-galaxy/zbus?rev=34e8ab8447c1a6da34be50c043eb126b45af6b2e#34e8ab8447c1a6da34be50c043eb126b45af6b2e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1847,8 +1847,9 @@ dependencies = [
 [[package]]
 name = "zruntime"
 version = "0.1.0"
-source = "git+https://github.com/z-galaxy/zruntime?rev=1ef1a0cfbe0d4790c0230bbb6792885213da9e2a#1ef1a0cfbe0d4790c0230bbb6792885213da9e2a"
+source = "git+https://github.com/z-galaxy/zruntime?rev=1becd68a87d41d2efee99d78fa60ed7774eb0499#1becd68a87d41d2efee99d78fa60ed7774eb0499"
 dependencies = [
  "futures-core",
+ "futures-io",
  "tracing",
 ]
