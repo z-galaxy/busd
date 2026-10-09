@@ -23,7 +23,7 @@ path = "src/bin/busd.rs"
 [dependencies]
 # TODO: Switch back to a crates-io version once zbus 6.0 is released. Until then, depend on a
 # pinned revision of zbus's git main branch, where the 6.0 API is being developed.
-zbus = { git = "https://github.com/z-galaxy/zbus", rev = "34e8ab8447c1a6da34be50c043eb126b45af6b2e", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "24dea4f3afb79dfa04ad75e2d4243998729de0b6", features = [
     "tokio",
     "bus-impl",
     "service",
@@ -64,7 +64,7 @@ console-subscriber = ["tracing", "dep:console-subscriber"]
 
 [dev-dependencies]
 # The tests drive the bus through proxies, which the binary itself does not need.
-zbus = { git = "https://github.com/z-galaxy/zbus", rev = "34e8ab8447c1a6da34be50c043eb126b45af6b2e", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "24dea4f3afb79dfa04ad75e2d4243998729de0b6", features = [
     "proxy",
 ], default-features = false }
 ntest = "0.10.0"
