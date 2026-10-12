@@ -1786,7 +1786,7 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=6e197cd1fb562d69df671aaf7bec9637f9d5ca6c#6e197cd1fb562d69df671aaf7bec9637f9d5ca6c"
+source = "git+https://github.com/z-galaxy/zbus?rev=dcfc42df0d914fc1bcc0871e8055f5854afab2af#dcfc42df0d914fc1bcc0871e8055f5854afab2af"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -1815,7 +1815,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=6e197cd1fb562d69df671aaf7bec9637f9d5ca6c#6e197cd1fb562d69df671aaf7bec9637f9d5ca6c"
+source = "git+https://github.com/z-galaxy/zbus?rev=dcfc42df0d914fc1bcc0871e8055f5854afab2af#dcfc42df0d914fc1bcc0871e8055f5854afab2af"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1826,7 +1826,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=6e197cd1fb562d69df671aaf7bec9637f9d5ca6c#6e197cd1fb562d69df671aaf7bec9637f9d5ca6c"
+source = "git+https://github.com/z-galaxy/zbus?rev=dcfc42df0d914fc1bcc0871e8055f5854afab2af#dcfc42df0d914fc1bcc0871e8055f5854afab2af"
 dependencies = [
  "proc-macro2",
  "quote",
