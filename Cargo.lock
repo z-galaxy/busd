@@ -369,19 +369,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
-name = "futures-lite"
-version = "2.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5edaec856126859abb19ed65f39e90fea3a9574b9707f13539acf4abf7eb532"
-dependencies = [
- "fastrand",
- "futures-core",
- "futures-io",
- "parking",
- "pin-project-lite",
-]
-
-[[package]]
 name = "futures-macro"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1786,13 +1773,12 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=dcfc42df0d914fc1bcc0871e8055f5854afab2af#dcfc42df0d914fc1bcc0871e8055f5854afab2af"
+source = "git+https://github.com/z-galaxy/zbus?rev=bb1e01cc2438fa01423f35d274fc16ca8b2ed059#bb1e01cc2438fa01423f35d274fc16ca8b2ed059"
 dependencies = [
  "async-trait",
  "bitflags",
  "endi",
  "futures-core",
- "futures-lite",
  "hex",
  "libc",
  "ordered-stream",
@@ -1815,7 +1801,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=dcfc42df0d914fc1bcc0871e8055f5854afab2af#dcfc42df0d914fc1bcc0871e8055f5854afab2af"
+source = "git+https://github.com/z-galaxy/zbus?rev=bb1e01cc2438fa01423f35d274fc16ca8b2ed059#bb1e01cc2438fa01423f35d274fc16ca8b2ed059"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1826,7 +1812,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=dcfc42df0d914fc1bcc0871e8055f5854afab2af#dcfc42df0d914fc1bcc0871e8055f5854afab2af"
+source = "git+https://github.com/z-galaxy/zbus?rev=bb1e01cc2438fa01423f35d274fc16ca8b2ed059#bb1e01cc2438fa01423f35d274fc16ca8b2ed059"
 dependencies = [
  "proc-macro2",
  "quote",
