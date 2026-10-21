@@ -46,11 +46,11 @@ zruntime = { version = "0.2.0", features = [
     "helper",
     "lock",
     "mpmc",
+    "signal",
     "tcp",
     "unblock",
     "unix",
 ], default-features = false }
-signal-hook = { version = "0.4.5", default-features = false }
 fastrand = "2.2.0"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
@@ -84,3 +84,8 @@ split-debuginfo = "packed"
 strip = "symbols"
 # No one needs an undebuggable release binary
 debug = "full"
+
+# zruntime's `signal` module is in no release yet: build against its main branch, which has it,
+# until one is out.
+[patch.crates-io]
+zruntime = { git = "https://github.com/z-galaxy/zruntime" }

@@ -1,19 +1,16 @@
 extern crate busd;
 
-use std::{
-    fs::File,
-    io::{Read, Write},
-    os::{fd::FromRawFd, unix::net::UnixStream},
-    path::PathBuf,
-    pin::pin,
-};
+use std::{fs::File, io::Write, os::fd::FromRawFd, path::PathBuf, pin::pin};
 
 use busd::{bus, config::Config, error, info, warn};
 
 use anyhow::Result;
 use clap::Parser;
 use futures_util::future::{select, Either};
-use zruntime::{AsyncIo, SharedRuntime};
+use zruntime::{
+    signal::{Signal, Signals},
+    SharedRuntime,
+};
 
 /// A simple D-Bus broker.
 #[derive(Parser, Debug)]
@@ -91,14 +88,10 @@ async fn run() -> Result<()> {
         println!("{}", bus.address());
     }
 
-    // The signal handler writes a byte to one end of a socket pair, which the runtime can wait for
-    // on the other end.
-    let (sig_int_read, sig_int_write) = UnixStream::pair()?;
-    signal_hook::low_level::pipe::register(signal_hook::consts::SIGINT, sig_int_write)?;
-    let sig_int = AsyncIo::new(&SharedRuntime::current()?, sig_int_read)?;
+    let mut signals = Signals::new(&SharedRuntime::current()?, [Signal::Interrupt])?;
 
     {
-        let interrupted = pin!(sig_int.read_with(|mut stream| stream.read(&mut [0; 1])));
+        let interrupted = pin!(signals.recv());
         let running = pin!(bus.run());
         match select(interrupted, running).await {
             Either::Left((Ok(_), _)) => info!("Received SIGINT, shutting down.."),
