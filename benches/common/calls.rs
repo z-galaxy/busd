@@ -31,6 +31,10 @@ pub const INTERFACE: &str = "org.dbus2.benchmark";
 /// A method that the services serve: it takes a byte array, and replies with nothing.
 pub const METHOD: &str = "TakeByteArray";
 
+/// The other method that the services serve: it takes the dicts of `dicts.rs`, a dict of dicts of
+/// variants, and replies with nothing, without the service reading the dicts.
+pub const DICTS_METHOD: &str = "TakeDicts";
+
 /// Anything that goes wrong ends the benchmark, so the errors need no more than their message.
 /// They are `Send`, so that the thread of a service or a client can hand its error over.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -90,7 +94,7 @@ impl Caller {
     /// Calls `method` of the service with `body` as the body of the call, and waits for the reply.
     ///
     /// Fails if the service replies with an error, which is what it does for any method but
-    /// `METHOD`, or the connection closes first.
+    /// `METHOD` and `DICTS_METHOD`, or the connection closes first.
     pub async fn call_with<B>(&mut self, method: &str, body: &B) -> Result<()>
     where
         B: Serialize + DynamicType,
@@ -233,6 +237,10 @@ async fn reply_to_calls(connection: &Connection, mut calls: MessageStream) -> Re
 
                 Message::method_return(&header).build(&())?
             }
+            // The dicts are not deserialized, so that what a round trip takes is the bus's as far
+            // as it can be, rather than the service's deserializing of their 100 variants. The
+            // byte array above is cheap to deserialize, as it is borrowed from the message.
+            Some(DICTS_METHOD) => Message::method_return(&header).build(&())?,
             _ => Message::error(&header, "org.freedesktop.DBus.Error.UnknownMethod")
                 .build(&("Unknown method",))?,
         };
