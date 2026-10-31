@@ -68,3 +68,5 @@ jobs:
         run: cargo --locked clippy --all -- -D warnings
       - name: Check common mistakes (no default features)
         run: cargo --locked clippy --all --no-default-features -- -D warnings
+      - name: Check common mistakes (benchmarks)
+        run: cargo --locked clippy --bench bus -- -D warnings

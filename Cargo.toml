@@ -15,10 +15,18 @@ exclude = ["LICENSE"]
 [lib]
 name = "busd"
 path = "src/lib.rs"
+bench = false
 
 [[bin]]
 name = "busd"
 path = "src/bin/busd.rs"
+bench = false
+
+# What the bus costs to route the traffic of its clients, which CodSpeed measures by the clock on
+# every push to `main` and every pull request (`.github/workflows/bench.yml`).
+[[bench]]
+name = "bus"
+harness = false
 
 [dependencies]
 zbus = { version = "6.2.0", features = [
@@ -62,15 +70,24 @@ tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
 
 [dev-dependencies]
-# The tests drive the bus through proxies, which the binary itself does not need.
+# The tests drive the bus through proxies, which the binary itself does not need. The benchmarks
+# send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte by byte.
 zbus = { version = "6.0.0", features = [
     "proxy",
+    "serde_bytes",
 ], default-features = false }
 ntest = "0.10.0"
 rand = "0.10.0"
 futures-util = { version = "0.3.30", default-features = true }
 tracing = "0.1.40"
-rustix = { version = "1.1.2", features = ["net", "process"] }
+# `thread` pins the threads of the benchmarks to CPUs of their own.
+rustix = { version = "1.1.2", features = ["net", "process", "thread"] }
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
+serde = { version = "1.0.200", features = ["derive"] }
+serde_bytes = "0.11.19"
+# The channels that stop the services and the bus of the benchmarks, and hand the replies on a
+# shared connection to their callers.
+zruntime = { version = "0.2.2", features = ["mpmc"], default-features = false }
 
 [profile.release]
 lto = "fat"
@@ -82,4 +99,11 @@ split-debuginfo = "packed"
 strip = "symbols"
 # No one needs an undebuggable release binary
 debug = "full"
+
+# The benchmarks build busd with the optimizations of the release profile, but keep its symbols in
+# the binary, so that CodSpeed can tell which functions the time goes to. It does not ship quite so:
+# cargo builds every benchmark to unwind on a panic, and with the features of the dev-dependencies.
+[profile.bench]
+split-debuginfo = "off"
+strip = "none"
 
