@@ -2,6 +2,7 @@
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/z-galaxy/busd/ci.yml?branch=main)](https://github.com/z-galaxy/busd/actions?query=branch%3Amain)
 [![crates.io](https://img.shields.io/crates/v/busd.svg)](https://crates.io/crates/busd)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/z-galaxy/busd?utm_source=badge)
 
 # busd
 
@@ -85,6 +86,18 @@ addition of [peer credentials] on every message, which can avoid round-trips on 
 ## License
 
 [MIT](LICENSE-MIT)
+
+## Sponsors
+
+<a href="https://codspeed.io/?utm_source=oss-sponsorship&utm_medium=z-galaxy">
+  <picture>
+    <source media="(prefers-color-scheme: dark)"
+      srcset="https://codspeed.io/codspeed-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)"
+      srcset="https://codspeed.io/codspeed-logo-light.svg">
+    <img alt="CodSpeed logo" src="https://codspeed.io/codspeed-logo-light.svg" width="400">
+  </picture>
+</a>
 
 [specification]: https://dbus.freedesktop.org/doc/dbus-specification.html
 [peer credentials]: https://github.com/z-galaxy/busd/issues/29
