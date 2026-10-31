@@ -68,3 +68,9 @@ jobs:
         run: cargo --locked clippy --all -- -D warnings
       - name: Check common mistakes (no default features)
         run: cargo --locked clippy --all --no-default-features -- -D warnings
+      # Named one by one, as `--benches` leaves out `compare`, which `cargo bench` runs only when
+      # asked to.
+      - name: Check common mistakes (benchmarks)
+        run: cargo --locked clippy --bench bus --bench compare -- -D warnings
+      - name: Check the statistics of the comparison with other brokers
+        run: cargo --locked test --bench compare -- pairs --self-test

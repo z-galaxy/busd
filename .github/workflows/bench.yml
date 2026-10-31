@@ -1,0 +1,55 @@
+name: CodSpeed Benchmarks
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+# A push to a pull request makes the report of the run still going for its previous push moot,
+# so that run is cancelled rather than left to use up runner minutes. Every run on main is kept:
+# each is the baseline of the pull requests based on it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  # Lets the CodSpeed action authenticate the upload with GitHub's OIDC token instead of a secret.
+  id-token: write
+
+jobs:
+  benchmarks:
+    name: Run benchmarks (walltime)
+    # The benchmarks of `bus` route the traffic of clients on other threads through the bus, over
+    # unix sockets: what they cost is mostly in the kernel, which CodSpeed's CPU simulation leaves
+    # out, so they are measured by the clock. On a bare-metal CodSpeed macro runner, given to this
+    # job alone, so that the numbers move with the code rather than with the load of whoever shares
+    # a hosted runner's host. Keep the job on this one label: two runs are only comparable when
+    # measured on the same machine.
+    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    # A run takes a few minutes and its build a few more: one that takes longer is stuck, and would
+    # hold the macro runner until GitHub's own limit of 6 hours.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup rust toolchain, cache and cargo-codspeed binary
+        uses: moonrepo/setup-rust@v1
+        with:
+          channel: stable
+          cache-target: release
+          # setup-rust's cache key leaves the architecture out: without this, this arm64 job would
+          # find a cache that an x86_64 job saved under the same key, and never save its own.
+          cache-extra-identifier: ${{ runner.arch }}
+          bins: cargo-codspeed
+      # `compare` is left out: it measures busd against other brokers, which this runner lacks.
+      - name: Build the benchmark target
+        run: cargo codspeed build -m walltime --bench bus
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: walltime
+          run: cargo codspeed run -m walltime --bench bus
