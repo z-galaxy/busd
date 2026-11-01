@@ -54,7 +54,7 @@ When contributing to this project, you **implicitly** declare that:
 
 * you have authored 100% of the content,
 * you have the necessary rights to the content, and
-* you agree to providing the content under the [project's license](LICENSE).
+* you agree to providing the content under the [project's license](LICENSE-MIT).
 
 ## Running the test suite
 
