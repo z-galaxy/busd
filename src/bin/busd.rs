@@ -158,7 +158,7 @@ mod tests {
     use std::path::Path;
 
     use busd::config::Config;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::{read_config, Args};
 
@@ -203,6 +203,20 @@ mod tests {
 
         assert_eq!(config, Config::read_file(SESSION).unwrap());
         assert_ne!(config, Config::default());
+    }
+
+    #[test]
+    fn usage() {
+        let help = Args::command().render_help().to_string();
+
+        assert!(help.contains("Usage: busd [OPTIONS]"), "{help}");
+    }
+
+    #[test]
+    fn error_context() {
+        let error = Args::try_parse_from(["busd", "--ready-fd", "x"]).unwrap_err();
+
+        assert!(error.to_string().contains("--ready-fd"), "{error}");
     }
 
     const MISSING: &str = "/nonexistent/busd/session.conf";

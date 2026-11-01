@@ -58,6 +58,8 @@ clap = { version = "4.5.4", features = [
     "derive",
     "std",
     "help",
+    "usage",
+    "error-context",
 ], default-features = false }
 tracing = { version = "0.1.40", optional = true }
 tracing-subscriber = { version = "0.3.18", features = [
@@ -112,14 +114,6 @@ zruntime = { version = "0.2.2", features = ["mpmc"], default-features = false }
 # The comparison with other brokers writes its results as JSON, and reads them back: its runs keep
 # the order of their fields, and their numbers read back exactly as they were written.
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
-# The comparison's command line, with the usage and the context of an error in its message.
-clap = { version = "4.5.4", features = [
-    "derive",
-    "std",
-    "help",
-    "usage",
-    "error-context",
-], default-features = false }
 
 # The comparison with other brokers measures the CPU time of their processes with `getrusage`,
 # which rustix has no call for.
