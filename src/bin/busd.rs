@@ -75,6 +75,14 @@ async fn run() -> Result<()> {
         config.listen.as_ref().map(ToString::to_string)
     };
 
+    // SIGTERM is what service managers, such as systemd, and `kill` send to stop a service. Taking
+    // the signals over before the bus listens, and so before anyone can tell that it's ready, has
+    // the bus clean up however soon one of them comes.
+    let mut signals = Signals::new(
+        &SharedRuntime::current()?,
+        [Signal::Interrupt, Signal::Terminate],
+    )?;
+
     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
 
     if let Some(fd) = args.ready_fd {
@@ -88,14 +96,18 @@ async fn run() -> Result<()> {
         println!("{}", bus.address());
     }
 
-    let mut signals = Signals::new(&SharedRuntime::current()?, [Signal::Interrupt])?;
-
     {
-        let interrupted = pin!(signals.recv());
+        let signaled = pin!(signals.recv());
         let running = pin!(bus.run());
-        match select(interrupted, running).await {
-            Either::Left((Ok(_), _)) => info!("Received SIGINT, shutting down.."),
-            Either::Left((Err(e), _)) => error!("Failed to wait for SIGINT: {}", e),
+        match select(signaled, running).await {
+            Either::Left((Ok(signal), _)) => {
+                let name = match signal {
+                    Signal::Terminate => "SIGTERM",
+                    _ => "SIGINT",
+                };
+                info!("Received {}, shutting down..", name);
+            }
+            Either::Left((Err(e), _)) => error!("Failed to wait for signals: {}", e),
             Either::Right((Ok(()), _)) => warn!("Bus stopped, shutting down.."),
             Either::Right((Err(e), _)) => error!("Bus stopped with an error: {}", e),
         }
