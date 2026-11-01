@@ -1,5 +1,5 @@
 use crate::{debug, info, trace, warn};
-use anyhow::{bail, Ok, Result};
+use anyhow::{bail, Context, Ok, Result};
 use std::{env, path::Path, str::FromStr, sync::Arc, time::Duration};
 use zbus::{
     address::{
@@ -66,15 +66,17 @@ impl Bus {
             Transport::Unix(unix) => {
                 // Resolve address specification into address that clients can use.
                 let addr = Self::unix_addr(unix)?;
-                address = Address::new(Transport::Unix(Unix::new(UnixSocket::File(
-                    addr.as_pathname()
-                        .expect("Address created for UNIX socket should always have a path.")
-                        .to_path_buf(),
-                ))))
-                .set_guid(guid.clone())?;
+                let path = addr
+                    .as_pathname()
+                    .expect("Address created for UNIX socket should always have a path.")
+                    .to_path_buf();
+                address = Address::new(Transport::Unix(Unix::new(UnixSocket::File(path.clone()))))
+                    .set_guid(guid.clone())?;
 
                 (
-                    Self::unix_stream(addr.clone()).await?,
+                    Self::unix_stream(addr)
+                        .await
+                        .with_context(|| format!("failed to listen on {}", path.display()))?,
                     AuthMechanism::External,
                 )
             }
