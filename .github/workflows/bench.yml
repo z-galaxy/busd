@@ -84,12 +84,12 @@ jobs:
   # runner's host. Keep them on this one label: two runs are only comparable when measured on the
   # same machine.
   #
-  # They are built on a GitHub-hosted runner of the same architecture and the same release of
-  # Ubuntu as the macro runner, which costs nothing, and only run on the macro runner, so that the
-  # minutes of the macro runner go to running them rather than to building them. The build keeps
-  # the id `benchmarks`, which the job that built and ran them had before, as setup-rust's cache key
-  # hashes the id: on the same architecture and release of Ubuntu, it goes on from the cache that
-  # the macro runner saved.
+  # They are built on a GitHub-hosted runner of the same architecture as the macro runner, which
+  # costs nothing, and only run on the macro runner, so that the minutes of the macro runner go to
+  # running them rather than to building them. They are built in a container of the macro runner's
+  # release of Ubuntu, 22.04, rather than on a hosted runner of it, which GitHub retires in 2027:
+  # built on a later release, they are linked against a later glibc, whose symbols the 2.35 of the
+  # macro runner lacks. Renovate leaves the container's release alone, as `renovate.json` says.
   #
   # They aren't worth the macro runner for a draft either, which is pushed to again and again: they
   # run once it is marked as ready for review, and for each push after that. A release changes
@@ -101,12 +101,21 @@ jobs:
     name: Build benchmarks (walltime)
     needs: changes
     runs-on: ubuntu-26.04-arm
+    container: ubuntu:22.04
     if: >-
       ${{ needs.changes.outputs.measured == 'true' && !github.event.pull_request.draft &&
       !(github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')) &&
       !(github.event_name == 'push' && contains(join(github.event.commits.*.message), '🔖')) }}
     timeout-minutes: 30
     steps:
+      # The image has none of these: the installer of rustup, which setup-rust runs, downloads with
+      # curl, over HTTPS; rustc links with the C compiler, which also builds the C code of
+      # CodSpeed's instrument hooks; checkout clones with git; and the cache is compressed with
+      # zstd, as on a hosted runner.
+      - name: Install what the build needs
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git zstd
       - uses: actions/checkout@v7
       - name: Setup rust toolchain, cache and cargo-codspeed binary
         uses: moonrepo/setup-rust@v1
