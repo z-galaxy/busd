@@ -1,6 +1,12 @@
 use crate::{debug, info, trace, warn};
 use anyhow::{bail, Context, Ok, Result};
-use std::{env, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 use zbus::{
     address::{
         transport::{Tcp, Unix, UnixSocket},
@@ -307,18 +313,20 @@ impl AcceptedSocket {
     }
 }
 
+/// A socket in the user's runtime directory, `$XDG_RUNTIME_DIR` or else `/run/user/<uid>`, or in
+/// the directory for temporary files if the user has no runtime directory.
 fn default_address() -> String {
-    let runtime_dir = env::var("XDG_RUNTIME_DIR")
-        .as_ref()
-        .map(|s| Path::new(s).to_path_buf())
-        .ok()
-        .unwrap_or_else(|| {
-            Path::new("/run")
-                .join("user")
-                .join(format!("{}", rustix::process::getuid()))
-        });
+    let dir = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let dir = Path::new("/run/user").join(rustix::process::getuid().to_string());
 
-    format!("unix:dir={}", runtime_dir.display())
+            dir.is_dir().then_some(dir)
+        })
+        .unwrap_or_else(env::temp_dir);
+
+    format!("unix:dir={}", dir.display())
 }
 
 #[cfg(not(unix))]
