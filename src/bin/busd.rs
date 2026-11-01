@@ -1,10 +1,16 @@
 extern crate busd;
 
-use std::{fs::File, io::Write, os::fd::FromRawFd, path::PathBuf, pin::pin};
+use std::{
+    fs::File,
+    io::Write,
+    os::fd::FromRawFd,
+    path::{Path, PathBuf},
+    pin::pin,
+};
 
 use busd::{bus, config::Config, error, info, warn};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::future::{select, Either};
 use zruntime::{
@@ -42,6 +48,9 @@ struct Args {
 
     /// Equivalent to `--config /usr/share/dbus-1/session.conf`.
     /// This is the default if `--config` and `--system` are unspecified.
+    ///
+    /// As the default, the file is optional: busd goes by its built-in defaults if it doesn't
+    /// exist.
     #[clap(long)]
     session: bool,
 
@@ -58,16 +67,7 @@ async fn run() -> Result<()> {
     busd::tracing_subscriber::init();
 
     let args = Args::parse();
-
-    let config_path = if args.system {
-        PathBuf::from("/usr/share/dbus-1/system.conf")
-    } else if let Some(config_path) = args.config {
-        config_path
-    } else {
-        PathBuf::from("/usr/share/dbus-1/session.conf")
-    };
-    info!("reading configuration file {} ...", config_path.display());
-    let config = Config::read_file(&config_path)?;
+    let config = read_config(&args, Path::new(SESSION_CONFIG))?;
 
     let address = if let Some(address) = args.address {
         Some(address)
@@ -106,4 +106,94 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The configuration that `args` ask for.
+///
+/// The session configuration, at `session_config`, only has to exist if `--session` asks for it:
+/// without `--config`, `--session` or `--system`, the bus goes by its built-in defaults if there's
+/// no file there, as on a system without the reference implementation of D-Bus.
+fn read_config(args: &Args, session_config: &Path) -> Result<Config> {
+    let path = if args.system {
+        Path::new(SYSTEM_CONFIG)
+    } else if let Some(path) = &args.config {
+        path.as_path()
+    } else if args.session
+        || session_config
+            .try_exists()
+            .with_context(|| format!("failed to look for {}", session_config.display()))?
+    {
+        session_config
+    } else {
+        info!(
+            "configuration file {} doesn't exist, going by the defaults",
+            session_config.display(),
+        );
+
+        return Ok(Config::default());
+    };
+    info!("reading configuration file {} ...", path.display());
+
+    Config::read_file(path)
+        .with_context(|| format!("failed to read configuration file {}", path.display()))
+}
+
+const SESSION_CONFIG: &str = "/usr/share/dbus-1/session.conf";
+const SYSTEM_CONFIG: &str = "/usr/share/dbus-1/system.conf";
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use busd::config::Config;
+    use clap::Parser;
+
+    use super::{read_config, Args};
+
+    #[test]
+    fn missing_session_config_is_optional() {
+        let args = Args::parse_from(["busd"]);
+        let config = read_config(&args, Path::new(MISSING)).unwrap();
+
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn missing_session_config_asked_for() {
+        let args = Args::parse_from(["busd", "--session"]);
+        let error = read_config(&args, Path::new(MISSING)).unwrap_err();
+
+        assert!(error.to_string().contains(MISSING), "{error:?}");
+    }
+
+    #[test]
+    fn unreachable_session_config() {
+        // Whether there's a file at this path can't be known, as its parent is a file.
+        let args = Args::parse_from(["busd"]);
+        let error = read_config(&args, Path::new(UNREACHABLE)).unwrap_err();
+
+        assert!(error.to_string().contains(UNREACHABLE), "{error:?}");
+    }
+
+    #[test]
+    fn missing_config() {
+        // The session configuration exists, so that `--config` has to take precedence over it.
+        let args = Args::parse_from(["busd", "--config", MISSING]);
+        let error = read_config(&args, Path::new(SESSION)).unwrap_err();
+
+        assert!(error.to_string().contains(MISSING), "{error:?}");
+    }
+
+    #[test]
+    fn session_config() {
+        let args = Args::parse_from(["busd"]);
+        let config = read_config(&args, Path::new(SESSION)).unwrap();
+
+        assert_eq!(config, Config::read_file(SESSION).unwrap());
+        assert_ne!(config, Config::default());
+    }
+
+    const MISSING: &str = "/nonexistent/busd/session.conf";
+    const UNREACHABLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml/session.conf");
+    const SESSION: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/session.conf");
 }

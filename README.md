@@ -1,17 +1,33 @@
-<img alt="Project logo: a bus" src="data/logo.svg" width="200">
+<p align="center">
+  <a href="https://crates.io/crates/busd">
+    <img alt="crates.io" src="https://img.shields.io/crates/v/busd">
+  </a>
+  <a href="https://github.com/z-galaxy/busd/actions/workflows/ci.yml">
+    <img alt="Build Status"
+      src="https://github.com/z-galaxy/busd/actions/workflows/ci.yml/badge.svg">
+  </a>
+  <a href="https://app.codspeed.io/z-galaxy/busd?utm_source=badge">
+    <img alt="CodSpeed" src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json">
+  </a>
+</p>
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/z-galaxy/busd/ci.yml?branch=main)](https://github.com/z-galaxy/busd/actions?query=branch%3Amain)
-[![crates.io](https://img.shields.io/crates/v/busd.svg)](https://crates.io/crates/busd)
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/z-galaxy/busd?utm_source=badge)
+<p align="center">
+  <img alt="Project logo: a bus"
+    src="https://raw.githubusercontent.com/z-galaxy/busd/d1eebb1097c46e3a195d9994c4539c7ec51b5266/data/logo.svg"
+    width="200">
+</p>
 
-# busd
+<h1 align="center">busd</h1>
 
 A D-Bus bus (broker) implementation in Rust. Since it's pure Rust, it's much easier to cross-build
 than other D-Bus brokers.
 
 ## Status
 
-Alpha. It's not ready for production use yet. Only the essentials are in place.
+Alpha. The essentials are in place, but busd is not ready for production use yet. Most notably, it
+doesn't enforce the [policies] of its configuration, so it must not serve as a system bus, and it
+doesn't start services on demand ([service activation]). The [feature parity] issues track what
+else it lacks.
 
 ## Performance
 
@@ -74,11 +90,14 @@ Running a session instance is super easy:
 busd --print-address
 ```
 
-`--print-address` will print the address of the bus to stdout. You can then use that address to
-connect to the bus:
+`--print-address` will print the address of the bus to stdout. By default, busd listens where the
+session configuration of [dbus-daemon], `/usr/share/dbus-1/session.conf`, tells it to: usually on a
+socket in `/tmp`. Without that file, it listens on a socket in the user's runtime directory,
+`$XDG_RUNTIME_DIR`, or in the directory for temporary files if there's none. You can then use the
+address that busd printed to connect to the bus:
 
 ```bash
-export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus,guid=d0af79a44c000ce7985797ba649dbc05"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/dbus-2818978930,guid=794623ae7cf44eb69a27f57e9ea4af6b"
 busctl --user introspect org.freedesktop.DBus /org/freedesktop/DBus
 busctl --user list
 ```
@@ -95,13 +114,13 @@ busctl call --user com.intel.dleyna-renderer /com/intel/dLeynaRenderer com.intel
 
 ### Full compatibility with the D-Bus specification
 
-Implement all features that manadated and recommended by the [specification].
+Implement all features that the [specification] mandates or recommends.
 
 ### Additional Header Fields
 
 While the D-Bus spec does not allow custom header fields in messages, `busd` will still support a
-few additional on-demand (only) fields, that are useful for certain applications. One example is
-addition of [peer credentials] on every message, which can avoid round-trips on the bus.
+few additional on-demand (only) fields that are useful for certain applications. One example is the
+addition of [peer credentials] to every message, which can avoid round trips on the bus.
 
 ## License
 
@@ -123,3 +142,6 @@ addition of [peer credentials] on every message, which can avoid round-trips on 
 [peer credentials]: https://github.com/z-galaxy/busd/issues/29
 [dbus-broker]: https://github.com/bus1/dbus-broker
 [dbus-daemon]: https://gitlab.freedesktop.org/dbus/dbus
+[policies]: https://github.com/z-galaxy/busd/issues/79
+[service activation]: https://github.com/z-galaxy/busd/issues/82
+[feature parity]: https://github.com/z-galaxy/busd/labels/feature%20parity

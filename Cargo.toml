@@ -1,6 +1,6 @@
 [package]
 name = "busd"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["Zeeshan Ali Khan <zeeshanak@gnome.org>"]
 description = "A D-Bus bus (broker) implementation"
 edition = "2021"
@@ -10,7 +10,19 @@ rust-version = "1.89"
 repository = "https://github.com/z-galaxy/busd"
 keywords = ["D-Bus", "DBus", "IPC"]
 categories = ["network-programming"]
-exclude = ["LICENSE"]
+# The tooling of the repository, such as its CI, git hooks and guidance for AI agents, is of no use
+# to those who build the crate. `LICENSE` is a link to `LICENSE-MIT`, so cargo would pack the
+# license twice.
+exclude = [
+    ".commitlintrc.mjs",
+    ".githooks/",
+    ".github/",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "LICENSE",
+    "release-plz.toml",
+]
 
 [lib]
 name = "busd"
@@ -37,7 +49,7 @@ harness = false
 bench = false
 
 [dependencies]
-zbus = { version = "6.2.0", features = [
+zbus = { version = "6.2.1", features = [
     "default-rt",
     "bus-impl",
     "service",
