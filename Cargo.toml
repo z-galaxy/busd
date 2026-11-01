@@ -49,7 +49,7 @@ harness = false
 bench = false
 
 [dependencies]
-zbus = { version = "6.2.0", features = [
+zbus = { version = "6.2.1", features = [
     "default-rt",
     "bus-impl",
     "service",
