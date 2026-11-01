@@ -24,7 +24,10 @@ than other D-Bus brokers.
 
 ## Status
 
-Alpha. It's not ready for production use yet. Only the essentials are in place.
+Alpha. The essentials are in place, but busd is not ready for production use yet. Most notably, it
+doesn't enforce the [policies] of its configuration, so it must not serve as a system bus, and it
+doesn't start services on demand ([service activation]). The [feature parity] issues track what
+else it lacks.
 
 ## Performance
 
@@ -136,3 +139,6 @@ addition of [peer credentials] on every message, which can avoid round-trips on 
 [peer credentials]: https://github.com/z-galaxy/busd/issues/29
 [dbus-broker]: https://github.com/bus1/dbus-broker
 [dbus-daemon]: https://gitlab.freedesktop.org/dbus/dbus
+[policies]: https://github.com/z-galaxy/busd/issues/79
+[service activation]: https://github.com/z-galaxy/busd/issues/82
+[feature parity]: https://github.com/z-galaxy/busd/labels/feature%20parity
