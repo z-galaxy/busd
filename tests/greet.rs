@@ -20,7 +20,7 @@ use zbus::{
     object_server::SignalEmitter,
     proxy,
     proxy::CacheProperties,
-    AsyncDrop, Connection, MatchRule, MessageStream, ObjectPath,
+    Address, AsyncDrop, Connection, MatchRule, MessageStream, ObjectPath,
 };
 use zruntime::{Event, SharedRuntime};
 
@@ -40,11 +40,24 @@ fn greet() {
         // TCP socket
         let address = "tcp:host=127.0.0.1,port=4248".to_string();
         greet_(&address).await;
+
+        // Abstract Unix socket, which only Linux has.
+        #[cfg(target_os = "linux")]
+        {
+            let s = Alphanumeric.sample_string(&mut rng(), 10);
+            let address = format!("unix:abstract={s}");
+            greet_(&address).await;
+        }
     });
 }
 
 async fn greet_(socket_addr: &str) {
     let mut bus = Bus::for_address(Some(socket_addr)).await.unwrap();
+    // The bus gives its clients the address that it was given, with its GUID added, and that's
+    // where they connect.
+    let address = bus.address().clone();
+    let given = Address::try_from(socket_addr).unwrap();
+    assert_eq!(address.transport(), given.transport());
     let stop = Event::new();
     let stopped = stop.listen();
 
@@ -61,8 +74,8 @@ async fn greet_(socket_addr: &str) {
         bus
     });
 
-    let ret = match greet_service(socket_addr).await {
-        Ok(service_conn) => greet_client(socket_addr).await.map(|_| service_conn),
+    let ret = match greet_service(&address).await {
+        Ok(service_conn) => greet_client(&address).await.map(|_| service_conn),
         Err(e) => Err(e),
     };
     stop.notify(usize::MAX);
@@ -72,7 +85,7 @@ async fn greet_(socket_addr: &str) {
 }
 
 #[instrument]
-async fn greet_service(socket_addr: &str) -> anyhow::Result<Connection> {
+async fn greet_service(address: &Address) -> anyhow::Result<Connection> {
     struct Greeter {
         count: u64,
     }
@@ -112,7 +125,7 @@ async fn greet_service(socket_addr: &str) -> anyhow::Result<Connection> {
     }
 
     let greeter = Greeter { count: 0 };
-    connection::Builder::address(socket_addr)
+    connection::Builder::address(address.clone())
         .name("org.zbus.MyGreeter")
         .serve_at("/org/zbus/MyGreeter", greeter)
         .build()
@@ -121,7 +134,7 @@ async fn greet_service(socket_addr: &str) -> anyhow::Result<Connection> {
 }
 
 #[instrument]
-async fn greet_client(socket_addr: &str) -> anyhow::Result<()> {
+async fn greet_client(address: &Address) -> anyhow::Result<()> {
     #[proxy(
         interface = "org.zbus.MyGreeter1",
         default_path = "/org/zbus/MyGreeter"
@@ -134,7 +147,9 @@ async fn greet_client(socket_addr: &str) -> anyhow::Result<()> {
     }
 
     let runtime = SharedRuntime::current()?;
-    let conn = connection::Builder::address(socket_addr).build().await?;
+    let conn = connection::Builder::address(address.clone())
+        .build()
+        .await?;
 
     let proxy = MyGreeterProxy::builder(&conn)
         .destination("org.zbus.MyGreeter")
