@@ -26,23 +26,6 @@ jobs:
       - name: Run tests on stable Rust
         run: cargo --locked test
 
-  test_nightly:
-    env:
-      RUST_LOG: "trace"
-      RUST_BACKTRACE: "full"
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-      - uses: Swatinem/rust-cache@v2
-      - name: Run tests on nightly Rust
-        run: cargo --locked test
-
   fmt:
     runs-on: ubuntu-latest
     steps:
