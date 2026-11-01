@@ -13,10 +13,12 @@ publish = true
 # We're not a library.
 semver_check = false
 
-# Bump minor version for non-bugfix commits.
+# Bump minor version for non-bugfix commits. release-plz takes these for features, which only bump
+# the patch version of a 0.x version, unless `features_always_increment_minor` is set.
 custom_minor_increment_regex = """\
 ^(🎨|⚡️|🔥|✨|💄|🎉|🔒️|⬇️|⬆️|📌|➕|➖|🔧|👽️|💥|♿️|💬|🔊|🔇|🚸|🏗️|🗑️)\
 """
+features_always_increment_minor = true
 
 # PR configuration.
 pr_name = "🔖 Release {{ version }}"
