@@ -5,6 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.1 - 2026-11-01
+
+### 👷 CI
+- Drop the tests on nightly Rust.
+- Build the benchmarks in a container of Ubuntu 22.04.
+- Build the benchmarks off the macro runner.
+- Skip the benchmarks where they can't measure a change.
+- Run the benchmarks on CodSpeed.
+- Add a workflow to release with release-plz.
+- adopt shared commitlint config for `gimoji`.
+
+### ♻️ Changed
+- Make `tracing` an optional feature.
+- Show changelog emojis on section headings only.
+- Support skipping the changelog via a commit trailer.
+
+### 📦 Dependencies
+- Update dependency ubuntu to v26.
+- Update actions/upload-artifact action to v7.
+- Update actions/download-artifact action to v8.
+- Switch to released version of zbus & zruntime.
+- Build on zruntime's main branch, which watches sockets edge-triggered.
+- Build on zbus's main branch, which reads ahead of each message.
+- Update foldhash to 0.2.0 (#395).
+- Build on zbus's main branch, which checks received messages whole.
+- Update rustix to v1.1.6 (#387).
+- Build on the latest commits of zbus and zruntime.
+- Use zruntime's signal handling instead of signal-hook.
+- Build on zbus from git, for Connection::send_all.
+- Build on zruntime from git, for its lazy time-limit clock.
+- Update zbus to v6.1.0 (#381).
+- Update zruntime to v0.2.1 (#380).
+- Use zruntime's Event instead of event-listener's.
+- Use zbus 6.0.0 from crates.io.
+- Update tokio to v1.53.3 (#368).
+- Drop the enumflags2 dependency.
+- Bump the MSRV to 1.89.
+- Update ntest to 0.10.0 (#354).
+- Update rand to v0.10.3 (#353).
+- Update quick-xml to 0.42.0 (#350).
+- Update futures-util to v0.3.34 (#348).
+- Update event-listener to v5.4.2 (#346).
+- Update clap to v4.6.3 (#344).
+- Update fastrand to v2.5.0 (#343).
+- Update serde to v1.0.229 (#342).
+- Update anyhow to v1.0.104 (#341).
+- Update actions/setup-node action to v7.
+- Update actions/checkout action to v7.
+- Update tracing-subscriber to v0.3.23 (#312).
+
+### 📝 Documentation
+- Refresh the numbers in the README from busd's own comparison.
+- Refresh the numbers in the README, and add those of signals.
+- Refresh the numbers in the README from the benchmark on zbus 6.
+- Give numbers on how busd performs in the README.
+- Add AGENTS.md pointing to CONTRIBUTING.md.
+- Document top-down module ordering convention.
+
+### 🐛 Fixed
+- Disconnect clients that don't take a message in time.
+- Don't abort matching a broadcast against a destination rule.
+- Queue messages for each client rather than wait on it.
+- Deliver signals sent to a well-known name to its owner.
+- Don't abort on a broadcast signal to a monitor with rules.
+- Use zbus Builder::build_message_stream to avoid dropping Hello.
+
+### ⚙️ Other
+- 🦺 Disconnect a client that sends a message with an invalid body. #385
+- ⏪️ Revert "🐛 Queue messages for each client rather than wait on it".
+- 👽️ Port to the zbus 6 API.
+- 🚨 Fix clippy::useless_borrows_in_formatting.
+- 🧵 Don't hold the peers lock during connection setup.
+- 🤖 Custom regex for minor version bump.
+
+### ⚡️ Performance
+- Set the sender of a client's message without building it anew.
+- Forward the messages of each peer in batches.
+- Wait 100 ms rather than 1 s for a client to take a message.
+- Send a message to all of its recipients at once.
+- Port from Tokio to zruntime.
+- Filter logs with `Targets` instead of `EnvFilter`.
+
+### 🔥 Removed
+- Drop the console-subscriber feature.
+
+### 🔒️ Security
+- Deliver only the replies that answer a pending call. #386
+- Disconnect clients that send messages with too many fds.
+- Don't let match rules match messages sent to others.
+
+### ✅ Testing
+- Compare busd with other brokers, on the workloads of dbus-bench.
+- Benchmark how the bus routes the traffic of its clients.
+- Time the stalled subscribers' disconnections during the flood.
+- Resolve a TCP port conflict between 2 tests.
+- Fix loop condition in a test.
+- Increase test timeouts from 15 to 30 seconds.
+
 ## 0.5.0 - 2026-01-13
 
 ### Added
