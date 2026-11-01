@@ -15,10 +15,26 @@ exclude = ["LICENSE"]
 [lib]
 name = "busd"
 path = "src/lib.rs"
+bench = false
 
 [[bin]]
 name = "busd"
 path = "src/bin/busd.rs"
+bench = false
+
+# What the bus costs to route the traffic of its clients, which CodSpeed measures by the clock on
+# every push to `main` and every pull request (`.github/workflows/bench.yml`).
+[[bench]]
+name = "bus"
+harness = false
+
+# busd against other brokers, such as dbus-broker and dbus-daemon: it needs them installed, and
+# takes a while, so neither `cargo bench` nor CI runs it unless asked to, with
+# `cargo bench --bench compare`. `benches/README.md` says how.
+[[bench]]
+name = "compare"
+harness = false
+bench = false
 
 [dependencies]
 zbus = { version = "6.2.0", features = [
@@ -62,15 +78,41 @@ tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
 
 [dev-dependencies]
-# The tests drive the bus through proxies, which the binary itself does not need.
+# The tests drive the bus through proxies, which the binary itself does not need. The benchmarks
+# send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte by byte.
 zbus = { version = "6.0.0", features = [
     "proxy",
+    "serde_bytes",
 ], default-features = false }
 ntest = "0.10.0"
 rand = "0.10.0"
 futures-util = { version = "0.3.30", default-features = true }
 tracing = "0.1.40"
-rustix = { version = "1.1.2", features = ["net", "process"] }
+# `thread` pins the threads of the benchmarks to CPUs of their own, and `param` tells the
+# comparison with other brokers how long a clock tick of the CPU times of /proc is.
+rustix = { version = "1.1.2", features = ["net", "process", "thread", "param"] }
+criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
+serde = { version = "1.0.200", features = ["derive"] }
+serde_bytes = "0.11.19"
+# The channels that stop the services and the bus of the benchmarks, and hand the replies on a
+# shared connection to their callers.
+zruntime = { version = "0.2.2", features = ["mpmc"], default-features = false }
+# The comparison with other brokers writes its results as JSON, and reads them back: its runs keep
+# the order of their fields, and their numbers read back exactly as they were written.
+serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
+# The comparison's command line, with the usage and the context of an error in its message.
+clap = { version = "4.5.4", features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+], default-features = false }
+
+# The comparison with other brokers measures the CPU time of their processes with `getrusage`,
+# which rustix has no call for.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2.191"
 
 [profile.release]
 lto = "fat"
@@ -83,3 +125,9 @@ strip = "symbols"
 # No one needs an undebuggable release binary
 debug = "full"
 
+# The benchmarks build busd with the optimizations of the release profile, but keep its symbols in
+# the binary, so that CodSpeed can tell which functions the time goes to. It does not ship quite so:
+# cargo builds every benchmark to unwind on a panic, and with the features of the dev-dependencies.
+[profile.bench]
+split-debuginfo = "off"
+strip = "none"
