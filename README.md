@@ -1,10 +1,23 @@
-<img alt="Project logo: a bus" src="data/logo.svg" width="200">
+<p align="center">
+  <a href="https://crates.io/crates/busd">
+    <img alt="crates.io" src="https://img.shields.io/crates/v/busd">
+  </a>
+  <a href="https://github.com/z-galaxy/busd/actions/workflows/ci.yml">
+    <img alt="Build Status"
+      src="https://github.com/z-galaxy/busd/actions/workflows/ci.yml/badge.svg">
+  </a>
+  <a href="https://app.codspeed.io/z-galaxy/busd?utm_source=badge">
+    <img alt="CodSpeed" src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json">
+  </a>
+</p>
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/z-galaxy/busd/ci.yml?branch=main)](https://github.com/z-galaxy/busd/actions?query=branch%3Amain)
-[![crates.io](https://img.shields.io/crates/v/busd.svg)](https://crates.io/crates/busd)
-[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/z-galaxy/busd?utm_source=badge)
+<p align="center">
+  <img alt="Project logo: a bus"
+    src="https://raw.githubusercontent.com/z-galaxy/busd/d1eebb1097c46e3a195d9994c4539c7ec51b5266/data/logo.svg"
+    width="200">
+</p>
 
-# busd
+<h1 align="center">busd</h1>
 
 A D-Bus bus (broker) implementation in Rust. Since it's pure Rust, it's much easier to cross-build
 than other D-Bus brokers.
