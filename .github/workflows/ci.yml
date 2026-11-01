@@ -26,6 +26,32 @@ jobs:
       - name: Run tests on stable Rust
         run: cargo --locked test
 
+  msrv:
+    runs-on: ubuntu-latest
+    env:
+      RUST_LOG: "trace"
+      RUST_BACKTRACE: "full"
+      RUSTFLAGS: -D warnings
+      # The `rust-version` of Cargo.toml.
+      MSRV: 1.89.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests with the MSRV
+        run: cargo --locked test
+      - name: Check the build without default features with the MSRV
+        run: cargo --locked check --no-default-features
+      # Some dependencies, such as rustix and zruntime, build code of their own for macOS, and
+      # checking it takes no Mac.
+      - name: Check the build for macOS with the MSRV
+        run: |
+          cargo --locked check --target x86_64-apple-darwin --lib --bins --tests
+          cargo --locked check --target x86_64-apple-darwin --no-default-features
+
   fmt:
     runs-on: ubuntu-latest
     steps:
