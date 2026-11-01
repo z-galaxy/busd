@@ -71,20 +71,14 @@ impl Bus {
         let (listener, auth_mechanism) = match address.transport() {
             Transport::Unix(unix) => {
                 // Resolve address specification into address that clients can use.
-                let addr = Self::unix_addr(unix)?;
-                let path = addr
-                    .as_pathname()
-                    .expect("Address created for UNIX socket should always have a path.")
-                    .to_path_buf();
-                address = Address::new(Transport::Unix(Unix::new(UnixSocket::File(path.clone()))))
-                    .set_guid(guid.clone())?;
+                let (addr, socket) = Self::unix_addr(unix)?;
+                let unix = Unix::new(socket);
+                let listener = Self::unix_stream(addr)
+                    .await
+                    .with_context(|| format!("failed to listen on {unix}"))?;
+                address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
 
-                (
-                    Self::unix_stream(addr)
-                        .await
-                        .with_context(|| format!("failed to listen on {}", path.display()))?,
-                    AuthMechanism::External,
-                )
+                (listener, AuthMechanism::External)
             }
             Transport::Tcp(tcp) => (Self::tcp_stream(tcp).await?, AuthMechanism::Anonymous),
             _ => bail!("Unsupported address `{}`.", address),
@@ -157,7 +151,10 @@ impl Bus {
         }
     }
 
-    fn unix_addr(unix: &Unix) -> Result<std::os::unix::net::SocketAddr> {
+    /// The address to listen on for `unix`, and the socket that clients connect to.
+    ///
+    /// For a directory, the socket is a file of a random name in it.
+    fn unix_addr(unix: &Unix) -> Result<(std::os::unix::net::SocketAddr, UnixSocket)> {
         use std::os::unix::net::SocketAddr;
 
         Ok(match unix.path() {
@@ -171,7 +168,7 @@ impl Bus {
                     name.to_string_lossy()
                 );
 
-                addr
+                (addr, UnixSocket::Abstract(name.clone()))
             }
             UnixSocket::File(path) => {
                 let addr = SocketAddr::from_pathname(path)?;
@@ -180,7 +177,7 @@ impl Bus {
                     path.to_string_lossy()
                 );
 
-                addr
+                (addr, UnixSocket::File(path.clone()))
             }
             UnixSocket::Dir(dir) | UnixSocket::TmpDir(dir) => {
                 let path = dir.join(format!("dbus-{}", fastrand::u32(1_000_000..u32::MAX)));
@@ -190,7 +187,7 @@ impl Bus {
                     path.to_string_lossy()
                 );
 
-                addr
+                (addr, UnixSocket::File(path))
             }
             _ => bail!("Unsupported address."),
         })
