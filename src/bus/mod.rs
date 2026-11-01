@@ -328,8 +328,3 @@ fn default_address() -> String {
 
     format!("unix:dir={}", dir.display())
 }
-
-#[cfg(not(unix))]
-fn default_address() -> String {
-    "tcp:host=127.0.0.1,port=4242".to_string()
-}
