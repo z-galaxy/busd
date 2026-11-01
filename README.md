@@ -90,11 +90,14 @@ Running a session instance is super easy:
 busd --print-address
 ```
 
-`--print-address` will print the address of the bus to stdout. You can then use that address to
-connect to the bus:
+`--print-address` will print the address of the bus to stdout. By default, busd listens where the
+session configuration of [dbus-daemon], `/usr/share/dbus-1/session.conf`, tells it to: usually on a
+socket in `/tmp`. Without that file, it listens on a socket in the user's runtime directory,
+`$XDG_RUNTIME_DIR`, or in the directory for temporary files if there's none. You can then use the
+address that busd printed to connect to the bus:
 
 ```bash
-export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus,guid=d0af79a44c000ce7985797ba649dbc05"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/dbus-2818978930,guid=794623ae7cf44eb69a27f57e9ea4af6b"
 busctl --user introspect org.freedesktop.DBus /org/freedesktop/DBus
 busctl --user list
 ```
