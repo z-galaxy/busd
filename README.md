@@ -114,13 +114,13 @@ busctl call --user com.intel.dleyna-renderer /com/intel/dLeynaRenderer com.intel
 
 ### Full compatibility with the D-Bus specification
 
-Implement all features that manadated and recommended by the [specification].
+Implement all features that the [specification] mandates or recommends.
 
 ### Additional Header Fields
 
 While the D-Bus spec does not allow custom header fields in messages, `busd` will still support a
-few additional on-demand (only) fields, that are useful for certain applications. One example is
-addition of [peer credentials] on every message, which can avoid round-trips on the bus.
+few additional on-demand (only) fields that are useful for certain applications. One example is the
+addition of [peer credentials] to every message, which can avoid round trips on the bus.
 
 ## License
 
