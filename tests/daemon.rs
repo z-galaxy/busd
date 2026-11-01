@@ -2,7 +2,7 @@
 
 use std::{
     env::temp_dir,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     str::FromStr,
     thread,
@@ -24,7 +24,7 @@ use zbus::Address;
 fn sigterm() {
     let s = Alphanumeric.sample_string(&mut rng(), 10);
     let path = temp_dir().join(s);
-    let mut busd = Busd::spawn(&format!("unix:path={}", path.display()));
+    let mut busd = Busd::spawn(&format!("unix:path={}", path.display()), None);
     // Once busd prints its address, it listens.
     busd.address();
     assert!(path.exists(), "busd doesn't listen on {}", path.display());
@@ -34,6 +34,22 @@ fn sigterm() {
     assert!(!path.exists(), "busd left {} behind", path.display());
 }
 
+/// What `--print-address` prints to stdout is the address alone, however much busd logs, so that
+/// a script can read it from there.
+#[test]
+#[timeout(30000)]
+fn print_address() {
+    let s = Alphanumeric.sample_string(&mut rng(), 10);
+    let path = temp_dir().join(s);
+    let mut busd = Busd::spawn(&format!("unix:path={}", path.display()), Some("trace"));
+    busd.address();
+
+    busd.stop(Signal::TERM);
+    let mut rest = String::new();
+    busd.stdout.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, "", "busd printed more than its address");
+}
+
 /// A busd process, killed if it's still running when dropped.
 struct Busd {
     child: Child,
@@ -41,18 +57,22 @@ struct Busd {
 }
 
 impl Busd {
-    /// Starts busd, listening on `address`.
+    /// Starts busd, listening on `address`, and logging what `log` says, as `RUST_LOG` would.
     ///
-    /// It reads the session configuration of the tests, rather than the one of the system, and
-    /// logs its errors alone, as it does without `RUST_LOG`, whatever the `RUST_LOG` of the tests.
-    fn spawn(address: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_busd"))
+    /// It reads the session configuration of the tests, rather than the one of the system. Without
+    /// `log`, it logs its errors alone, as it does without `RUST_LOG`, whatever the `RUST_LOG` of
+    /// the tests.
+    fn spawn(address: &str, log: Option<&str>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_busd"));
+        command
             .args(["--config", CONFIG, "--address", address, "--print-address"])
-            .env_remove("RUST_LOG")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        match log {
+            Some(log) => command.env("RUST_LOG", log),
+            None => command.env_remove("RUST_LOG"),
+        };
+        let mut child = command.spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
 
         Self { child, stdout }
@@ -62,8 +82,10 @@ impl Busd {
     fn address(&mut self) -> Address {
         let mut line = String::new();
         self.stdout.read_line(&mut line).unwrap();
+        let line = line.trim_end();
 
-        Address::from_str(line.trim_end()).unwrap()
+        Address::from_str(line)
+            .unwrap_or_else(|e| panic!("busd printed `{line}` rather than an address: {e}"))
     }
 
     /// Sends `signal` to busd, and waits a few seconds at most for it to exit.

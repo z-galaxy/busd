@@ -24,9 +24,11 @@ pub fn init() {
             Err(_) => Targets::new().with_default(LevelFilter::ERROR),
         };
         // The formatter's own level filter defaults to INFO, which would cap whatever `targets`
-        // lets through, so open it fully and leave the filtering to `targets`.
+        // lets through, so open it fully and leave the filtering to `targets`. The logs go to
+        // stderr, so that stdout carries only what `--print-address` prints.
         FmtSubscriber::builder()
             .with_max_level(LevelFilter::TRACE)
+            .with_writer(std::io::stderr)
             .finish()
             .with(targets)
             .init();
