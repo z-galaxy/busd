@@ -31,6 +31,9 @@ must call `.detach()`.
 cargo build
 cargo build --release
 
+# Build with profile-guided optimization, which needs `rustup component add llvm-tools`
+./build-pgo.sh
+
 # Run a session bus and print its address
 cargo run -- --print-address
 

@@ -110,6 +110,36 @@ Since auto-starting of services is not yet implemented, you'll have to start ser
 busctl call --user com.intel.dleyna-renderer /com/intel/dLeynaRenderer com.intel.dLeynaRenderer.Manager GetRenderers
 ```
 
+### Profile-guided optimization
+
+Those who build busd for others, such as distributions, can optimize it for the traffic of a bus,
+with [profile-guided optimization] (PGO), by building it with `build-pgo.sh` rather than
+`cargo build --release`:
+
+```bash
+rustup component add llvm-tools
+./build-pgo.sh
+```
+
+The script builds busd with instrumentation first, has the clients of the
+[comparison with other brokers](benches/README.md#against-other-brokers-compare) make their traffic
+through it, once for each workload, and then builds it as it ships, with the profile of that
+traffic, to `target/<host>/release/busd`, such as `target/x86_64-unknown-linux-gnu/release/busd`,
+whose path it prints. On those workloads, on a cloud VM of 4 vCPUs, such a build took about 9% less
+time than one without PGO with 20 or 100 clients at once, and 5 to 13% less CPU time, but little or
+no less with one client. Its binary is 6% larger. A bus whose traffic differs from what busd trains
+on may gain less.
+
+The script needs the `llvm-profdata` of the LLVM that rustc is built with, which rustup's
+`llvm-tools` component has, or another one in `LLVM_PROFDATA`, and busd's dev-dependencies, for the
+clients. It passes its arguments, such as `--no-default-features`, and the flags of `RUSTFLAGS` on
+to both builds of busd. The comparison measures such a build against a plain one as another broker:
+
+```bash
+cargo bench --bench compare -- \
+    --broker "busd-pgo=target/x86_64-unknown-linux-gnu/release/busd --address {address}"
+```
+
 ## The plan
 
 ### Full compatibility with the D-Bus specification
@@ -139,6 +169,7 @@ addition of [peer credentials] to every message, which can avoid round trips on 
 </a>
 
 [specification]: https://dbus.freedesktop.org/doc/dbus-specification.html
+[profile-guided optimization]: https://doc.rust-lang.org/rustc/profile-guided-optimization.html
 [peer credentials]: https://github.com/z-galaxy/busd/issues/29
 [dbus-broker]: https://github.com/bus1/dbus-broker
 [dbus-daemon]: https://gitlab.freedesktop.org/dbus/dbus

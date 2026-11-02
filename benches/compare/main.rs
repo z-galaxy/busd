@@ -251,7 +251,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Runs the client of a workload against the bus at an address once: what each run of the
-    /// comparison spawns.
+    /// comparison spawns, and what `build-pgo.sh` trains busd with.
     #[command(hide = true)]
     Client {
         /// The workload to run.
