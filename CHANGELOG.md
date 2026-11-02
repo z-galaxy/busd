@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.6.1 - 2026-11-02
+
+### 📝 Documentation
+- Link to LICENSE-MIT from CONTRIBUTING.md. #414
+
+### 🐛 Fixed
+- Remove the socket file on SIGTERM too. #410
+- Don't panic on an abstract UNIX socket address. #409
+
+### ⚙️ Other
+- 🔊 Log to stderr rather than stdout. #411
+- 🚩 Enable the usage and the error context of clap. #412
+
 ## 0.6.0 - 2026-11-01
 
 ### 👷 CI
