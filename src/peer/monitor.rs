@@ -16,6 +16,7 @@ use super::{Peer, Recipient};
 pub struct Monitor {
     conn: Connection,
     recipient: Recipient,
+    id: usize,
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
 }
@@ -28,6 +29,12 @@ impl Monitor {
     /// Where the bus sends the messages for the monitor: where it sent those for its peer.
     pub fn recipient(&self) -> &Recipient {
         &self.recipient
+    }
+
+    /// The number of the peer that became the monitor, which no other peer, or monitor, that the
+    /// bus ever has shares.
+    pub fn id(&self) -> usize {
+        self.id
     }
 
     pub fn unique_name(&self) -> &OwnedUniqueName {
@@ -66,6 +73,7 @@ impl Monitor {
         Self {
             conn: peer.conn().clone(),
             recipient: peer.recipient().clone(),
+            id: peer.id(),
             unique_name: peer.unique_name().clone(),
             match_rules,
         }

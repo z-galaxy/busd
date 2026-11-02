@@ -183,10 +183,9 @@ impl NameRegistry {
         all_changed
     }
 
-    pub fn lookup(&self, name: WellKnownName) -> Option<OwnedUniqueName> {
-        self.names
-            .get(name.as_str())
-            .map(|e| e.owner.unique_name.clone())
+    /// The unique name of the owner of `name`, if it has one.
+    pub fn lookup(&self, name: &WellKnownName<'_>) -> Option<&OwnedUniqueName> {
+        self.names.get(name.as_str()).map(|e| &e.owner.unique_name)
     }
 
     pub fn all_names(&self) -> &HashMap<OwnedWellKnownName, NameEntry> {

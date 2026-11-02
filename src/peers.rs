@@ -35,17 +35,14 @@ use crate::{
 /// the time the bus gets to them, up to [`MAX_BATCH`] of them and [`MAX_BATCH_BYTES`]. Each
 /// recipient gets its messages of a batch in one go, so that its socket takes them with as few
 /// writes as it can, in the order that the peer sent them, monitors included. The bus picks the
-/// recipients of the messages of a batch while it holds the locks of the peers, monitors and
-/// names, and only sends the messages once it has let go of them, as a send may wait for its
-/// recipient to read. It sends the batch to all of its recipients at once, so that those that
-/// don't read hold it up for as long as the slowest of them, rather than for as long as all of
-/// them together, and goes on to the next batch once each recipient has taken its messages or
-/// been disconnected.
+/// recipients of the messages of a batch while it holds the lock of its [`Routing`], and only
+/// sends the messages once it has let go of it, as a send may wait for its recipient to read. It
+/// sends the batch to all of its recipients at once, so that those that don't read hold it up for
+/// as long as the slowest of them, rather than for as long as all of them together, and goes on to
+/// the next batch once each recipient has taken its messages or been disconnected.
 #[derive(Debug)]
 pub struct Peers {
-    peers: RwLock<BTreeMap<OwnedUniqueName, Peer>>,
-    monitors: RwLock<BTreeMap<OwnedUniqueName, Monitor>>,
-    name_registry: RwLock<NameRegistry>,
+    routing: RwLock<Routing>,
     /// The connection on which the bus serves the D-Bus API, from when the bus is among its peers
     /// until the bus goes.
     bus_conn: Mutex<Option<Connection>>,
@@ -53,12 +50,8 @@ pub struct Peers {
 
 impl Peers {
     pub fn new() -> Arc<Self> {
-        let name_registry = NameRegistry::default();
-
         Arc::new(Self {
-            peers: RwLock::new(BTreeMap::new()),
-            monitors: RwLock::new(BTreeMap::new()),
-            name_registry: RwLock::new(name_registry),
+            routing: RwLock::new(Routing::default()),
             bus_conn: Mutex::new(None),
         })
     }
@@ -82,8 +75,8 @@ impl Peers {
         let pending_calls = peer.pending_calls().clone();
         let id = peer.id();
 
-        let mut peers = self.peers_mut().await;
-        match peers.get(&unique_name) {
+        let mut routing = self.routing_mut().await;
+        match routing.peers.get(&unique_name) {
             Some(peer) => panic!(
                 "Unique name `{}` re-used. We're in deep trouble if this happens",
                 peer.unique_name()
@@ -97,7 +90,7 @@ impl Peers {
                     pending_calls,
                 ))
                 .detach();
-                peers.insert(unique_name.clone(), peer);
+                routing.peers.insert(unique_name.clone(), peer);
             }
         }
 
@@ -114,8 +107,8 @@ impl Peers {
         let pending_calls = peer.pending_calls().clone();
         let id = peer.id();
 
-        let mut peers = self.peers_mut().await;
-        match peers.get(&unique_name) {
+        let mut routing = self.routing_mut().await;
+        match routing.peers.get(&unique_name) {
             Some(peer) => panic!(
                 "Unique name `{}` re-used. We're in deep trouble if this happens",
                 peer.unique_name()
@@ -129,7 +122,7 @@ impl Peers {
                     pending_calls,
                 ))
                 .detach();
-                peers.insert(unique_name.clone(), peer);
+                routing.peers.insert(unique_name.clone(), peer);
             }
         }
     }
@@ -143,20 +136,14 @@ impl Peers {
         self.bus_conn().take();
     }
 
-    pub async fn peers(&self) -> impl Deref<Target = BTreeMap<OwnedUniqueName, Peer>> + '_ {
-        self.peers.read().await
+    /// What the bus routes messages by, to read.
+    pub async fn routing(&self) -> impl Deref<Target = Routing> + '_ {
+        self.routing.read().await
     }
 
-    pub async fn peers_mut(&self) -> impl DerefMut<Target = BTreeMap<OwnedUniqueName, Peer>> + '_ {
-        self.peers.write().await
-    }
-
-    pub async fn name_registry(&self) -> impl Deref<Target = NameRegistry> + '_ {
-        self.name_registry.read().await
-    }
-
-    pub async fn name_registry_mut(&self) -> impl DerefMut<Target = NameRegistry> + '_ {
-        self.name_registry.write().await
+    /// What the bus routes messages by, to change.
+    pub async fn routing_mut(&self) -> impl DerefMut<Target = Routing> + '_ {
+        self.routing.write().await
     }
 
     pub async fn make_monitor(
@@ -164,29 +151,20 @@ impl Peers {
         peer_name: &UniqueName<'_>,
         match_rules: MatchRules,
     ) -> bool {
-        let monitor = {
-            let mut peers = self.peers_mut().await;
-            let peer = match peers.remove(peer_name.as_str()) {
-                Some(peer) => peer,
-                None => {
-                    return false;
-                }
-            };
-
-            peer.become_monitor(match_rules)
+        let mut routing = self.routing_mut().await;
+        let Some(peer) = routing.peers.remove(peer_name.as_str()) else {
+            return false;
         };
-
+        let monitor = peer.become_monitor(match_rules);
         let monitor_monitoring_fut = monitor.monitor();
         let unique_name = monitor.unique_name().clone();
-        let peers = self.clone();
-        self.monitors
-            .write()
-            .await
-            .insert(unique_name.clone(), monitor);
+        routing.monitors.insert(unique_name.clone(), monitor);
+        drop(routing);
 
+        let peers = self.clone();
         spawn(async move {
             monitor_monitoring_fut.await;
-            peers.monitors.write().await.remove(&unique_name);
+            peers.routing_mut().await.monitors.remove(&unique_name);
             debug!("Monitor {} disconnected", unique_name);
         })
         .detach();
@@ -244,6 +222,7 @@ impl Peers {
         pending_calls: Arc<PendingCalls>,
     ) -> Result<()> {
         let mut batch = Vec::new();
+        let mut outbox = Outbox::default();
         loop {
             let msg = match select(cancellation_listener, peer_stream.next()).await {
                 Either::Left(_) | Either::Right((None, _)) => {
@@ -289,7 +268,7 @@ impl Peers {
                 }
             }
 
-            self.forward(&unique_name, id, &pending_calls, &batch)
+            self.forward(&unique_name, id, &pending_calls, &batch, &mut outbox)
                 .await?;
             batch.clear();
             if too_many_fds {
@@ -310,17 +289,23 @@ impl Peers {
         // Stream is done means the peer disconnected or it became a monitor, unless the peer sent
         // a message that gets it disconnected. Remove it from the list of peers: that, and the end
         // of its stream, close its connection.
-        let removed = self.peers_mut().await.remove(&unique_name).is_some();
+        let removed = self
+            .routing_mut()
+            .await
+            .peers
+            .remove(&unique_name)
+            .is_some();
         // The calls that the peer made won't get their replies to it now.
-        for peer in self.peers().await.values() {
+        for peer in self.routing().await.peers.values() {
             peer.pending_calls().forget(id);
         }
         // Not being in the list means the peer was turned into a monitor. `Monitoring` iface
         // emits the signals then.
         if removed {
             let names_changes = self
-                .name_registry_mut()
+                .routing_mut()
                 .await
+                .name_registry
                 .release_all(unique_name.inner().clone())
                 .await;
             for changed in names_changes {
@@ -344,7 +329,7 @@ impl Peers {
     }
 
     /// Forward `msgs`, which the peer `sender`, numbered `sender_id`, sent in this order, to their
-    /// recipients.
+    /// recipients, through the empty `outbox` of the task that serves `sender`.
     ///
     /// Each recipient gets those of `msgs` that go to it in one go, in order, and all of them get
     /// theirs at once.
@@ -361,25 +346,29 @@ impl Peers {
         sender_id: usize,
         pending_calls: &PendingCalls,
         msgs: &[Message],
+        outbox: &mut Outbox,
     ) -> Result<()> {
         let from_bus = *sender == fdo::BUS_NAME;
         // The calls that the bus refuses.
         let mut refused = Vec::new();
-        let sends = {
-            let name_registry = self.name_registry().await;
-            let peers = self.peers.read().await;
-            let monitors = self.monitors.read().await;
-            let mut outbox = Outbox::new(msgs);
+        // The recipients are picked under the lock, and only sent their messages without it.
+        {
+            let routing = self.routing().await;
+            let Routing {
+                peers,
+                monitors,
+                name_registry,
+            } = &*routing;
             for (i, msg) in msgs.iter().enumerate() {
                 if msg.message_type() == message::Type::Signal {
                     trace!("Broadcasting message: {:?}", msg);
                     for (name, peer) in peers.iter() {
-                        if !peer.interested(msg, &name_registry) {
+                        if !peer.interested(msg, name_registry) {
                             trace!("Peer {} not interested in {msg:?}", name);
                             continue;
                         }
 
-                        outbox.add(name, peer.recipient(), i);
+                        outbox.add(msgs, peer.id(), peer.recipient(), i);
                     }
                 } else {
                     let header = msg.header();
@@ -394,7 +383,7 @@ impl Peers {
                     );
                     let peer = match destination {
                         BusName::Unique(name) => peers.get_key_value(name.as_str()),
-                        BusName::WellKnown(name) => match name_registry.lookup(name.clone()) {
+                        BusName::WellKnown(name) => match name_registry.lookup(name) {
                             Some(owner) => peers.get_key_value(owner.as_str()),
                             None => {
                                 warn!("unknown destination: {}", name);
@@ -438,7 +427,7 @@ impl Peers {
 
                                 continue;
                             }
-                            outbox.add(name, peer.recipient(), i)
+                            outbox.add(msgs, peer.id(), peer.recipient(), i)
                         }
                         None => debug!("no peer for destination `{destination}`"),
                     }
@@ -452,28 +441,17 @@ impl Peers {
                     msg
                 );
                 for (name, monitor) in monitors.iter() {
-                    if !monitor.interested(msg, &name_registry) {
+                    if !monitor.interested(msg, name_registry) {
                         trace!("Monitor {} not interested in {msg:?}", name);
                         continue;
                     }
 
-                    outbox.add(name, monitor.recipient(), i);
+                    outbox.add(msgs, monitor.id(), monitor.recipient(), i);
                 }
             }
-
-            outbox.into_sends()
-        };
-
-        match &sends[..] {
-            [] => (),
-            [(recipient, share)] => recipient.send(share.of(msgs)).await,
-            sends => {
-                let sends = sends
-                    .iter()
-                    .map(|(recipient, share)| recipient.send(share.of(msgs)));
-                join_all(sends).await;
-            }
         }
+
+        outbox.send(msgs).await;
         for i in refused {
             let error =
                 Message::error(&msgs[i].header(), "org.freedesktop.DBus.Error.AccessDenied")
@@ -499,6 +477,24 @@ impl Peers {
         // Nothing can panic while the lock is held.
         self.bus_conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// What the bus routes messages by: its peers, its monitors and the owners of its names.
+///
+/// They are all behind one lock, so that the bus takes one lock to pick the recipients of a batch.
+#[derive(Debug, Default)]
+pub struct Routing {
+    /// The peers, by their unique names.
+    ///
+    /// They are hashed, with foldhash, so that finding the peer that a message goes to takes one
+    /// hash of the name and one comparison with the name of the peer, rather than kept in a tree,
+    /// which would compare the name with the keys of each node on the way, every comparison
+    /// through the `:busd.` that the unique names of all clients start with.
+    pub peers: HashMap<OwnedUniqueName, Peer, foldhash::fast::RandomState>,
+    /// The owners of the well-known names, and those that queue for them.
+    pub name_registry: NameRegistry,
+    /// The monitors, by their unique names.
+    monitors: BTreeMap<OwnedUniqueName, Monitor>,
 }
 
 /// The `NoReply` error, from the bus, to the call of `caller` with `serial`, as dbus-broker sends
@@ -530,39 +526,35 @@ pub const MAX_BATCH: usize = 16;
 pub const MAX_BATCH_BYTES: usize = 16 * 1024;
 
 /// The messages of a batch that each recipient gets.
-struct Outbox<'n, 'm> {
-    /// The messages of the batch, in the order that their sender sent them.
-    batch: &'m [Message],
-    /// Each recipient, by its unique name, and its share, in the order of their first messages.
-    sends: Vec<(&'n OwnedUniqueName, Recipient, Share)>,
-    /// Where each recipient is in `sends`, by its unique name.
+///
+/// The task that serves a peer keeps its outbox from one batch to the next, as it keeps the vector
+/// of the batch, so that the outbox only allocates where a batch takes more room than those before
+/// it did, rather than for every batch.
+#[derive(Default)]
+struct Outbox {
+    /// Each recipient, by its number, and its share, in the order of their first messages.
+    sends: Vec<(usize, Recipient, Share)>,
+    /// Where each recipient is in `sends`, by its number.
     ///
     /// The recipients of the first message come up once each, so that they need no lookup, and
     /// they only go in here once the recipients of another message are looked up among them. A
     /// batch of one message, as most are when a peer waits for each reply, needs none at all.
-    index: HashMap<&'n OwnedUniqueName, usize>,
+    index: HashMap<usize, usize, foldhash::fast::RandomState>,
 }
 
-impl<'n, 'm> Outbox<'n, 'm> {
-    /// An outbox for the messages of `batch`.
-    fn new(batch: &'m [Message]) -> Self {
-        Self {
-            batch,
-            sends: Vec::new(),
-            index: HashMap::new(),
-        }
-    }
-
-    /// Add the message at `i` in the batch to the share of `recipient`, whose unique name is
-    /// `name`.
-    fn add(&mut self, name: &'n OwnedUniqueName, recipient: &Recipient, i: usize) {
+impl Outbox {
+    /// Add the message at `i` in `batch` to the share of `recipient`, whose number is `id`.
+    ///
+    /// The number of a peer is that of [`Peer::id`], which a monitor keeps from the peer that it
+    /// was, so no two recipients share one.
+    fn add(&mut self, batch: &[Message], id: usize, recipient: &Recipient, i: usize) {
         if i > 0 {
-            for (at, (name, ..)) in self.sends.iter().enumerate().skip(self.index.len()) {
-                self.index.insert(name, at);
+            for (at, (id, ..)) in self.sends.iter().enumerate().skip(self.index.len()) {
+                self.index.insert(*id, at);
             }
-            match self.index.entry(name) {
+            match self.index.entry(id) {
                 Entry::Occupied(at) => {
-                    self.sends[*at.get()].2.add(self.batch, i);
+                    self.sends[*at.get()].2.add(batch, i);
 
                     return;
                 }
@@ -573,15 +565,29 @@ impl<'n, 'm> Outbox<'n, 'm> {
         }
 
         self.sends
-            .push((name, recipient.clone(), Share::Run(i..i + 1)));
+            .push((id, recipient.clone(), Share::Run(i..i + 1)));
     }
 
-    /// Each recipient and its share, in the order of their first messages.
-    fn into_sends(self) -> Vec<(Recipient, Share)> {
-        self.sends
-            .into_iter()
-            .map(|(_, recipient, share)| (recipient, share))
-            .collect()
+    /// Send each recipient its share of `batch`, all of them at once, and empty the outbox for the
+    /// next batch.
+    ///
+    /// The outbox lets go of the recipients, and the messages of their shares, as soon as they are
+    /// sent, rather than with the next batch, which may be a long time coming: a recipient holds
+    /// the connection of its client, which stays open for as long as it is held, and a message the
+    /// file descriptors that it carries.
+    async fn send(&mut self, batch: &[Message]) {
+        match &self.sends[..] {
+            [] => (),
+            [(_, recipient, share)] => recipient.send(share.of(batch)).await,
+            sends => {
+                let sends = sends
+                    .iter()
+                    .map(|(_, recipient, share)| recipient.send(share.of(batch)));
+                join_all(sends).await;
+            }
+        }
+        self.sends.clear();
+        self.index.clear();
     }
 }
 
