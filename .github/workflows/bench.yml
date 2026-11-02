@@ -43,8 +43,8 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
           # What can't change what `bus` measures, nor how it runs: documentation and images, the
-          # repository's settings, the other workflows, and the code of the tests and of
-          # `compare`, which `bus` doesn't build.
+          # repository's settings, the other workflows, the script that builds busd with PGO, and
+          # the code of the tests and of `compare`, which `bus` doesn't build.
           UNMEASURED: |-
             \.md$
             ^LICENSE(-MIT)?$
@@ -53,6 +53,7 @@ jobs:
             ^\.githooks/
             ^tests/
             ^benches/compare/
+            ^build-pgo\.sh$
             ^release-plz\.toml$
             ^\.(commitlintrc\.mjs|gitignore)$
         run: |
