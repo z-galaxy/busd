@@ -31,21 +31,21 @@ impl MatchRules {
             }
 
             // Then match sender and destination involving well-known names, manually.
-            if let Some(sender) = rule.sender().cloned().and_then(|name| match name {
-                BusName::WellKnown(name) => name_registry.lookup(name).as_deref().cloned(),
+            if let Some(sender) = rule.sender().and_then(|name| match name {
+                BusName::WellKnown(name) => name_registry.lookup(name),
                 // Unique name is already taken care of by the zbus API.
                 BusName::Unique(_) => None,
             }) {
-                if sender != hdr.sender().expect("SENDER field unset").clone() {
+                if sender != hdr.sender().expect("SENDER field unset") {
                     return false;
                 }
             }
 
             // The destination.
             if let Some(destination) = rule.destination() {
-                match hdr.destination().cloned() {
+                match hdr.destination() {
                     Some(BusName::WellKnown(name)) => match name_registry.lookup(name) {
-                        Some(name) if name == *destination => (),
+                        Some(name) if name == destination => (),
                         Some(_) => return false,
                         None => return false,
                     },

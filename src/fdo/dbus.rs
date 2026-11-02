@@ -162,9 +162,11 @@ impl DBus {
         let peers = self.peers()?;
         let routing = peers.routing().await;
         match name {
-            BusName::WellKnown(name) => routing.name_registry.lookup(name).ok_or_else(|| {
-                Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
-            }),
+            BusName::WellKnown(name) => {
+                routing.name_registry.lookup(&name).cloned().ok_or_else(|| {
+                    Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
+                })
+            }
             BusName::Unique(name) => {
                 if routing.peers.contains_key(&*name) {
                     Ok(name.into())

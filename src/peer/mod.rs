@@ -134,8 +134,8 @@ impl Peer {
         match msg.header().destination() {
             Some(BusName::Unique(name)) => *name == *self.unique_name,
             Some(BusName::WellKnown(name)) => name_registry
-                .lookup(name.clone())
-                .is_some_and(|owner| owner == self.unique_name),
+                .lookup(name)
+                .is_some_and(|owner| *owner == self.unique_name),
             None => self.match_rules.matches(msg, name_registry),
         }
     }

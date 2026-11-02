@@ -383,7 +383,7 @@ impl Peers {
                     );
                     let peer = match destination {
                         BusName::Unique(name) => peers.get_key_value(name.as_str()),
-                        BusName::WellKnown(name) => match name_registry.lookup(name.clone()) {
+                        BusName::WellKnown(name) => match name_registry.lookup(name) {
                             Some(owner) => peers.get_key_value(owner.as_str()),
                             None => {
                                 warn!("unknown destination: {}", name);
