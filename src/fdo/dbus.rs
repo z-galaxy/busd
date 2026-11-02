@@ -43,8 +43,9 @@ impl DBus {
     {
         let name = msg_sender(&hdr);
         let peers = self.peers()?;
-        let mut peers = peers.peers_mut().await;
-        let peer = peers
+        let mut routing = peers.routing_mut().await;
+        let peer = routing
+            .peers
             .get_mut(name.as_str())
             .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
 
@@ -69,8 +70,9 @@ impl DBus {
     ) -> Result<ResponseDispatchNotifier<OwnedUniqueName>> {
         let name = msg_sender(&hdr);
         let peers = self.peers()?;
-        let mut peers = peers.peers_mut().await;
-        let peer = peers
+        let mut routing = peers.routing_mut().await;
+        let peer = routing
+            .peers
             .get_mut(name.as_str())
             .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
         peer.hello().await?;
@@ -116,8 +118,9 @@ impl DBus {
         let unique_name = msg_sender(&hdr);
         let peers = self.peers()?;
         let (reply, name_owner_changed) = peers
-            .name_registry_mut()
+            .routing_mut()
             .await
+            .name_registry
             .request_name(name, unique_name.clone(), flags)
             .await;
         if let Some(changed) = name_owner_changed {
@@ -139,8 +142,9 @@ impl DBus {
         let unique_name = msg_sender(&hdr);
         let peers = self.peers()?;
         let (reply, name_owner_changed) = peers
-            .name_registry_mut()
+            .routing_mut()
             .await
+            .name_registry
             .release_name(name, unique_name.clone())
             .await;
         if let Some(changed) = name_owner_changed {
@@ -156,12 +160,13 @@ impl DBus {
     /// Returns the unique connection name of the primary owner of the name given.
     async fn get_name_owner(&self, name: BusName<'_>) -> Result<OwnedUniqueName> {
         let peers = self.peers()?;
+        let routing = peers.routing().await;
         match name {
-            BusName::WellKnown(name) => peers.name_registry().await.lookup(name).ok_or_else(|| {
+            BusName::WellKnown(name) => routing.name_registry.lookup(name).ok_or_else(|| {
                 Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
             }),
             BusName::Unique(name) => {
-                if peers.peers().await.contains_key(&*name) {
+                if routing.peers.contains_key(&*name) {
                     Ok(name.into())
                 } else {
                     Err(Error::NameHasNoOwner(
@@ -210,11 +215,12 @@ impl DBus {
         bus_name: BusName<'_>,
     ) -> Result<Arc<ConnectionCredentials>> {
         let owner = self.get_name_owner(bus_name.clone()).await?;
-        // Not under the lock of the peers: this waits for any send to the peer that is under way.
+        // Not under the lock of the routing: this waits for any send to the peer that is under way.
         let conn = self
             .peers()?
-            .peers()
+            .routing()
             .await
+            .peers
             .get(&owner)
             .map(|peer| peer.conn().clone())
             .ok_or_else(|| Error::Failed(format!("Peer `{bus_name}` not found")))?;
@@ -280,18 +286,17 @@ impl DBus {
     /// Returns a list of all currently-owned names on the bus.
     async fn list_names(&self) -> Result<Vec<OwnedBusName>> {
         let peers = self.peers()?;
-        let mut names: Vec<_> = peers
-            .peers()
-            .await
+        let routing = peers.routing().await;
+        let mut names: Vec<_> = routing
+            .peers
             .keys()
             .cloned()
             .map(|n| BusName::Unique(n.into()).into())
             .collect();
 
         names.extend(
-            peers
-                .name_registry()
-                .await
+            routing
+                .name_registry
                 .all_names()
                 .keys()
                 .map(|n| BusName::WellKnown(n.into()).into()),
@@ -303,8 +308,9 @@ impl DBus {
     /// List the connections currently queued for a bus name.
     async fn list_queued_owners(&self, name: WellKnownName<'_>) -> Result<Vec<OwnedUniqueName>> {
         self.peers()?
-            .name_registry()
+            .routing()
             .await
+            .name_registry
             .waiting_list(name)
             .ok_or_else(|| {
                 Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())

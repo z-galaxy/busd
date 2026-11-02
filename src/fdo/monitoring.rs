@@ -59,8 +59,9 @@ impl Monitoring {
             listener.await;
 
             let names_changes = peers
-                .name_registry_mut()
+                .routing_mut()
                 .await
+                .name_registry
                 .release_all(owner.clone())
                 .await;
             for changed in names_changes {

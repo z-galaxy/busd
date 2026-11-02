@@ -35,17 +35,14 @@ use crate::{
 /// the time the bus gets to them, up to [`MAX_BATCH`] of them and [`MAX_BATCH_BYTES`]. Each
 /// recipient gets its messages of a batch in one go, so that its socket takes them with as few
 /// writes as it can, in the order that the peer sent them, monitors included. The bus picks the
-/// recipients of the messages of a batch while it holds the locks of the peers, monitors and
-/// names, and only sends the messages once it has let go of them, as a send may wait for its
-/// recipient to read. It sends the batch to all of its recipients at once, so that those that
-/// don't read hold it up for as long as the slowest of them, rather than for as long as all of
-/// them together, and goes on to the next batch once each recipient has taken its messages or
-/// been disconnected.
+/// recipients of the messages of a batch while it holds the lock of its [`Routing`], and only
+/// sends the messages once it has let go of it, as a send may wait for its recipient to read. It
+/// sends the batch to all of its recipients at once, so that those that don't read hold it up for
+/// as long as the slowest of them, rather than for as long as all of them together, and goes on to
+/// the next batch once each recipient has taken its messages or been disconnected.
 #[derive(Debug)]
 pub struct Peers {
-    peers: RwLock<BTreeMap<OwnedUniqueName, Peer>>,
-    monitors: RwLock<BTreeMap<OwnedUniqueName, Monitor>>,
-    name_registry: RwLock<NameRegistry>,
+    routing: RwLock<Routing>,
     /// The connection on which the bus serves the D-Bus API, from when the bus is among its peers
     /// until the bus goes.
     bus_conn: Mutex<Option<Connection>>,
@@ -53,12 +50,8 @@ pub struct Peers {
 
 impl Peers {
     pub fn new() -> Arc<Self> {
-        let name_registry = NameRegistry::default();
-
         Arc::new(Self {
-            peers: RwLock::new(BTreeMap::new()),
-            monitors: RwLock::new(BTreeMap::new()),
-            name_registry: RwLock::new(name_registry),
+            routing: RwLock::new(Routing::default()),
             bus_conn: Mutex::new(None),
         })
     }
@@ -82,8 +75,8 @@ impl Peers {
         let pending_calls = peer.pending_calls().clone();
         let id = peer.id();
 
-        let mut peers = self.peers_mut().await;
-        match peers.get(&unique_name) {
+        let mut routing = self.routing_mut().await;
+        match routing.peers.get(&unique_name) {
             Some(peer) => panic!(
                 "Unique name `{}` re-used. We're in deep trouble if this happens",
                 peer.unique_name()
@@ -97,7 +90,7 @@ impl Peers {
                     pending_calls,
                 ))
                 .detach();
-                peers.insert(unique_name.clone(), peer);
+                routing.peers.insert(unique_name.clone(), peer);
             }
         }
 
@@ -114,8 +107,8 @@ impl Peers {
         let pending_calls = peer.pending_calls().clone();
         let id = peer.id();
 
-        let mut peers = self.peers_mut().await;
-        match peers.get(&unique_name) {
+        let mut routing = self.routing_mut().await;
+        match routing.peers.get(&unique_name) {
             Some(peer) => panic!(
                 "Unique name `{}` re-used. We're in deep trouble if this happens",
                 peer.unique_name()
@@ -129,7 +122,7 @@ impl Peers {
                     pending_calls,
                 ))
                 .detach();
-                peers.insert(unique_name.clone(), peer);
+                routing.peers.insert(unique_name.clone(), peer);
             }
         }
     }
@@ -143,20 +136,14 @@ impl Peers {
         self.bus_conn().take();
     }
 
-    pub async fn peers(&self) -> impl Deref<Target = BTreeMap<OwnedUniqueName, Peer>> + '_ {
-        self.peers.read().await
+    /// What the bus routes messages by, to read.
+    pub async fn routing(&self) -> impl Deref<Target = Routing> + '_ {
+        self.routing.read().await
     }
 
-    pub async fn peers_mut(&self) -> impl DerefMut<Target = BTreeMap<OwnedUniqueName, Peer>> + '_ {
-        self.peers.write().await
-    }
-
-    pub async fn name_registry(&self) -> impl Deref<Target = NameRegistry> + '_ {
-        self.name_registry.read().await
-    }
-
-    pub async fn name_registry_mut(&self) -> impl DerefMut<Target = NameRegistry> + '_ {
-        self.name_registry.write().await
+    /// What the bus routes messages by, to change.
+    pub async fn routing_mut(&self) -> impl DerefMut<Target = Routing> + '_ {
+        self.routing.write().await
     }
 
     pub async fn make_monitor(
@@ -164,29 +151,20 @@ impl Peers {
         peer_name: &UniqueName<'_>,
         match_rules: MatchRules,
     ) -> bool {
-        let monitor = {
-            let mut peers = self.peers_mut().await;
-            let peer = match peers.remove(peer_name.as_str()) {
-                Some(peer) => peer,
-                None => {
-                    return false;
-                }
-            };
-
-            peer.become_monitor(match_rules)
+        let mut routing = self.routing_mut().await;
+        let Some(peer) = routing.peers.remove(peer_name.as_str()) else {
+            return false;
         };
-
+        let monitor = peer.become_monitor(match_rules);
         let monitor_monitoring_fut = monitor.monitor();
         let unique_name = monitor.unique_name().clone();
-        let peers = self.clone();
-        self.monitors
-            .write()
-            .await
-            .insert(unique_name.clone(), monitor);
+        routing.monitors.insert(unique_name.clone(), monitor);
+        drop(routing);
 
+        let peers = self.clone();
         spawn(async move {
             monitor_monitoring_fut.await;
-            peers.monitors.write().await.remove(&unique_name);
+            peers.routing_mut().await.monitors.remove(&unique_name);
             debug!("Monitor {} disconnected", unique_name);
         })
         .detach();
@@ -311,17 +289,23 @@ impl Peers {
         // Stream is done means the peer disconnected or it became a monitor, unless the peer sent
         // a message that gets it disconnected. Remove it from the list of peers: that, and the end
         // of its stream, close its connection.
-        let removed = self.peers_mut().await.remove(&unique_name).is_some();
+        let removed = self
+            .routing_mut()
+            .await
+            .peers
+            .remove(&unique_name)
+            .is_some();
         // The calls that the peer made won't get their replies to it now.
-        for peer in self.peers().await.values() {
+        for peer in self.routing().await.peers.values() {
             peer.pending_calls().forget(id);
         }
         // Not being in the list means the peer was turned into a monitor. `Monitoring` iface
         // emits the signals then.
         if removed {
             let names_changes = self
-                .name_registry_mut()
+                .routing_mut()
                 .await
+                .name_registry
                 .release_all(unique_name.inner().clone())
                 .await;
             for changed in names_changes {
@@ -367,16 +351,19 @@ impl Peers {
         let from_bus = *sender == fdo::BUS_NAME;
         // The calls that the bus refuses.
         let mut refused = Vec::new();
-        // The recipients are picked under the locks, and only sent their messages without them.
+        // The recipients are picked under the lock, and only sent their messages without it.
         {
-            let name_registry = self.name_registry().await;
-            let peers = self.peers.read().await;
-            let monitors = self.monitors.read().await;
+            let routing = self.routing().await;
+            let Routing {
+                peers,
+                monitors,
+                name_registry,
+            } = &*routing;
             for (i, msg) in msgs.iter().enumerate() {
                 if msg.message_type() == message::Type::Signal {
                     trace!("Broadcasting message: {:?}", msg);
                     for (name, peer) in peers.iter() {
-                        if !peer.interested(msg, &name_registry) {
+                        if !peer.interested(msg, name_registry) {
                             trace!("Peer {} not interested in {msg:?}", name);
                             continue;
                         }
@@ -454,7 +441,7 @@ impl Peers {
                     msg
                 );
                 for (name, monitor) in monitors.iter() {
-                    if !monitor.interested(msg, &name_registry) {
+                    if !monitor.interested(msg, name_registry) {
                         trace!("Monitor {} not interested in {msg:?}", name);
                         continue;
                     }
@@ -490,6 +477,19 @@ impl Peers {
         // Nothing can panic while the lock is held.
         self.bus_conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// What the bus routes messages by: its peers, its monitors and the owners of its names.
+///
+/// They are all behind one lock, so that the bus takes one lock to pick the recipients of a batch.
+#[derive(Debug, Default)]
+pub struct Routing {
+    /// The peers, by their unique names.
+    pub peers: BTreeMap<OwnedUniqueName, Peer>,
+    /// The owners of the well-known names, and those that queue for them.
+    pub name_registry: NameRegistry,
+    /// The monitors, by their unique names.
+    monitors: BTreeMap<OwnedUniqueName, Monitor>,
 }
 
 /// The `NoReply` error, from the bus, to the call of `caller` with `serial`, as dbus-broker sends
