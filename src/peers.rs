@@ -485,7 +485,12 @@ impl Peers {
 #[derive(Debug, Default)]
 pub struct Routing {
     /// The peers, by their unique names.
-    pub peers: BTreeMap<OwnedUniqueName, Peer>,
+    ///
+    /// They are hashed, with foldhash, so that finding the peer that a message goes to takes one
+    /// hash of the name and one comparison with the name of the peer, rather than kept in a tree,
+    /// which would compare the name with the keys of each node on the way, every comparison
+    /// through the `:busd.` that the unique names of all clients start with.
+    pub peers: HashMap<OwnedUniqueName, Peer, foldhash::fast::RandomState>,
     /// The owners of the well-known names, and those that queue for them.
     pub name_registry: NameRegistry,
     /// The monitors, by their unique names.
