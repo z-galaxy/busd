@@ -82,6 +82,9 @@ cargo bench --bench compare -- --baseline main
 | `shared` | 100 callers that share a connection, then 100 clients, 1000 calls each |
 | `dicts` | the calls of `calls`, with a dict of dicts of 100 variants for their body |
 
+`build-pgo.sh` trains busd with these clients too, a run of each, for its build with
+[profile-guided optimization](../README.md#profile-guided-optimization).
+
 Each run starts a broker of its own, runs the client of a workload against it once, as a process of
 its own, and stops the broker, and the brokers take turns in an order shuffled anew for each
 round, so that whatever drift the machine has hits all of them alike. Of each run, the comparison

@@ -1,0 +1,38 @@
+# Builds busd with profile-guided optimization, as `build-pgo.sh` does for those who ship it, so
+# that a change that breaks the script, or the training of busd that it runs, shows. Only the
+# changes to what the script builds or runs, or to the script itself, run it: it builds busd twice,
+# and the clients that it trains busd with, which takes a few minutes.
+name: PGO
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - build-pgo.sh
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - benches/common/**
+      - benches/compare/**
+      - .github/workflows/pgo.yml
+  pull_request:
+    branches: [main]
+    paths: *paths
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build busd with PGO
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The llvm-profdata of llvm-tools is of the LLVM that rustc is built with, as it must be.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build busd with PGO
+        run: ./build-pgo.sh
