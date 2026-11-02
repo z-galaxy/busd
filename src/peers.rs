@@ -244,6 +244,7 @@ impl Peers {
         pending_calls: Arc<PendingCalls>,
     ) -> Result<()> {
         let mut batch = Vec::new();
+        let mut outbox = Outbox::default();
         loop {
             let msg = match select(cancellation_listener, peer_stream.next()).await {
                 Either::Left(_) | Either::Right((None, _)) => {
@@ -289,7 +290,7 @@ impl Peers {
                 }
             }
 
-            self.forward(&unique_name, id, &pending_calls, &batch)
+            self.forward(&unique_name, id, &pending_calls, &batch, &mut outbox)
                 .await?;
             batch.clear();
             if too_many_fds {
@@ -344,7 +345,7 @@ impl Peers {
     }
 
     /// Forward `msgs`, which the peer `sender`, numbered `sender_id`, sent in this order, to their
-    /// recipients.
+    /// recipients, through the empty `outbox` of the task that serves `sender`.
     ///
     /// Each recipient gets those of `msgs` that go to it in one go, in order, and all of them get
     /// theirs at once.
@@ -361,15 +362,16 @@ impl Peers {
         sender_id: usize,
         pending_calls: &PendingCalls,
         msgs: &[Message],
+        outbox: &mut Outbox,
     ) -> Result<()> {
         let from_bus = *sender == fdo::BUS_NAME;
         // The calls that the bus refuses.
         let mut refused = Vec::new();
-        let sends = {
+        // The recipients are picked under the locks, and only sent their messages without them.
+        {
             let name_registry = self.name_registry().await;
             let peers = self.peers.read().await;
             let monitors = self.monitors.read().await;
-            let mut outbox = Outbox::new(msgs);
             for (i, msg) in msgs.iter().enumerate() {
                 if msg.message_type() == message::Type::Signal {
                     trace!("Broadcasting message: {:?}", msg);
@@ -379,7 +381,7 @@ impl Peers {
                             continue;
                         }
 
-                        outbox.add(name, peer.recipient(), i);
+                        outbox.add(msgs, peer.id(), peer.recipient(), i);
                     }
                 } else {
                     let header = msg.header();
@@ -438,7 +440,7 @@ impl Peers {
 
                                 continue;
                             }
-                            outbox.add(name, peer.recipient(), i)
+                            outbox.add(msgs, peer.id(), peer.recipient(), i)
                         }
                         None => debug!("no peer for destination `{destination}`"),
                     }
@@ -457,23 +459,12 @@ impl Peers {
                         continue;
                     }
 
-                    outbox.add(name, monitor.recipient(), i);
+                    outbox.add(msgs, monitor.id(), monitor.recipient(), i);
                 }
             }
-
-            outbox.into_sends()
-        };
-
-        match &sends[..] {
-            [] => (),
-            [(recipient, share)] => recipient.send(share.of(msgs)).await,
-            sends => {
-                let sends = sends
-                    .iter()
-                    .map(|(recipient, share)| recipient.send(share.of(msgs)));
-                join_all(sends).await;
-            }
         }
+
+        outbox.send(msgs).await;
         for i in refused {
             let error =
                 Message::error(&msgs[i].header(), "org.freedesktop.DBus.Error.AccessDenied")
@@ -530,39 +521,35 @@ pub const MAX_BATCH: usize = 16;
 pub const MAX_BATCH_BYTES: usize = 16 * 1024;
 
 /// The messages of a batch that each recipient gets.
-struct Outbox<'n, 'm> {
-    /// The messages of the batch, in the order that their sender sent them.
-    batch: &'m [Message],
-    /// Each recipient, by its unique name, and its share, in the order of their first messages.
-    sends: Vec<(&'n OwnedUniqueName, Recipient, Share)>,
-    /// Where each recipient is in `sends`, by its unique name.
+///
+/// The task that serves a peer keeps its outbox from one batch to the next, as it keeps the vector
+/// of the batch, so that the outbox only allocates where a batch takes more room than those before
+/// it did, rather than for every batch.
+#[derive(Default)]
+struct Outbox {
+    /// Each recipient, by its number, and its share, in the order of their first messages.
+    sends: Vec<(usize, Recipient, Share)>,
+    /// Where each recipient is in `sends`, by its number.
     ///
     /// The recipients of the first message come up once each, so that they need no lookup, and
     /// they only go in here once the recipients of another message are looked up among them. A
     /// batch of one message, as most are when a peer waits for each reply, needs none at all.
-    index: HashMap<&'n OwnedUniqueName, usize>,
+    index: HashMap<usize, usize, foldhash::fast::RandomState>,
 }
 
-impl<'n, 'm> Outbox<'n, 'm> {
-    /// An outbox for the messages of `batch`.
-    fn new(batch: &'m [Message]) -> Self {
-        Self {
-            batch,
-            sends: Vec::new(),
-            index: HashMap::new(),
-        }
-    }
-
-    /// Add the message at `i` in the batch to the share of `recipient`, whose unique name is
-    /// `name`.
-    fn add(&mut self, name: &'n OwnedUniqueName, recipient: &Recipient, i: usize) {
+impl Outbox {
+    /// Add the message at `i` in `batch` to the share of `recipient`, whose number is `id`.
+    ///
+    /// The number of a peer is that of [`Peer::id`], which a monitor keeps from the peer that it
+    /// was, so no two recipients share one.
+    fn add(&mut self, batch: &[Message], id: usize, recipient: &Recipient, i: usize) {
         if i > 0 {
-            for (at, (name, ..)) in self.sends.iter().enumerate().skip(self.index.len()) {
-                self.index.insert(name, at);
+            for (at, (id, ..)) in self.sends.iter().enumerate().skip(self.index.len()) {
+                self.index.insert(*id, at);
             }
-            match self.index.entry(name) {
+            match self.index.entry(id) {
                 Entry::Occupied(at) => {
-                    self.sends[*at.get()].2.add(self.batch, i);
+                    self.sends[*at.get()].2.add(batch, i);
 
                     return;
                 }
@@ -573,15 +560,29 @@ impl<'n, 'm> Outbox<'n, 'm> {
         }
 
         self.sends
-            .push((name, recipient.clone(), Share::Run(i..i + 1)));
+            .push((id, recipient.clone(), Share::Run(i..i + 1)));
     }
 
-    /// Each recipient and its share, in the order of their first messages.
-    fn into_sends(self) -> Vec<(Recipient, Share)> {
-        self.sends
-            .into_iter()
-            .map(|(_, recipient, share)| (recipient, share))
-            .collect()
+    /// Send each recipient its share of `batch`, all of them at once, and empty the outbox for the
+    /// next batch.
+    ///
+    /// The outbox lets go of the recipients, and the messages of their shares, as soon as they are
+    /// sent, rather than with the next batch, which may be a long time coming: a recipient holds
+    /// the connection of its client, which stays open for as long as it is held, and a message the
+    /// file descriptors that it carries.
+    async fn send(&mut self, batch: &[Message]) {
+        match &self.sends[..] {
+            [] => (),
+            [(_, recipient, share)] => recipient.send(share.of(batch)).await,
+            sends => {
+                let sends = sends
+                    .iter()
+                    .map(|(_, recipient, share)| recipient.send(share.of(batch)));
+                join_all(sends).await;
+            }
+        }
+        self.sends.clear();
+        self.index.clear();
     }
 }
 
