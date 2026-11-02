@@ -43,8 +43,15 @@ use zruntime::{AsyncIo, Event, Shared, SharedRuntime};
 #[cfg(target_os = "linux")]
 use {
     busd::peer::MAX_MESSAGE_FDS,
-    rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags},
-    std::{io::IoSlice, mem::MaybeUninit, os::fd::AsFd},
+    rustix::net::{
+        recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
+        SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+    },
+    std::{
+        io::{IoSlice, IoSliceMut},
+        mem::MaybeUninit,
+        os::fd::AsFd,
+    },
     zbus::names::OwnedUniqueName,
 };
 
@@ -196,6 +203,21 @@ fn too_many_fds() {
     init_tracing();
 
     zruntime::block_on(with_bus(LONG_TIMEOUT, too_many_fds_));
+}
+
+/// A message that brings more file descriptors than its header declares gets to its recipient with
+/// only those that it declares.
+///
+/// The recipient reads its socket itself, as a client of zbus would only take as many file
+/// descriptors as the message declares, whatever comes along with it.
+#[cfg(target_os = "linux")]
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn undeclared_fds() {
+    init_tracing();
+
+    zruntime::block_on(with_bus(LONG_TIMEOUT, undeclared_fds_));
 }
 
 /// A client that the bus wrote part of a message to, when the time limit came, gets nothing more
@@ -789,6 +811,40 @@ async fn too_many_fds_(address: String) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+async fn undeclared_fds_(address: String) -> anyhow::Result<()> {
+    let path = address.strip_prefix("unix:path=").unwrap().to_owned();
+    let files = (0..3)
+        .map(|_| File::open("/dev/null"))
+        .collect::<io::Result<Vec<_>>>()?;
+    let (msg, fds) = zruntime::unblock(move || {
+        let (recipient, recipient_name) = RawClient::connect(&path)?;
+        // The `NameAcquired` signal of its unique name.
+        recipient.read_message()?;
+        let (sender, _) = RawClient::connect(&path)?;
+
+        // A signal that declares one file descriptor, and brings all three.
+        let signal = with_fds(&recipient_name, &files[..1])?;
+        let fds: Vec<_> = files.iter().map(AsFd::as_fd).collect();
+        sender.send_with_fds(signal.data(), &fds)?;
+
+        anyhow::Ok(recipient.read_message_with_fds()?)
+    })
+    .await?;
+    let member = b"WithFds";
+    ensure!(
+        msg.windows(member.len()).any(|bytes| bytes == member),
+        "the recipient got another message"
+    );
+    ensure!(
+        fds.len() == 1,
+        "the signal came with {} file descriptors",
+        fds.len()
+    );
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 async fn partial_write_(address: String) -> anyhow::Result<()> {
     // A client that reads what the bus sends it as it says hello, and then stops reading.
     let path = address.strip_prefix("unix:path=").unwrap().to_owned();
@@ -1279,6 +1335,13 @@ impl RawClient {
     fn send(&self, msg: &Message) -> io::Result<()> {
         let data = msg.data();
         let fds: Vec<_> = data.fds().iter().map(AsFd::as_fd).collect();
+
+        self.send_with_fds(data, &fds)
+    }
+
+    /// Send the message of `data` with `fds`, whatever its header declares, with at most
+    /// [`MAX_MESSAGE_FDS`] of them per write.
+    fn send_with_fds(&self, data: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<()> {
         let chunks: Vec<_> = fds.chunks(MAX_MESSAGE_FDS).collect();
         let mut sent = 0;
         for (i, chunk) in chunks.iter().enumerate() {
@@ -1301,12 +1364,43 @@ impl RawClient {
 
     /// Read the next message that the bus sends.
     fn read_message(&self) -> io::Result<Vec<u8>> {
-        let mut msg = vec![0; 16];
-        (&self.0).read_exact(&mut msg)?;
-        msg.resize(message_len(&msg), 0);
-        (&self.0).read_exact(&mut msg[16..])?;
+        self.read_message_with_fds().map(|(msg, _)| msg)
+    }
 
-        Ok(msg)
+    /// Read the next message that the bus sends, and the file descriptors that come with it.
+    ///
+    /// The reads take no more than the bytes of the message, so the file descriptors are those
+    /// that the bus sends with any of them.
+    fn read_message_with_fds(&self) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+        let mut msg = vec![0; 16];
+        let mut fds = vec![];
+        self.read_exact_with_fds(&mut msg, &mut fds)?;
+        msg.resize(message_len(&msg), 0);
+        self.read_exact_with_fds(&mut msg[16..], &mut fds)?;
+
+        Ok((msg, fds))
+    }
+
+    /// Fill `buf` from the socket, and add the file descriptors that come with it to `fds`.
+    fn read_exact_with_fds(&self, mut buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<()> {
+        while !buf.is_empty() {
+            let mut space =
+                [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_MESSAGE_FDS))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let mut iov = [IoSliceMut::new(buf)];
+            let read = recvmsg(&self.0, &mut iov, &mut control, RecvFlags::CMSG_CLOEXEC)?.bytes;
+            for msg in control.drain() {
+                if let RecvAncillaryMessage::ScmRights(received) = msg {
+                    fds.extend(received);
+                }
+            }
+            if read == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            buf = &mut buf[read..];
+        }
+
+        Ok(())
     }
 
     /// Wait for the bus to disconnect the client, and return what it sends until then.
