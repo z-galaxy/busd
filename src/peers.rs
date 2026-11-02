@@ -337,6 +337,9 @@ impl Peers {
     /// only goes on if it answers one of the calls that wait on `sender`, `pending_calls`. The bus
     /// answers each call to it itself, so those aren't recorded, and its own replies go on as they
     /// are.
+    ///
+    /// A call to a name that no peer has gets an error from the bus, as with dbus-broker, unless
+    /// it expects no reply, and goes on to the monitors all the same.
     async fn forward(
         &self,
         sender: &OwnedUniqueName,
@@ -346,8 +349,8 @@ impl Peers {
         outbox: &mut Outbox,
     ) -> Result<()> {
         let from_bus = *sender == fdo::BUS_NAME;
-        // The calls that the bus refuses.
-        let mut refused = Vec::new();
+        // The calls that the bus answers with an error of its own, and why.
+        let mut rejected = Vec::new();
         // The recipients are picked under the lock, and only sent their messages without it.
         {
             let routing = self.routing().await;
@@ -380,14 +383,9 @@ impl Peers {
                     );
                     let peer = match destination {
                         BusName::Unique(name) => peers.get_key_value(name.as_str()),
-                        BusName::WellKnown(name) => match name_registry.lookup(name) {
-                            Some(owner) => peers.get_key_value(owner.as_str()),
-                            None => {
-                                warn!("unknown destination: {}", name);
-
-                                continue;
-                            }
-                        },
+                        BusName::WellKnown(name) => name_registry
+                            .lookup(name)
+                            .and_then(|owner| peers.get_key_value(owner.as_str())),
                     };
                     let msg_type = msg.message_type();
                     if !from_bus
@@ -408,11 +406,13 @@ impl Peers {
                             continue;
                         }
                     }
+                    let primary = msg.primary_header();
+                    let flags = primary.flags();
+                    let expects_reply = msg_type == message::Type::MethodCall
+                        && !flags.contains(message::Flags::NO_REPLY_EXPECTED);
                     match peer {
                         Some((name, peer)) => {
-                            let primary = msg.primary_header();
-                            if msg_type == message::Type::MethodCall
-                                && !primary.flags().contains(message::Flags::NO_REPLY_EXPECTED)
+                            if expects_reply
                                 && *name != fdo::BUS_NAME
                                 && !peer.pending_calls().add(
                                     sender_id,
@@ -420,13 +420,25 @@ impl Peers {
                                     primary.serial_num(),
                                 )
                             {
-                                refused.push(i);
+                                rejected.push((i, Rejection::SerialPending));
 
                                 continue;
                             }
                             outbox.add(msgs, peer.id(), peer.recipient(), i)
                         }
-                        None => debug!("no peer for destination `{destination}`"),
+                        None => {
+                            debug!("no peer for destination `{destination}`");
+                            // The bus starts no services, so no name is one that a service can be
+                            // started for.
+                            if expects_reply {
+                                let rejection = if flags.contains(message::Flags::NO_AUTO_START) {
+                                    Rejection::NameHasNoOwner
+                                } else {
+                                    Rejection::ServiceUnknown
+                                };
+                                rejected.push((i, rejection));
+                            }
+                        }
                     }
                 }
                 if monitors.is_empty() {
@@ -449,11 +461,11 @@ impl Peers {
         }
 
         outbox.send(msgs).await;
-        for i in refused {
-            let error =
-                Message::error(&msgs[i].header(), "org.freedesktop.DBus.Error.AccessDenied")
-                    .sender(fdo::BUS_NAME)
-                    .build(&"Pending reply with that serial already exists")?;
+        for (i, rejection) in rejected {
+            let (name, description) = rejection.error();
+            let error = Message::error(&msgs[i].header(), name)
+                .sender(fdo::BUS_NAME)
+                .build(&description)?;
             self.send_from_bus(&error).await;
         }
 
@@ -507,6 +519,38 @@ fn no_reply(caller: &OwnedUniqueName, serial: NonZeroU32) -> zbus::Result<Messag
     Message::error(&call.header(), "org.freedesktop.DBus.Error.NoReply")
         .sender(fdo::BUS_NAME)
         .build(&"Remote peer disconnected")
+}
+
+/// Why the bus answers a call with an error of its own, rather than pass the call on to its
+/// callee.
+#[derive(Clone, Copy, Debug)]
+enum Rejection {
+    /// A call of the same caller with the same serial waits on the callee already.
+    SerialPending,
+    /// No peer has the destination, and no service can be started for it.
+    ServiceUnknown,
+    /// No peer has the destination, and the call asks for no service to be started for it.
+    NameHasNoOwner,
+}
+
+impl Rejection {
+    /// The name of the error, and its description, as dbus-broker has them.
+    fn error(self) -> (&'static str, &'static str) {
+        match self {
+            Self::SerialPending => (
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Pending reply with that serial already exists",
+            ),
+            Self::ServiceUnknown => (
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "The name is not activatable",
+            ),
+            Self::NameHasNoOwner => (
+                "org.freedesktop.DBus.Error.NameHasNoOwner",
+                "Destination does not exist",
+            ),
+        }
+    }
 }
 
 /// How many messages of a peer the bus forwards in one batch, at most.

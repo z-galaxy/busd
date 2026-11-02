@@ -64,6 +64,18 @@ fn same_serial() {
     zruntime::block_on(with_bus(same_serial_));
 }
 
+/// A call to a name that no peer has gets an error from the bus: `ServiceUnknown`, as the bus
+/// starts no services, or `NameHasNoOwner` if the call asks for none to be started. A call that
+/// expects no reply gets none. The monitors get each of the calls all the same.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn absent_destination() {
+    init_tracing();
+
+    zruntime::block_on(with_bus(absent_destination_));
+}
+
 async fn forged_reply_(address: String) -> anyhow::Result<()> {
     let caller = connect(&address).await?;
     let (callee, mut calls) = callee(&address).await?;
@@ -203,6 +215,77 @@ async fn same_serial_(address: String) -> anyhow::Result<()> {
         header.sender().unwrap() == busd::fdo::BUS_NAME,
         "the caller got {reply:?}"
     );
+
+    Ok(())
+}
+
+async fn absent_destination_(address: String) -> anyhow::Result<()> {
+    let monitor = connect(&address).await?;
+    let mut monitored = MessageStream::from(&monitor);
+    MonitoringProxy::new(&monitor)
+        .await?
+        .become_monitor(&[], 0)
+        .await?;
+    let caller = connect(&address).await?;
+    let mut replies = MessageStream::from(&caller);
+    // No client of the bus ever gets this unique name, and no one owns the well-known one.
+    let destinations = [":busd.4294967295", "org.zbus.Replies.Absent"];
+    let call = |destination, flags| {
+        Message::method_call(PATH, "Call")
+            .destination(destination)
+            .interface(INTERFACE)
+            .with_flags(flags)
+            .build(&())
+    };
+
+    for destination in destinations {
+        // A call that expects no reply goes first, so that an error to it would come before the
+        // errors to the calls after it, which the bus sends in the order of the calls.
+        let msg = call(destination, message::Flags::NO_REPLY_EXPECTED)?;
+        caller.send(&msg).await?;
+        for (flags, expected) in [
+            (
+                message::Flags::empty(),
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+            ),
+            (
+                message::Flags::NO_AUTO_START,
+                "org.freedesktop.DBus.Error.NameHasNoOwner",
+            ),
+        ] {
+            let msg = call(destination, flags)?;
+            caller.send(&msg).await?;
+            let error = next_reply(&mut replies).await?;
+            let header = error.header();
+            ensure!(
+                header.message_type() == message::Type::Error
+                    && header.error_name().unwrap() == expected
+                    && header.sender().unwrap() == busd::fdo::BUS_NAME
+                    && header.reply_serial() == Some(msg.primary_header().serial_num()),
+                "the call to `{destination}` with {flags:?} got {error:?}"
+            );
+        }
+    }
+
+    // The monitor got the three calls to each destination.
+    for destination in destinations {
+        for _ in 0..3 {
+            let msg = loop {
+                let msg = monitored.try_next().await?.context("no message")?;
+                if msg.message_type() == message::Type::MethodCall
+                    && msg.header().member().is_some_and(|member| member == "Call")
+                {
+                    break msg;
+                }
+            };
+            let header = msg.header();
+            let got = header.destination().map(ToString::to_string);
+            ensure!(
+                got.as_deref() == Some(destination),
+                "the monitor got a call to {got:?} rather than to `{destination}`"
+            );
+        }
+    }
 
     Ok(())
 }
