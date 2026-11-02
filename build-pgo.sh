@@ -11,8 +11,9 @@
 # It prints the path of busd once it's built: `target/<host>/release/busd`, such as
 # `target/x86_64-unknown-linux-gnu/release/busd`, or the same in `CARGO_TARGET_DIR`. The
 # instrumented build and the profile stay in `target/pgo`. The arguments go to both builds of busd,
-# such as `--no-default-features`, and so do the flags of `RUSTFLAGS`, which those of PGO are added
-# to.
+# such as `--no-default-features`, and the flags of PGO go with those of `RUSTFLAGS`, or else with
+# those of `target.<triple>.rustflags` and `target.<cfg>.rustflags` in cargo's configuration: cargo
+# then leaves out those of `build.rustflags`, as it only takes them when no others apply.
 #
 # The profile is merged by the llvm-profdata of `LLVM_PROFDATA`, if it's set, or else by that of
 # rustup's llvm-tools component, or else by the one on `PATH`. It must be of the LLVM that rustc is
@@ -37,9 +38,9 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
 pgo=$CARGO_TARGET_DIR/pgo
 profiles=$pgo/profiles
 profile=$pgo/busd.profdata
-# `RUSTFLAGS` is split at whitespace.
+# `RUSTFLAGS` is split at whitespace, and the configuration of the flags of PGO quotes them with '.
 case $pgo in
-*[[:space:]]*) fail "RUSTFLAGS can't name $pgo in the flags of PGO, as it has whitespace" ;;
+*[[:space:]\']*) fail "the flags of PGO can't name $pgo, as it has whitespace or a '" ;;
 esac
 
 # Naming the target, the host's, keeps `RUSTFLAGS` away from build scripts and procedural macros,
@@ -70,9 +71,26 @@ fi
 echo "Building the clients that busd is trained with" >&2
 cargo bench --locked --bench compare --no-run
 
+# Builds busd for the host with `flag`, one of PGO, and the arguments after it, which go to cargo
+# build. Cargo takes `RUSTFLAGS`, if it's set, over all the flags of its configuration, so `flag` is
+# added to it then. Otherwise, `flag` goes in a configuration of its own, as rustflags of
+# `target.'cfg(not(any()))'`, which cargo joins with those that the other configurations give the
+# target, by its triple or by a `cfg`. That `cfg` holds for any target, as `cfg(all())` does, but
+# the other configurations are unlikely to have it: cargo can't merge rustflags given as an array,
+# as these are, with those of the same key given as a string, as they may be.
+build() {
+    local flag=$1
+    shift
+    if [ -n "${RUSTFLAGS+set}" ]; then
+        RUSTFLAGS="$RUSTFLAGS $flag" cargo build --release --locked --bin busd --target "$host" "$@"
+    else
+        cargo build --release --locked --bin busd --target "$host" \
+            --config "target.'cfg(not(any()))'.rustflags = ['$flag']" "$@"
+    fi
+}
+
 echo "Building busd with instrumentation" >&2
-RUSTFLAGS="${RUSTFLAGS:-} -Cprofile-generate=$profiles" \
-    cargo build --release --locked --bin busd --target "$host" --target-dir "$pgo/instrumented" "$@"
+build "-Cprofile-generate=$profiles" --target-dir "$pgo/instrumented" "$@"
 instrumented=$pgo/instrumented/$host/release/busd
 
 # Runs of busd add to the profiles that they find there, and those of an earlier build would be
@@ -128,7 +146,6 @@ echo "Merging the profile into $profile" >&2
 "$llvm_profdata" merge -o "$profile" "$profiles"
 
 echo "Building busd with the profile" >&2
-RUSTFLAGS="${RUSTFLAGS:-} -Cprofile-use=$profile" \
-    cargo build --release --locked --bin busd --target "$host" "$@"
+build "-Cprofile-use=$profile" "$@"
 
 echo "$CARGO_TARGET_DIR/$host/release/busd"
