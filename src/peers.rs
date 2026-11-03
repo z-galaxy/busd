@@ -14,8 +14,7 @@ use std::{
     time::Duration,
 };
 use zbus::{
-    connection::{self, AuthMechanism},
-    message,
+    connection, message,
     names::{BusName, OwnedUniqueName, UniqueName},
     Connection, Message, Optional, OwnedGuid,
 };
@@ -62,14 +61,12 @@ impl Peers {
         guid: &OwnedGuid,
         id: usize,
         builder: connection::Builder<'_>,
-        auth_mechanism: AuthMechanism,
         send_timeout: Duration,
     ) -> Result<()> {
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
-        let (peer, peer_stream) =
-            Peer::new(guid.clone(), id, builder, auth_mechanism, send_timeout).await?;
+        let (peer, peer_stream) = Peer::new(guid.clone(), id, builder, send_timeout).await?;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
         let pending_calls = peer.pending_calls().clone();

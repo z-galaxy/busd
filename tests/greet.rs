@@ -37,10 +37,6 @@ fn greet() {
         let address = format!("unix:path={}", path.display());
         greet_(&address).await;
 
-        // TCP socket
-        let address = "tcp:host=127.0.0.1,port=4248".to_string();
-        greet_(&address).await;
-
         // Abstract Unix socket, which only Linux has.
         #[cfg(target_os = "linux")]
         {
@@ -48,6 +44,20 @@ fn greet() {
             let address = format!("unix:abstract={s}");
             greet_(&address).await;
         }
+    });
+}
+
+/// The bus refuses to listen on anything but a unix socket.
+#[test]
+#[timeout(30000)]
+fn tcp_refused() {
+    zruntime::block_on(async {
+        let address = "tcp:host=127.0.0.1,port=4248";
+        let error = Bus::for_address(Some(address)).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Unsupported address `{address}`: the bus only listens on unix sockets."),
+        );
     });
 }
 

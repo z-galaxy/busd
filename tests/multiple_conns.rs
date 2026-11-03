@@ -18,14 +18,9 @@ fn multi_conenct() {
     busd::tracing_subscriber::init();
 
     zruntime::block_on(async {
-        // Unix socket
         let s = Alphanumeric.sample_string(&mut rng(), 10);
         let path = temp_dir().join(s);
         let address = format!("unix:path={}", path.display());
-        multi_conenct_(&address).await;
-
-        // TCP socket
-        let address = "tcp:host=127.0.0.1,port=4246".to_string();
         multi_conenct_(&address).await;
     });
 }

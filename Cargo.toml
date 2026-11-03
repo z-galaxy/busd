@@ -76,7 +76,6 @@ zruntime = { version = "0.2.2", features = [
     "helper",
     "lock",
     "signal",
-    "tcp",
     "unblock",
     "unix",
 ], default-features = false }

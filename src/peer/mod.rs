@@ -38,7 +38,6 @@ impl Peer {
         guid: OwnedGuid,
         id: usize,
         builder: connection::Builder<'_>,
-        auth_mechanism: AuthMechanism,
         send_timeout: Duration,
     ) -> Result<(Self, Stream)> {
         debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
@@ -51,10 +50,13 @@ impl Peer {
         // zbus checks the body of each message of the client as it receives it, as the bus passes
         // the bodies of messages on without deserializing them, and the connection ends on one
         // that doesn't hold what its signature says, as with dbus-broker.
+        //
+        // A client authenticates with the EXTERNAL mechanism, the only one that dbus-broker takes
+        // too: as the uid that its socket tells.
         let msg_stream = builder
             .server(guid)
             .p2p()
-            .auth_mechanism(auth_mechanism)
+            .auth_mechanism(AuthMechanism::External)
             .validate_bodies()
             .build_message_stream()
             .await?;

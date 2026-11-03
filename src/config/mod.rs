@@ -4,10 +4,11 @@ use std::{
     str::FromStr,
 };
 
+use crate::warn;
 use anyhow::{Error, Result};
 use policy::OptionalPolicy;
 use serde::Deserialize;
-use zbus::{conn::AuthMechanism, Address};
+use zbus::{address::Transport, Address};
 
 pub mod policy;
 pub mod rule;
@@ -27,18 +28,6 @@ use xml::{Document, Element, TypeElement};
 /// [XML configuration files]: https://dbus.freedesktop.org/doc/dbus-daemon.1.html#configuration_file
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Config {
-    /// If `true`, connections that authenticated using the ANONYMOUS mechanism will be authorized
-    /// to connect. This option has no practical effect unless the ANONYMOUS mechanism has also
-    /// been enabled using the `auth` option.
-    pub allow_anonymous: bool,
-
-    /// Lists permitted authorization mechanisms.
-    /// If this element doesn't exist, then all known mechanisms are allowed.
-    // TODO: warn when multiple `<auth>` elements are defined, as we only support one
-    // TODO: consider implementing `Deserialize` over in zbus crate, then removing this "skip..."
-    #[serde(default, skip_deserializing)]
-    pub auth: Option<AuthMechanism>,
-
     /// If `true`, the bus daemon becomes a real daemon (forks into the background, etc.).
     pub fork: bool,
 
@@ -48,7 +37,8 @@ pub struct Config {
 
     /// Address that the bus should listen on.
     /// The address is in the standard D-Bus format that contains a transport name plus possible
-    /// parameters/options.
+    /// parameters/options. The bus only listens on unix sockets, so it ignores the other
+    /// addresses.
     // TODO: warn when multiple `<listen>` elements are defined, as we only support one
     // TODO: consider implementing `Deserialize` over in zbus crate, then removing this "skip..."
     #[serde(default, skip_deserializing)]
@@ -89,9 +79,8 @@ impl TryFrom<Document> for Config {
 
         for element in value.busconfig {
             match element {
-                Element::AllowAnonymous => config.allow_anonymous = true,
-                Element::Auth(auth) => {
-                    config.auth = Some(AuthMechanism::from_str(&auth)?);
+                Element::AllowAnonymous | Element::Auth => {
+                    // NO-OP: the bus only takes the EXTERNAL mechanism, as dbus-broker does
                 }
                 Element::Fork => config.fork = true,
                 Element::Include(_) => {
@@ -105,7 +94,11 @@ impl TryFrom<Document> for Config {
                     // NO-OP: deprecated and ignored
                 }
                 Element::Listen(listen) => {
-                    config.listen = Some(Address::from_str(&listen)?);
+                    let address = Address::from_str(&listen)?;
+                    match address.transport() {
+                        Transport::Unix(_) => config.listen = Some(address),
+                        _ => warn!("Ignoring `{listen}`: the bus only listens on unix sockets."),
+                    }
                 }
                 Element::Pidfile(p) => config.pidfile = Some(p),
                 Element::Policy(pe) => {
@@ -246,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn config_parse_with_allow_anonymous_and_fork_and_keep_umask_and_syslog_ok() {
+    fn config_parse_with_fork_and_keep_umask_and_syslog_ok() {
         let input = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
         "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
         <busconfig>
@@ -259,10 +252,10 @@ mod tests {
 
         let config = Config::parse(input).expect("should parse XML input");
 
+        // `<allow_anonymous />` is ignored.
         assert_eq!(
             config,
             Config {
-                allow_anonymous: true,
                 fork: true,
                 keep_umask: true,
                 syslog: true,
@@ -283,13 +276,8 @@ mod tests {
 
         let config = Config::parse(input).expect("should parse XML input");
 
-        assert_eq!(
-            config,
-            Config {
-                auth: Some(AuthMechanism::External),
-                ..Default::default()
-            }
-        );
+        // `<auth>` is ignored.
+        assert_eq!(config, Config::default());
     }
 
     #[test]
@@ -310,19 +298,19 @@ mod tests {
         "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
         <busconfig>
             <listen>unix:path=/tmp/foo</listen>
-            <listen>tcp:host=localhost,port=1234</listen>
+            <listen>unix:path=/tmp/bar</listen>
             <listen>tcp:host=localhost,port=0,family=ipv4</listen>
         </busconfig>
         "#;
 
         let config = Config::parse(input).expect("should parse XML input");
 
+        // The last unix socket wins, and the TCP address is ignored.
         assert_eq!(
             config,
             Config {
                 listen: Some(
-                    Address::from_str("tcp:host=localhost,port=0,family=ipv4")
-                        .expect("should parse address")
+                    Address::from_str("unix:path=/tmp/bar").expect("should parse address")
                 ),
                 ..Default::default()
             }
@@ -358,10 +346,8 @@ mod tests {
         assert_eq!(
             config,
             Config {
-                auth: Some(AuthMechanism::External),
                 listen: Some(
-                    Address::from_str("tcp:host=localhost,port=1234")
-                        .expect("should parse address")
+                    Address::from_str("unix:path=/tmp/foo").expect("should parse address")
                 ),
                 policies: vec![
                     Policy::DefaultContext(vec![

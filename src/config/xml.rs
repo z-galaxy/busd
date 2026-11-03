@@ -186,7 +186,7 @@ impl Document {
 #[serde(rename_all = "snake_case")]
 pub enum Element {
     AllowAnonymous,
-    Auth(String),
+    Auth,
     Fork,
     /// Include a file at this point. If the filename is relative, it is located relative to the
     /// configuration file doing the including.
