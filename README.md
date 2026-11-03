@@ -132,8 +132,10 @@ on may gain less.
 
 The script needs the `llvm-profdata` of the LLVM that rustc is built with, which rustup's
 `llvm-tools` component has, or another one in `LLVM_PROFDATA`, and busd's dev-dependencies, for the
-clients. It passes its arguments, such as `--no-default-features`, and the flags of `RUSTFLAGS` on
-to both builds of busd. The comparison measures such a build against a plain one as another broker:
+clients. It passes its arguments, such as `--no-default-features`, on to both builds of busd, and
+adds the flags of PGO to those of `RUSTFLAGS`, or else to those of `target.<triple>.rustflags` in
+cargo's configuration: cargo then leaves out those of `build.rustflags`. The comparison measures
+such a build against a plain one as another broker:
 
 ```bash
 cargo bench --bench compare -- \
