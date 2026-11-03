@@ -2,6 +2,7 @@ use crate::{debug, info, trace, warn};
 use anyhow::{bail, Context, Ok, Result};
 use std::{
     env,
+    os::fd::AsFd,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -115,6 +116,20 @@ impl Bus {
         self.inner.send_timeout = timeout;
     }
 
+    /// Set how many objects the bus keeps for each user at most: its connections, and the calls to
+    /// them that wait for replies.
+    ///
+    /// The bus closes a connection of a user beyond them, and answers a call to a connection of a
+    /// user beyond them with a `LimitsExceeded` error. The calls of other users only get a share of
+    /// them, as [`Charge::new`] has it. It is [`MAX_OBJECTS`] unless set otherwise, and applies to
+    /// every user at once.
+    ///
+    /// [`Charge::new`]: crate::user::Charge::new
+    /// [`MAX_OBJECTS`]: crate::user::MAX_OBJECTS
+    pub fn set_max_objects_per_user(&mut self, max: usize) {
+        self.inner.peers.users().set_max_objects(max);
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         loop {
             self.accept_next().await?;
@@ -191,14 +206,22 @@ impl Bus {
         let id = self.next_id();
         let inner = self.inner.clone();
         spawn(async move {
-            // zbus is given the standard library stream that the zruntime one wraps, and the
-            // connection then drives it on the runtime it is built on.
-            let builder = connection::Builder::unix_stream(stream.into_std());
-            let res = inner
-                .peers
-                .clone()
-                .add(&inner.guid, id, builder, inner.send_timeout)
-                .await;
+            // The socket is asked for the uid of the client itself, rather than the connection
+            // that zbus makes of it, as zbus looks up the groups of the client along with its uid,
+            // which takes a thread for blocking work, and longer than the rest of the connection.
+            let res = match peer_uid(&stream) {
+                Result::Ok(uid) => {
+                    // zbus is given the standard library stream that the zruntime one wraps, and
+                    // the connection then drives it on the runtime it is built on.
+                    let builder = connection::Builder::unix_stream(stream.into_std());
+                    inner
+                        .peers
+                        .clone()
+                        .add(&inner.guid, id, builder, inner.send_timeout, uid)
+                        .await
+                }
+                Err(e) => Err(e.into()),
+            };
             if let Err(e) = res {
                 warn!("Failed to establish connection: {}", e);
             }
@@ -227,6 +250,54 @@ impl Drop for Bus {
     fn drop(&mut self) {
         self.inner.peers.remove_us();
     }
+}
+
+/// The uid of the peer of the unix socket `socket`.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn peer_uid(socket: impl AsFd) -> std::io::Result<u32> {
+    let ucred = rustix::net::sockopt::socket_peercred(socket)?;
+
+    Result::Ok(ucred.uid.as_raw())
+}
+
+/// The uid of the peer of the unix socket `socket`.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn peer_uid(socket: impl AsFd) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut uid = 0;
+    let mut gid = 0;
+    // SAFETY: The descriptor is that of `socket`, which stays open for as long as the call lasts,
+    // and `uid` and `gid` are valid for the writes of the call.
+    let ret = unsafe { libc::getpeereid(socket.as_fd().as_raw_fd(), &mut uid, &mut gid) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Result::Ok(uid)
+}
+
+/// The uid of the peer of the unix socket `socket`, which no call on this platform tells, so that
+/// no client can authenticate.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
+fn peer_uid(_socket: impl AsFd) -> std::io::Result<u32> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// A socket in the user's runtime directory, `$XDG_RUNTIME_DIR` or else `/run/user/<uid>`, or in

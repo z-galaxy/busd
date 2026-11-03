@@ -7,7 +7,7 @@ use zbus::{
     Connection, MessageStream,
 };
 
-use crate::{match_rules::MatchRules, name_registry::NameRegistry};
+use crate::{match_rules::MatchRules, name_registry::NameRegistry, user::Charge};
 
 use super::{Peer, Recipient};
 
@@ -19,6 +19,8 @@ pub struct Monitor {
     id: usize,
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
+    /// The monitor, as an object that the bus keeps for its user, as it was as a peer.
+    _charge: Option<Charge>,
 }
 
 impl Monitor {
@@ -69,13 +71,14 @@ impl Monitor {
         }
     }
 
-    pub(super) fn new(peer: Peer, match_rules: MatchRules) -> Self {
+    pub(super) fn new(mut peer: Peer, match_rules: MatchRules) -> Self {
         Self {
             conn: peer.conn().clone(),
             recipient: peer.recipient().clone(),
             id: peer.id(),
             unique_name: peer.unique_name().clone(),
             match_rules,
+            _charge: peer.charge.take(),
         }
     }
 }

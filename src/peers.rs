@@ -1,5 +1,5 @@
 use crate::{debug, trace, warn};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{
     future::{join_all, select, Either},
     stream::StreamExt,
@@ -24,7 +24,8 @@ use crate::{
     fdo,
     match_rules::MatchRules,
     name_registry::{NameOwnerChanged, NameRegistry},
-    peer::{Monitor, Peer, PendingCalls, Recipient, Stream, MAX_MESSAGE_FDS},
+    peer::{Caller, Monitor, Peer, PendingCalls, Recipient, Refusal, Stream, MAX_MESSAGE_FDS},
+    user::{Charge, Users, MAX_OBJECTS},
 };
 
 /// The peers of the bus, and its monitors and names.
@@ -45,6 +46,8 @@ pub struct Peers {
     /// The connection on which the bus serves the D-Bus API, from when the bus is among its peers
     /// until the bus goes.
     bus_conn: Mutex<Option<Connection>>,
+    /// The users of the peers, and of the bus itself.
+    users: Users,
 }
 
 impl Peers {
@@ -52,24 +55,39 @@ impl Peers {
         Arc::new(Self {
             routing: RwLock::new(Routing::default()),
             bus_conn: Mutex::new(None),
+            users: Users::new(MAX_OBJECTS),
         })
     }
 
-    /// Add a client, which the bus gives `send_timeout` to take each message.
+    /// The users of the peers, and of the bus itself.
+    pub fn users(&self) -> &Users {
+        &self.users
+    }
+
+    /// Add a client, of the user of `uid`, which the bus gives `send_timeout` to take each message.
+    ///
+    /// The client is an object of its user from the start, as with dbus-broker, so the bus refuses
+    /// a client beyond the quota of its user before the client authenticates.
     pub async fn add(
         self: &Arc<Self>,
         guid: &OwnedGuid,
         id: usize,
         builder: connection::Builder<'_>,
         send_timeout: Duration,
+        uid: u32,
     ) -> Result<()> {
+        let user = self.users.user(uid);
+        let charge = Charge::new(&user, &user)
+            .ok_or_else(|| anyhow!("the bus keeps as many objects for the user {uid} as it may"))?;
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
-        let (peer, peer_stream) = Peer::new(guid.clone(), id, builder, send_timeout).await?;
+        let (peer, peer_stream) =
+            Peer::new(guid.clone(), id, builder, send_timeout, user, charge).await?;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
         let pending_calls = peer.pending_calls().clone();
+        let caller = peer.caller().clone();
         let id = peer.id();
 
         let mut routing = self.routing_mut().await;
@@ -85,6 +103,7 @@ impl Peers {
                     unique_name.clone(),
                     id,
                     pending_calls,
+                    caller,
                 ))
                 .detach();
                 routing.peers.insert(unique_name.clone(), peer);
@@ -98,10 +117,13 @@ impl Peers {
     /// of `msg_stream`.
     pub async fn add_us(self: &Arc<Self>, msg_stream: zbus::MessageStream, conn: Connection) {
         *self.bus_conn() = Some(conn);
-        let (peer, peer_stream) = Peer::new_us(msg_stream).await;
+        // The user of the process of the bus, as with dbus-broker.
+        let user = self.users.user(rustix::process::getuid().as_raw());
+        let (peer, peer_stream) = Peer::new_us(msg_stream, user).await;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
         let pending_calls = peer.pending_calls().clone();
+        let caller = peer.caller().clone();
         let id = peer.id();
 
         let mut routing = self.routing_mut().await;
@@ -117,6 +139,7 @@ impl Peers {
                     unique_name.clone(),
                     id,
                     pending_calls,
+                    caller,
                 ))
                 .detach();
                 routing.peers.insert(unique_name.clone(), peer);
@@ -208,8 +231,9 @@ impl Peers {
         Ok(())
     }
 
-    /// Serve the peer `unique_name`, numbered `id`, whose messages come out of `peer_stream`, and
-    /// whose calls that wait for its replies are `pending_calls`, until it goes.
+    /// Serve the peer `unique_name`, numbered `id`, whose messages come out of `peer_stream`, whose
+    /// calls that wait for its replies are `pending_calls`, and which is `caller` as it makes
+    /// calls, until it goes.
     async fn serve_peer(
         self: Arc<Self>,
         mut peer_stream: Stream,
@@ -217,6 +241,7 @@ impl Peers {
         unique_name: OwnedUniqueName,
         id: usize,
         pending_calls: Arc<PendingCalls>,
+        caller: Arc<Caller>,
     ) -> Result<()> {
         let mut batch = Vec::new();
         let mut outbox = Outbox::default();
@@ -265,8 +290,15 @@ impl Peers {
                 }
             }
 
-            self.forward(&unique_name, id, &pending_calls, &batch, &mut outbox)
-                .await?;
+            self.forward(
+                &unique_name,
+                id,
+                &caller,
+                &pending_calls,
+                &batch,
+                &mut outbox,
+            )
+            .await?;
             batch.clear();
             if too_many_fds {
                 warn!(
@@ -326,13 +358,15 @@ impl Peers {
     }
 
     /// Forward `msgs`, which the peer `sender`, numbered `sender_id`, sent in this order, to their
-    /// recipients, through the empty `outbox` of the task that serves `sender`.
+    /// recipients, through the empty `outbox` of the task that serves `sender`. `caller` is
+    /// `sender`, as the caller of its calls that wait for replies.
     ///
     /// Each recipient gets those of `msgs` that go to it in one go, in order, and all of them get
     /// theirs at once.
     ///
     /// A call that expects a reply is recorded as one that waits on its callee as it goes to the
-    /// callee, unless its caller has a call of the same serial waiting there already, in which case
+    /// callee, unless its caller has a call of the same serial waiting there already, or the user
+    /// of its caller has as many of the objects of the user of the callee as it may, in which case
     /// the bus refuses it, with an error, as dbus-broker does. A reply, or an error, of `sender`
     /// only goes on to its destination if it answers one of the calls that wait on `sender`,
     /// `pending_calls`. The bus answers each call to it itself, so those aren't recorded, and its
@@ -348,6 +382,7 @@ impl Peers {
         &self,
         sender: &OwnedUniqueName,
         sender_id: usize,
+        caller: &Arc<Caller>,
         pending_calls: &PendingCalls,
         msgs: &[Message],
         outbox: &mut Outbox,
@@ -409,17 +444,18 @@ impl Peers {
                             debug!("{msg:?} answers no call that waits on {sender}")
                         }
                         Some((name, peer)) => {
-                            if expects_reply
-                                && *name != fdo::BUS_NAME
-                                && !peer.pending_calls().add(
-                                    sender_id,
-                                    sender,
-                                    primary.serial_num(),
-                                )
-                            {
-                                rejected.push((msg.clone(), Rejection::SerialPending));
+                            let refusal = if expects_reply && *name != fdo::BUS_NAME {
+                                peer.pending_calls()
+                                    .add(sender_id, caller, primary.serial_num())
+                                    .err()
                             } else {
-                                outbox.add(msgs, peer.id(), peer.recipient(), i)
+                                None
+                            };
+                            match refusal {
+                                Some(refusal) => {
+                                    rejected.push((msg.clone(), Rejection::from(refusal)))
+                                }
+                                None => outbox.add(msgs, peer.id(), peer.recipient(), i),
                             }
                         }
                         None => {
@@ -548,6 +584,11 @@ fn no_reply(caller: &OwnedUniqueName, serial: NonZeroU32) -> zbus::Result<Messag
 enum Rejection {
     /// A call of the same caller with the same serial waits on the callee already.
     SerialPending,
+    /// The user of the caller has as many of the objects of the user of the callee as it may
+    /// already, as [`Charge::new`] has it.
+    ///
+    /// [`Charge::new`]: crate::user::Charge::new
+    QuotaExceeded,
     /// No peer has the destination, and no service can be started for it.
     ServiceUnknown,
     /// No peer has the destination, and the call asks for no service to be started for it.
@@ -564,6 +605,10 @@ impl Rejection {
                 "org.freedesktop.DBus.Error.AccessDenied",
                 "Pending reply with that serial already exists",
             ),
+            Self::QuotaExceeded => (
+                "org.freedesktop.DBus.Error.LimitsExceeded",
+                "Sending user's quota exceeded",
+            ),
             Self::ServiceUnknown => (
                 "org.freedesktop.DBus.Error.ServiceUnknown",
                 "The name is not activatable",
@@ -576,6 +621,15 @@ impl Rejection {
                 "org.freedesktop.DBus.Error.Failed",
                 "Peer does not support file descriptor passing.",
             ),
+        }
+    }
+}
+
+impl From<Refusal> for Rejection {
+    fn from(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::SerialPending => Self::SerialPending,
+            Refusal::QuotaExceeded => Self::QuotaExceeded,
         }
     }
 }

@@ -17,7 +17,12 @@ use zbus::{
     Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
 
-use crate::{fdo, match_rules::MatchRules, name_registry::NameRegistry};
+use crate::{
+    fdo,
+    match_rules::MatchRules,
+    name_registry::NameRegistry,
+    user::{Charge, User},
+};
 
 /// A peer connection.
 #[derive(Debug)]
@@ -29,6 +34,11 @@ pub struct Peer {
     match_rules: MatchRules,
     /// The calls to the peer that wait for its reply.
     pending_calls: Arc<PendingCalls>,
+    /// The peer, as the caller of the calls that wait for replies.
+    caller: Arc<Caller>,
+    /// The peer, as an object that the bus keeps for its user, as with dbus-broker; none for the
+    /// bus itself. A monitor that the peer becomes takes it over.
+    charge: Option<Charge>,
     greeted: bool,
     canceled_event: Event,
 }
@@ -39,6 +49,8 @@ impl Peer {
         id: usize,
         builder: connection::Builder<'_>,
         send_timeout: Duration,
+        user: Arc<User>,
+        charge: Charge,
     ) -> Result<(Self, Stream)> {
         debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
         let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
@@ -67,9 +79,11 @@ impl Peer {
             recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
             conn,
             id,
+            caller: Caller::new(unique_name.clone(), user.clone()),
+            charge: Some(charge),
             unique_name,
             match_rules: MatchRules::default(),
-            pending_calls: Arc::default(),
+            pending_calls: Arc::new(PendingCalls::new(user)),
             greeted: false,
             canceled_event: Event::new(),
         };
@@ -77,8 +91,8 @@ impl Peer {
         Ok((peer, stream))
     }
 
-    // This the the bus itself, serving the FDO D-Bus API.
-    pub async fn new_us(msg_stream: MessageStream) -> (Self, Stream) {
+    // This is the bus itself, serving the FDO D-Bus API, of `user`.
+    pub async fn new_us(msg_stream: MessageStream, user: Arc<User>) -> (Self, Stream) {
         let unique_name = OwnedUniqueName::try_from(fdo::BUS_NAME).unwrap();
         let conn = Connection::from(&msg_stream);
 
@@ -86,9 +100,11 @@ impl Peer {
             recipient: Recipient::bus(conn.clone()),
             conn,
             id: BUS_ID,
+            caller: Caller::new(unique_name.clone(), user.clone()),
+            charge: None,
             unique_name,
             match_rules: MatchRules::default(),
-            pending_calls: Arc::default(),
+            pending_calls: Arc::new(PendingCalls::new(user)),
             greeted: true,
             canceled_event: Event::new(),
         };
@@ -118,6 +134,11 @@ impl Peer {
     /// The calls to the peer that wait for its reply.
     pub fn pending_calls(&self) -> &Arc<PendingCalls> {
         &self.pending_calls
+    }
+
+    /// The peer, as the caller of the calls that wait for replies.
+    pub fn caller(&self) -> &Arc<Caller> {
+        &self.caller
     }
 
     pub fn listen_cancellation(&self) -> EventListener {
