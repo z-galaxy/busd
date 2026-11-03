@@ -85,21 +85,25 @@ impl Recipient {
 /// other messages on their way to the client, as well as the write of these. The bus forwards the
 /// messages of each sender in batches, of up to [`MAX_BATCH`] messages and [`MAX_BATCH_BYTES`]
 /// bytes but for the last message, and sends a client in one go those of a batch that go to it.
+/// The wait is for room on the client's socket, for the most part, so a client that stops reading
+/// only runs into this limit if the messages for it fill its socket, and it doesn't take them
+/// within this long of when the bus started to send them.
 ///
-/// The bus forwards the batches of each sender one after the other, so a client that stops reading
-/// while it is subscribed to the signals of the bus holds up every message of the bus, its replies
-/// included, for this long before it gets disconnected. Several such clients that stop taking
-/// messages at the same batch hold it up for this long all together, as the bus sends a batch to
-/// all of its recipients at once. That is why this is short: a holdup of 100 ms is barely
-/// noticeable, and nothing next to the 25 s that a method call waits for its reply by default,
-/// with libdbus, GDBus and sd-bus. The cost is that a client has to keep up with what it gets: one
-/// that reads at 128 MiB/s takes up to 12.8 MiB of messages in this time, but the largest messages,
-/// of 128 MiB, take reading at 1.25 GiB/s, and a client that gets stuck for longer than this, with
-/// messages waiting for it that its socket can't take, gets disconnected.
+/// This is long, so that a client that gets stuck for a few seconds, as under heavy I/O, catches
+/// up and keeps its connection, rather than losing it, along with its names and its match rules.
+/// Even the largest messages, of 128 MiB, only take reading at 12.8 MiB/s in this time. The cost
+/// is how long a client that stops reading holds up others before it gets disconnected: the bus
+/// forwards the batches of each sender one after the other, so one that is subscribed to the
+/// signals of the bus holds up every message of the bus, its replies included, for this long, and
+/// a monitor holds up every sender that it watches. Several such clients that stop taking messages
+/// at the same batch hold it up for this long all together, as the bus sends a batch to all of its
+/// recipients at once, while those that stop at different batches hold it up for this long each.
+/// One such holdup still ends well within the 25 s that a method call waits for its reply by
+/// default, with libdbus, GDBus and sd-bus.
 ///
 /// [`MAX_BATCH`]: crate::peers::MAX_BATCH
 /// [`MAX_BATCH_BYTES`]: crate::peers::MAX_BATCH_BYTES
-pub const SEND_TIMEOUT: Duration = Duration::from_millis(100);
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 enum Kind {
