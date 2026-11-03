@@ -24,10 +24,10 @@ than other D-Bus brokers.
 
 ## Status
 
-Alpha. The essentials are in place, but busd is not ready for production use yet. Most notably, it
-doesn't enforce the [policies] of its configuration, so it must not serve as a system bus, and it
-doesn't start services on demand ([service activation]). The [feature parity] issues track what
-else it lacks.
+Alpha. The essentials are in place, but busd is not ready for production use yet. It is meant to
+serve as a system bus as well as a session bus, but until it enforces the [policies] of its
+configuration, it can only serve as a session bus, and it doesn't start services on demand
+([service activation]) yet. The [feature parity] issues track what else it lacks.
 
 ## Performance
 
@@ -146,7 +146,14 @@ cargo bench --bench compare -- \
 
 ### Full compatibility with the D-Bus specification
 
-Implement all features that the [specification] mandates or recommends.
+Implement all features that the [specification] mandates or recommends. Where the specification
+leaves the behaviour of a bus open, do as [dbus-broker] does.
+
+### A system bus, as well as a session bus
+
+Serve as the system bus of a machine, which takes the [policies] of its configuration, and limits on
+what the clients of each user may have the bus keep, as with dbus-broker, so that no user can
+exhaust the bus, or get around the policies, at the expense of the others.
 
 ### Additional Header Fields
 
