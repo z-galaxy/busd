@@ -12,8 +12,7 @@ use zbus::{
         transport::{Unix, UnixSocket},
         Transport,
     },
-    connection::{self, AuthMechanism},
-    Address, Connection, Guid, OwnedGuid,
+    connection, Address, Connection, Guid, OwnedGuid,
 };
 use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
 
@@ -42,7 +41,6 @@ pub struct Inner {
     peers: Arc<Peers>,
     guid: OwnedGuid,
     next_id: usize,
-    auth_mechanism: AuthMechanism,
     send_timeout: Duration,
     _self_conn: Connection,
 }
@@ -99,7 +97,6 @@ impl Bus {
                 peers,
                 guid,
                 next_id: 0,
-                auth_mechanism: AuthMechanism::External,
                 send_timeout: SEND_TIMEOUT,
                 _self_conn: service_conn,
             },
@@ -200,13 +197,7 @@ impl Bus {
             let res = inner
                 .peers
                 .clone()
-                .add(
-                    &inner.guid,
-                    id,
-                    builder,
-                    inner.auth_mechanism,
-                    inner.send_timeout,
-                )
+                .add(&inner.guid, id, builder, inner.send_timeout)
                 .await;
             if let Err(e) = res {
                 warn!("Failed to establish connection: {}", e);
@@ -223,10 +214,6 @@ impl Bus {
 
     pub fn guid(&self) -> &OwnedGuid {
         &self.inner.guid
-    }
-
-    pub fn auth_mechanism(&self) -> AuthMechanism {
-        self.inner.auth_mechanism
     }
 
     fn next_id(&mut self) -> usize {
