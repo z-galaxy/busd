@@ -54,7 +54,9 @@ fn callee_becomes_monitor() {
 }
 
 /// A call with the serial of another of its caller that waits on the same callee is refused, and
-/// the callee only answers the first. A call that expects no reply doesn't wait on its callee.
+/// the callee only answers the first. A call that expects no reply doesn't wait on its callee. The
+/// monitors get the call that the bus refuses all the same, and the error of the bus to it, and the
+/// second answer of the callee, which goes nowhere else.
 #[test]
 #[instrument]
 #[timeout(30000)]
@@ -150,6 +152,12 @@ async fn callee_becomes_monitor_(address: String) -> anyhow::Result<()> {
 }
 
 async fn same_serial_(address: String) -> anyhow::Result<()> {
+    let monitor = connect(&address).await?;
+    let mut monitored = MessageStream::from(&monitor);
+    MonitoringProxy::new(&monitor)
+        .await?
+        .become_monitor(&[], 0)
+        .await?;
     let caller = connect(&address).await?;
     let mut replies = MessageStream::from(&caller);
     let (callee, mut calls) = callee(&address).await?;
@@ -193,6 +201,34 @@ async fn same_serial_(address: String) -> anyhow::Result<()> {
         "the caller got {refused:?}"
     );
 
+    // The monitor got all four calls, and the error of the bus to the last after it.
+    for member in ["First", "Second", "Third", "Fourth"] {
+        let msg = loop {
+            let msg = monitored.try_next().await?.context("no message")?;
+            if msg.message_type() == message::Type::MethodCall
+                && msg.header().interface().is_some_and(|i| i == INTERFACE)
+            {
+                break msg;
+            }
+        };
+        let header = msg.header();
+        let got = header.member().unwrap();
+        ensure!(
+            got == member,
+            "the monitor got `{got}` rather than `{member}`"
+        );
+    }
+    let error = loop {
+        let msg = monitored.try_next().await?.context("no message")?;
+        if msg.message_type() == message::Type::Error {
+            break msg;
+        }
+    };
+    ensure!(
+        error.header().reply_serial() == Some(serial),
+        "the monitor got {error:?}"
+    );
+
     // The callee answers the third, which the caller gets, and that one only.
     let third = Message::method_call(PATH, "Third")
         .sender(caller.unique_name().unwrap())
@@ -205,6 +241,21 @@ async fn same_serial_(address: String) -> anyhow::Result<()> {
     let reply = next_reply(&mut replies).await?;
     let answer: String = reply.body().deserialize()?;
     ensure!(answer == "first", "the caller got the `{answer}` reply");
+    for answer in ["first", "second"] {
+        let reply = loop {
+            let msg = monitored.try_next().await?.context("no message")?;
+            if msg.message_type() == message::Type::MethodReturn
+                && msg.header().sender() == Some(callee_name)
+            {
+                break msg;
+            }
+        };
+        let got: String = reply.body().deserialize()?;
+        ensure!(
+            got == answer,
+            "the monitor got the `{got}` reply rather than `{answer}`"
+        );
+    }
     // By the time that the bus answers the callee, it has passed the second reply on, if it does at
     // all, and the caller gets the reply of the bus to its own call after it.
     DBusProxy::new(&callee).await?.get_id().await?;

@@ -334,12 +334,15 @@ impl Peers {
     /// A call that expects a reply is recorded as one that waits on its callee as it goes to the
     /// callee, unless its caller has a call of the same serial waiting there already, in which case
     /// the bus refuses it, with an error, as dbus-broker does. A reply, or an error, of `sender`
-    /// only goes on if it answers one of the calls that wait on `sender`, `pending_calls`. The bus
-    /// answers each call to it itself, so those aren't recorded, and its own replies go on as they
-    /// are.
+    /// only goes on to its destination if it answers one of the calls that wait on `sender`,
+    /// `pending_calls`. The bus answers each call to it itself, so those aren't recorded, and its
+    /// own replies go on as they are.
     ///
     /// A call to a name that no peer has gets an error from the bus, as with dbus-broker, unless
-    /// it expects no reply, and goes on to the monitors all the same.
+    /// it expects no reply.
+    ///
+    /// The monitors get each message, whether it goes on to its destination or not, as dbus-broker
+    /// passes every message on to its monitors before it routes it.
     async fn forward(
         &self,
         sender: &OwnedUniqueName,
@@ -388,29 +391,22 @@ impl Peers {
                             .and_then(|owner| peers.get_key_value(owner.as_str())),
                     };
                     let msg_type = msg.message_type();
-                    if !from_bus
+                    let answers_none = !from_bus
                         && matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
-                    {
-                        let answers = match (peer, header.reply_serial()) {
+                        && match (peer, header.reply_serial()) {
                             (Some((_, peer)), Some(serial)) => {
-                                pending_calls.remove(peer.id(), serial)
+                                !pending_calls.remove(peer.id(), serial)
                             }
-                            _ => false,
+                            _ => true,
                         };
-                        // Monitors don't get it either, as it doesn't go anywhere.
-                        if !answers {
-                            debug!(
-                                "Dropping {msg:?}, as it answers no call that waits on {sender}"
-                            );
-
-                            continue;
-                        }
-                    }
                     let primary = msg.primary_header();
                     let flags = primary.flags();
                     let expects_reply = msg_type == message::Type::MethodCall
                         && !flags.contains(message::Flags::NO_REPLY_EXPECTED);
                     match peer {
+                        _ if answers_none => {
+                            debug!("{msg:?} answers no call that waits on {sender}")
+                        }
                         Some((name, peer)) => {
                             if expects_reply
                                 && *name != fdo::BUS_NAME
@@ -421,10 +417,9 @@ impl Peers {
                                 )
                             {
                                 rejected.push((i, Rejection::SerialPending));
-
-                                continue;
+                            } else {
+                                outbox.add(msgs, peer.id(), peer.recipient(), i)
                             }
-                            outbox.add(msgs, peer.id(), peer.recipient(), i)
                         }
                         None => {
                             debug!("no peer for destination `{destination}`");
