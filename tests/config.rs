@@ -4,7 +4,7 @@ use busd::config::{
     Access, BusType, Config, ConnectOperation, MessageType, Name, NameOwnership, Operation, Policy,
     ReceiveOperation, SendOperation,
 };
-use zbus::{connection::AuthMechanism, Address};
+use zbus::Address;
 
 #[test]
 fn config_read_file_with_includes_ok() {
@@ -14,7 +14,6 @@ fn config_read_file_with_includes_ok() {
     assert_eq!(
         got,
         Config {
-            auth: Some(AuthMechanism::External),
             listen: Some(Address::from_str("unix:path=/tmp/a").expect("should parse address")),
             policies: vec![
                 Policy::DefaultContext(vec![
@@ -156,7 +155,6 @@ fn config_read_file_session_conf_ok() {
 #[test]
 fn config_read_file_system_conf_ok() {
     let want = Config {
-        auth: Some(AuthMechanism::External),
         fork: true,
         listen: Some(
             Address::from_str("unix:path=/var/run/dbus/system_bus_socket")
