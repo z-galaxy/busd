@@ -32,7 +32,7 @@ use zbus::{
         socket::{ReadHalf, Socket, Split, WriteHalf},
     },
     export::async_trait::async_trait,
-    fdo::{DBusProxy, MonitoringProxy, RequestNameFlags, RequestNameReply},
+    fdo::{self, DBusProxy, MonitoringProxy, RequestNameFlags, RequestNameReply},
     message,
     names::{BusName, UniqueName, WellKnownName},
     proxy::CacheProperties,
@@ -166,6 +166,17 @@ fn client_without_fds() {
     init_tracing();
 
     zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_));
+}
+
+/// A call that a client can't take, as it has a file descriptor and the client didn't negotiate
+/// passing them, gets an error from the bus, rather than wait for a reply that can't come.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn call_to_client_without_fds() {
+    init_tracing();
+
+    zruntime::block_on(with_bus(LONG_TIMEOUT, call_to_client_without_fds_));
 }
 
 /// Messages that a client can't take, as they have file descriptors and the client didn't
@@ -710,6 +721,29 @@ async fn client_without_fds_(address: String) -> anyhow::Result<()> {
 
     // The reply to a call of the client comes after the signal, and still gets to it.
     DBusProxy::new(&client).await?.get_id().await?;
+
+    Ok(())
+}
+
+async fn call_to_client_without_fds_(address: String) -> anyhow::Result<()> {
+    let (client, _) = client_on_socket(&address).await?;
+    let client_name = client.unique_name().unwrap().to_owned();
+    let caller = connect(&address).await?;
+    let file = File::open("/dev/null")?;
+
+    let reply = caller
+        .call_method(
+            Some(client_name.as_str()),
+            "/org/zbus/Fds",
+            Some("org.zbus.Fds"),
+            "WithFd",
+            &Fd::from(&file),
+        )
+        .await;
+    ensure!(
+        matches!(reply, Err(zbus::Error::FDO(ref e)) if matches!(**e, fdo::Error::Failed(_))),
+        "the caller got {reply:?}"
+    );
 
     Ok(())
 }

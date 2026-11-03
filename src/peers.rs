@@ -339,7 +339,8 @@ impl Peers {
     /// own replies go on as they are.
     ///
     /// A call to a name that no peer has gets an error from the bus, as with dbus-broker, unless
-    /// it expects no reply.
+    /// it expects no reply, and so does one with file descriptors to a callee that didn't negotiate
+    /// passing them, which can't take it, rather than wait for a reply that can't come.
     ///
     /// The monitors get each message, whether it goes on to its destination or not, as dbus-broker
     /// passes every message on to its monitors before it routes it.
@@ -416,7 +417,7 @@ impl Peers {
                                     primary.serial_num(),
                                 )
                             {
-                                rejected.push((i, Rejection::SerialPending));
+                                rejected.push((msg.clone(), Rejection::SerialPending));
                             } else {
                                 outbox.add(msgs, peer.id(), peer.recipient(), i)
                             }
@@ -431,7 +432,7 @@ impl Peers {
                                 } else {
                                     Rejection::ServiceUnknown
                                 };
-                                rejected.push((i, rejection));
+                                rejected.push((msg.clone(), rejection));
                             }
                         }
                     }
@@ -455,10 +456,35 @@ impl Peers {
             }
         }
 
-        outbox.send(msgs).await;
-        for (i, rejection) in rejected {
+        let dropped = outbox.send(msgs).await;
+        // A call that its callee can't take, for its file descriptors, waits for no reply, and gets
+        // an error from the bus instead, as with dbus-broker.
+        if !dropped.is_empty() {
+            let routing = self.routing().await;
+            for (recipient, msg) in dropped {
+                let primary = msg.primary_header();
+                if msg.message_type() != message::Type::MethodCall
+                    || primary.flags().contains(message::Flags::NO_REPLY_EXPECTED)
+                {
+                    continue;
+                }
+                let Some(callee) = recipient
+                    .unique_name()
+                    .and_then(|name| routing.peers.get(name))
+                else {
+                    continue;
+                };
+                if callee
+                    .pending_calls()
+                    .remove(sender_id, primary.serial_num())
+                {
+                    rejected.push((msg, Rejection::UnexpectedFds));
+                }
+            }
+        }
+        for (msg, rejection) in rejected {
             let (name, description) = rejection.error();
-            let error = Message::error(&msgs[i].header(), name)
+            let error = Message::error(&msg.header(), name)
                 .sender(fdo::BUS_NAME)
                 .build(&description)?;
             self.send_from_bus(&error).await;
@@ -526,6 +552,8 @@ enum Rejection {
     ServiceUnknown,
     /// No peer has the destination, and the call asks for no service to be started for it.
     NameHasNoOwner,
+    /// The call has file descriptors, and the callee didn't negotiate passing them.
+    UnexpectedFds,
 }
 
 impl Rejection {
@@ -543,6 +571,10 @@ impl Rejection {
             Self::NameHasNoOwner => (
                 "org.freedesktop.DBus.Error.NameHasNoOwner",
                 "Destination does not exist",
+            ),
+            Self::UnexpectedFds => (
+                "org.freedesktop.DBus.Error.Failed",
+                "Peer does not support file descriptor passing.",
             ),
         }
     }
@@ -607,24 +639,46 @@ impl Outbox {
     /// Send each recipient its share of `batch`, all of them at once, and empty the outbox for the
     /// next batch.
     ///
+    /// Returns the messages that their recipients can't take, for their file descriptors, along
+    /// with each recipient.
+    ///
     /// The outbox lets go of the recipients, and the messages of their shares, as soon as they are
     /// sent, rather than with the next batch, which may be a long time coming: a recipient holds
     /// the connection of its client, which stays open for as long as it is held, and a message the
     /// file descriptors that it carries.
-    async fn send(&mut self, batch: &[Message]) {
-        match &self.sends[..] {
-            [] => (),
-            [(_, recipient, share)] => recipient.send(share.of(batch)).await,
+    async fn send(&mut self, batch: &[Message]) -> Vec<(Recipient, Message)> {
+        let dropped = match &self.sends[..] {
+            [] => Vec::new(),
+            [(_, recipient, share)] => {
+                let dropped = recipient.send(share.of(batch)).await;
+
+                with_recipient(recipient, dropped)
+            }
             sends => {
-                let sends = sends
+                let all = sends
                     .iter()
                     .map(|(_, recipient, share)| recipient.send(share.of(batch)));
-                join_all(sends).await;
+                let all = join_all(all).await;
+
+                sends
+                    .iter()
+                    .zip(all)
+                    .flat_map(|((_, recipient, _), dropped)| with_recipient(recipient, dropped))
+                    .collect()
             }
-        }
+        };
         self.sends.clear();
         self.index.clear();
+
+        dropped
     }
+}
+
+/// `msgs`, each with `recipient`.
+fn with_recipient(recipient: &Recipient, msgs: Vec<Message>) -> Vec<(Recipient, Message)> {
+    msgs.into_iter()
+        .map(|msg| (recipient.clone(), msg))
+        .collect()
 }
 
 /// The messages of a batch that a recipient gets.
