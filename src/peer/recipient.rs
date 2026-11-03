@@ -65,15 +65,25 @@ impl Recipient {
     /// A client that a send to fails, or doesn't take the messages within its time limit, gets
     /// disconnected: the end of its connection has the bus remove it, along with its names. The
     /// messages with file descriptors, for a client that didn't negotiate passing them, are dropped
-    /// instead, as the client can still take the others.
-    pub async fn send(&self, msgs: &[Message]) {
+    /// instead, as the client can still take the others, and returned.
+    pub async fn send(&self, msgs: &[Message]) -> Vec<Message> {
         match &self.0 {
             Kind::Client(client) => client.send(msgs).await,
             Kind::Bus(conn) => {
                 if let Err(e) = conn.send_all(msgs).await {
                     warn!("Error sending messages to the bus: {}", e);
                 }
+
+                Vec::new()
             }
+        }
+    }
+
+    /// The unique name of the client, none for the bus itself.
+    pub fn unique_name(&self) -> Option<&OwnedUniqueName> {
+        match &self.0 {
+            Kind::Client(client) => Some(&client.unique_name),
+            Kind::Bus(_) => None,
         }
     }
 }
@@ -130,14 +140,15 @@ struct Client {
 }
 
 impl Client {
-    async fn send(&self, msgs: &[Message]) {
+    /// Send `msgs`, and return those that the client can't take, for their file descriptors.
+    async fn send(&self, msgs: &[Message]) -> Vec<Message> {
         if self.disconnecting.load(Ordering::SeqCst) {
-            return;
+            return Vec::new();
         }
         let (failure, first) = {
             let send = pin!(self.runtime.timeout(self.timeout, self.send_in_turn(msgs)));
             let failure = match send.await {
-                Ok(Ok(())) => return,
+                Ok(Ok(dropped)) => return dropped,
                 Ok(Err(e)) => Failure::Error(e),
                 Err(_) => Failure::Timeout,
             };
@@ -150,7 +161,7 @@ impl Client {
         };
         // Another send got here first, and disconnects the client.
         if !first {
-            return;
+            return Vec::new();
         }
         match failure {
             Failure::Timeout => warn!(
@@ -173,36 +184,38 @@ impl Client {
                 self.unique_name
             );
         }
+
+        Vec::new()
     }
 
     /// Send `msgs` once no other send to the client is under way, unless the client is being
-    /// disconnected by then.
-    async fn send_in_turn(&self, msgs: &[Message]) -> zbus::Result<()> {
+    /// disconnected by then, and return those that the client can't take, for their file
+    /// descriptors.
+    async fn send_in_turn(&self, msgs: &[Message]) -> zbus::Result<Vec<Message>> {
         let _turn = self.sending.lock().await;
         if self.disconnecting.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         match self.conn.send_all(msgs).await {
             // Some of the messages have file descriptors, and the client didn't negotiate passing
             // them. zbus finds that before it writes anything, so the others can still go.
             Err(zbus::Error::Unsupported) => {
-                let without_fds: Vec<_> = msgs
+                let (dropped, without_fds): (Vec<_>, Vec<_>) = msgs
                     .iter()
-                    .filter(|msg| msg.data().fds().is_empty())
                     .cloned()
-                    .collect();
+                    .partition(|msg| !msg.data().fds().is_empty());
                 debug!(
                     "Dropping {} of {} messages for `{}`, which have file descriptors that it \
                      takes none of",
-                    msgs.len() - without_fds.len(),
+                    dropped.len(),
                     msgs.len(),
                     self.unique_name
                 );
 
-                self.conn.send_all(&without_fds).await
+                self.conn.send_all(&without_fds).await.map(|()| dropped)
             }
-            result => result,
+            result => result.map(|()| Vec::new()),
         }
     }
 }
