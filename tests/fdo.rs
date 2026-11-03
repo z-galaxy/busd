@@ -27,14 +27,9 @@ fn name_ownership_changes() {
     busd::tracing_subscriber::init();
 
     zruntime::block_on(async {
-        // Unix socket
         let s = Alphanumeric.sample_string(&mut rng(), 10);
         let path = temp_dir().join(s);
         let address = format!("unix:path={}", path.display());
-        name_ownership_changes_(&address).await;
-
-        // TCP socket
-        let address = "tcp:host=127.0.0.1,port=4242".to_string();
         name_ownership_changes_(&address).await;
     });
 }

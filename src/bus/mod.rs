@@ -9,7 +9,7 @@ use std::{
 };
 use zbus::{
     address::{
-        transport::{Tcp, Unix, UnixSocket},
+        transport::{Unix, UnixSocket},
         Transport,
     },
     connection::{self, AuthMechanism},
@@ -32,7 +32,7 @@ use crate::{
 #[derive(Debug)]
 pub struct Bus {
     inner: Inner,
-    listener: Listener,
+    listener: zruntime::net::unix::UnixListener<Shared>,
 }
 
 // All (cheaply) cloneable fields of `Bus` go here.
@@ -47,42 +47,26 @@ pub struct Inner {
     _self_conn: Connection,
 }
 
-#[derive(Debug)]
-enum Listener {
-    Unix(zruntime::net::unix::UnixListener<Shared>),
-    Tcp(zruntime::net::TcpListener<Shared>),
-}
-
 impl Bus {
     pub async fn for_address(address: Option<&str>) -> Result<Self> {
-        let mut address = match address {
+        let address = match address {
             Some(address) => Address::from_str(address)?,
             None => Address::from_str(&default_address())?,
         };
+        let Transport::Unix(unix) = address.transport() else {
+            bail!("Unsupported address `{address}`: the bus only listens on unix sockets.");
+        };
         let guid: OwnedGuid = match address.guid() {
             Some(guid) => guid.to_owned().into(),
-            None => {
-                let guid = Guid::generate();
-                address = address.set_guid(guid.clone())?;
-
-                guid.into()
-            }
+            None => Guid::generate().into(),
         };
-        let (listener, auth_mechanism) = match address.transport() {
-            Transport::Unix(unix) => {
-                // Resolve address specification into address that clients can use.
-                let (addr, socket) = Self::unix_addr(unix)?;
-                let unix = Unix::new(socket);
-                let listener = Self::unix_stream(addr)
-                    .await
-                    .with_context(|| format!("failed to listen on {unix}"))?;
-                address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
-
-                (listener, AuthMechanism::External)
-            }
-            Transport::Tcp(tcp) => (Self::tcp_stream(tcp).await?, AuthMechanism::Anonymous),
-            _ => bail!("Unsupported address `{}`.", address),
-        };
+        // Resolve address specification into address that clients can use.
+        let (addr, socket) = Self::unix_addr(unix)?;
+        let unix = Unix::new(socket);
+        let listener = Self::unix_stream(addr)
+            .await
+            .with_context(|| format!("failed to listen on {unix}"))?;
+        let address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
 
         let peers = Peers::new();
 
@@ -115,7 +99,7 @@ impl Bus {
                 peers,
                 guid,
                 next_id: 0,
-                auth_mechanism,
+                auth_mechanism: AuthMechanism::External,
                 send_timeout: SEND_TIMEOUT,
                 _self_conn: service_conn,
             },
@@ -193,40 +177,26 @@ impl Bus {
         })
     }
 
-    async fn unix_stream(addr: std::os::unix::net::SocketAddr) -> Result<Listener> {
+    async fn unix_stream(
+        addr: std::os::unix::net::SocketAddr,
+    ) -> Result<zruntime::net::unix::UnixListener<Shared>> {
         let runtime = SharedRuntime::current()?;
         let std_listener =
             zruntime::unblock(move || std::os::unix::net::UnixListener::bind_addr(&addr)).await?;
 
-        zruntime::net::unix::UnixListener::from_std(&runtime, std_listener)
-            .map(Listener::Unix)
-            .map_err(Into::into)
-    }
-
-    async fn tcp_stream(tcp: &Tcp) -> Result<Listener> {
-        if tcp.nonce_file().is_some() {
-            bail!("`nonce-tcp` transport is not supported (yet).");
-        }
-        info!("Listening on `{}:{}`.", tcp.host(), tcp.port());
-        let runtime = SharedRuntime::current()?;
-        let address = (tcp.host().to_owned(), tcp.port());
-
-        // zruntime's sockets take socket addresses, not host names. So resolve the host name and
-        // bind on a thread for blocking work, and hand the socket over to the runtime.
-        let std_listener = zruntime::unblock(move || std::net::TcpListener::bind(address)).await?;
-
-        zruntime::net::TcpListener::from_std(&runtime, std_listener)
-            .map(Listener::Tcp)
-            .map_err(Into::into)
+        zruntime::net::unix::UnixListener::from_std(&runtime, std_listener).map_err(Into::into)
     }
 
     async fn accept_next(&mut self) -> Result<()> {
-        let socket = self.accept().await?;
+        let (stream, _) = self.listener.accept().await?;
+        debug!("Accepted connection on address `{}`", self.inner.address);
 
         let id = self.next_id();
         let inner = self.inner.clone();
         spawn(async move {
-            let builder = socket.into_builder();
+            // zbus is given the standard library stream that the zruntime one wraps, and the
+            // connection then drives it on the runtime it is built on.
+            let builder = connection::Builder::unix_stream(stream.into_std());
             let res = inner
                 .peers
                 .clone()
@@ -245,24 +215,6 @@ impl Bus {
         .detach();
 
         Ok(())
-    }
-
-    async fn accept(&mut self) -> Result<AcceptedSocket> {
-        let socket = match &mut self.listener {
-            Listener::Unix(listener) => {
-                let (stream, _) = listener.accept().await?;
-
-                AcceptedSocket::Unix(stream)
-            }
-            Listener::Tcp(listener) => {
-                let (stream, _) = listener.accept().await?;
-
-                AcceptedSocket::Tcp(stream)
-            }
-        };
-        debug!("Accepted connection on address `{}`", self.inner.address);
-
-        Ok(socket)
     }
 
     pub fn peers(&self) -> &Arc<Peers> {
@@ -287,26 +239,6 @@ impl Bus {
 impl Drop for Bus {
     fn drop(&mut self) {
         self.inner.peers.remove_us();
-    }
-}
-
-/// A socket accepted by the bus's listener, not yet handed over to zbus.
-#[derive(Debug)]
-enum AcceptedSocket {
-    Unix(zruntime::net::unix::UnixStream<Shared>),
-    Tcp(zruntime::net::TcpStream<Shared>),
-}
-
-impl AcceptedSocket {
-    /// Create a builder for a connection over this socket.
-    ///
-    /// zbus is given the standard library stream that the zruntime one wraps, and the connection
-    /// then drives it on the runtime it is built on.
-    fn into_builder(self) -> connection::Builder<'static> {
-        match self {
-            AcceptedSocket::Unix(stream) => connection::Builder::unix_stream(stream.into_std()),
-            AcceptedSocket::Tcp(stream) => connection::Builder::tcp_stream(stream.into_std()),
-        }
     }
 }
 

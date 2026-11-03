@@ -1,4 +1,4 @@
-use std::pin::pin;
+use std::{env::temp_dir, pin::pin};
 
 use anyhow::ensure;
 use busd::bus::Bus;
@@ -7,6 +7,10 @@ use futures_util::{
     TryStreamExt,
 };
 use ntest::timeout;
+use rand::{
+    distr::{Alphanumeric, SampleString},
+    rng,
+};
 use tracing::instrument;
 use zbus::{
     connection,
@@ -25,7 +29,9 @@ fn become_monitor() {
     busd::tracing_subscriber::init();
 
     zruntime::block_on(async {
-        let address = "tcp:host=127.0.0.1,port=4244".to_string();
+        let s = Alphanumeric.sample_string(&mut rng(), 10);
+        let path = temp_dir().join(s);
+        let address = format!("unix:path={}", path.display());
         let mut bus = Bus::for_address(Some(&address)).await.unwrap();
         let stop = Event::new();
         let stopped = stop.listen();
