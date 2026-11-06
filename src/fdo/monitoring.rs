@@ -28,9 +28,12 @@ impl Monitoring {
     }
 }
 
+// One call at a time, in order, as with the `org.freedesktop.DBus` interface, and with the same
+// rule: a method never waits for anything that waits for the bus to take the calls after it.
 #[interface(
     interface = "org.freedesktop.DBus.Monitoring",
-    introspection_docs = false
+    introspection_docs = false,
+    spawn = false
 )]
 impl Monitoring {
     async fn become_monitor(
@@ -55,7 +58,9 @@ impl Monitoring {
         // Otherwise, some clients (e.g `busctl monitor`) can get confused.
         let (response, listener) = ResponseDispatchNotifier::new(());
         let ctxt = ctxt.to_owned();
+        let chore = peers.chore();
         spawn(async move {
+            let _chore = chore;
             listener.await;
 
             let names_changes = peers

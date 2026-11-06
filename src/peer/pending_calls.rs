@@ -20,15 +20,16 @@ use crate::user::{Charge, User};
 ///
 /// Each record is an object that the bus keeps for the user of the callee, on behalf of the user of
 /// the caller, as with dbus-broker, for as long as it is kept, so that a caller can't have the bus
-/// keep records without end, of calls to a peer that never answers.
+/// keep records without end, of calls to a peer that never answers. The records of the calls to the
+/// bus itself are no one's objects: see [`PendingCalls::of_bus`].
 ///
 /// The records of a peer are shared between the peer and the task that serves it, as the peer
 /// goes, when it becomes a monitor, before its task does.
 #[derive(Debug)]
 pub struct PendingCalls {
     calls: Mutex<Calls>,
-    /// The user of the peer.
-    user: Arc<User>,
+    /// The user of the peer, which the records are objects of; none for the bus itself.
+    user: Option<Arc<User>>,
 }
 
 impl PendingCalls {
@@ -36,7 +37,19 @@ impl PendingCalls {
     pub fn new(user: Arc<User>) -> Self {
         Self {
             calls: Mutex::default(),
-            user,
+            user: Some(user),
+        }
+    }
+
+    /// No calls yet, to the bus itself.
+    ///
+    /// The bus answers the calls to it itself, as they come in, and only records them for a
+    /// hand-over to wait for its answers, so their records are no one's objects, and the bus
+    /// refuses none of them for a quota: dbus-broker keeps no records of the calls to it at all.
+    pub fn of_bus() -> Self {
+        Self {
+            calls: Mutex::default(),
+            user: None,
         }
     }
 
@@ -52,7 +65,12 @@ impl PendingCalls {
         match self.calls().entry((caller_id, serial)) {
             Entry::Occupied(_) => Err(Refusal::SerialPending),
             Entry::Vacant(call) => {
-                let charge = Charge::new(&self.user, &caller.user).ok_or(Refusal::QuotaExceeded)?;
+                let charge = match &self.user {
+                    Some(user) => {
+                        Some(Charge::new(user, &caller.user).ok_or(Refusal::QuotaExceeded)?)
+                    }
+                    None => None,
+                };
                 call.insert(Call {
                     caller: caller.clone(),
                     _charge: charge,
@@ -72,6 +90,48 @@ impl PendingCalls {
     /// Forget the calls of the caller whose number is `caller_id`, which goes.
     pub fn forget(&self, caller_id: usize) {
         self.calls().retain(|(id, _), _| *id != caller_id);
+    }
+
+    /// Record the call of `caller`, whose number is `caller_id`, with `serial`, which another
+    /// instance of the bus handed over, whatever the quota of the user of the callee: that instance
+    /// kept all of the records that it handed over at once.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn add_handed_over(
+        &self,
+        caller_id: usize,
+        caller: &Arc<Caller>,
+        serial: NonZeroU32,
+    ) {
+        let charge = self
+            .user
+            .as_ref()
+            .map(|user| Charge::taken_over(user, &caller.user));
+        self.calls().insert(
+            (caller_id, serial),
+            Call {
+                caller: caller.clone(),
+                _charge: charge,
+            },
+        );
+    }
+
+    /// The records: the number of the caller of each call, its unique name, and the serial of the
+    /// call.
+    pub fn records(&self) -> impl Iterator<Item = (usize, OwnedUniqueName, NonZeroU32)> {
+        let records: Vec<_> = self
+            .calls()
+            .iter()
+            .map(|((caller_id, serial), call)| {
+                (*caller_id, call.caller.unique_name.clone(), *serial)
+            })
+            .collect();
+
+        records.into_iter()
+    }
+
+    /// Whether no call waits.
+    pub fn is_empty(&self) -> bool {
+        self.calls().is_empty()
     }
 
     /// Take all of the records away: the caller and the serial of each call.
@@ -125,6 +185,7 @@ type Calls = HashMap<(usize, NonZeroU32), Call, foldhash::fast::RandomState>;
 #[derive(Debug)]
 struct Call {
     caller: Arc<Caller>,
-    /// The record, as an object that the bus keeps for the user of the callee.
-    _charge: Charge,
+    /// The record, as an object that the bus keeps for the user of the callee; none for a call to
+    /// the bus itself.
+    _charge: Option<Charge>,
 }

@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{ensure, Context};
-use busd::bus::Bus;
+use busd::{bus::Bus, user::MAX_OBJECTS};
 use futures_util::{
     future::{join, select, try_join_all, Either},
     stream::StreamExt,
@@ -190,6 +190,20 @@ fn client_without_fds_in_a_batch() {
     zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_in_a_batch_));
 }
 
+/// A client is an object of its user from the moment that it connects, as with dbus-broker, so
+/// that a user can't have the bus keep more of its clients than its quota by stalling their
+/// handshakes: with one object for each user, a client that stalls in its handshake, as one that
+/// the bus rejected, keeps the bus from taking another client of the user, which it disconnects
+/// before its handshake, until the first one goes.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn stalled_handshake_counts() {
+    init_tracing();
+
+    zruntime::block_on(with_bus_of(LONG_TIMEOUT, 1, stalled_handshake_counts_));
+}
+
 /// A client that the bus can't write to anymore gets disconnected, even while the bus can still
 /// read from it.
 #[cfg(target_os = "linux")]
@@ -299,13 +313,20 @@ async fn stall_holds_up_no_one_else_(address: String) -> anyhow::Result<()> {
     ensure!(!flooding.is_finished(), "the flood didn't wait");
 
     // Meanwhile, which takes each lock of the bus to change what it holds: a client connects, asks
-    // for a name and releases it, and gets a signal from another one, and a third one becomes a
-    // monitor.
+    // for a name and releases it, and for the credentials of the stalled client, which a lookup
+    // through the connection of that client would wait for the flood to go on for, and gets a
+    // signal from another one, and a third one becomes a monitor.
+    let stalled_name = BusName::from(stalled.unique_name().context("no unique name")?.clone());
     let runtime = SharedRuntime::current()?;
     runtime
         .timeout(LONG_TIMEOUT / 4, async {
             let newcomer = connect(&address).await?;
             let dbus = DBusProxy::new(&newcomer).await?;
+            let uid = dbus.get_connection_unix_user(stalled_name).await?;
+            ensure!(
+                uid == rustix::process::getuid().as_raw(),
+                "the stalled client's UID is {uid}"
+            );
             let name = WellKnownName::try_from("org.zbus.Others")?;
             dbus.request_name(name.clone(), RequestNameFlags::empty())
                 .await?;
@@ -784,6 +805,53 @@ async fn client_without_fds_in_a_batch_(address: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn stalled_handshake_counts_(address: String) -> anyhow::Result<()> {
+    stalled_handshake_keeps_others_out(&address).await?;
+
+    // Once the bus sees the stalled client go, it takes another client of the user.
+    let deadline = Instant::now() + LONG_TIMEOUT;
+    while connect(&address).await.is_err() {
+        ensure!(
+            Instant::now() < deadline,
+            "the bus took no other client of the user once the stalled one went"
+        );
+        SharedRuntime::current()?.sleep(PAUSE).await;
+    }
+
+    Ok(())
+}
+
+/// Check that a client stalled in its handshake with the bus at `address` keeps the other clients
+/// of its user out, as the quota of the user takes one client. The stalled client goes as this
+/// returns.
+async fn stalled_handshake_keeps_others_out(address: &str) -> anyhow::Result<()> {
+    let path = address.strip_prefix("unix:path=").unwrap().to_owned();
+    let _stalled = {
+        let path = path.clone();
+        zruntime::unblock(move || rejected_handshake(&path)).await?
+    };
+
+    let turned_away = zruntime::unblock(move || {
+        let mut stream = UnixStream::connect(&path)?;
+        stream.set_read_timeout(Some(LONG_TIMEOUT))?;
+
+        stream.read(&mut [0])
+    });
+    let read = turned_away
+        .await
+        .context("the bus kept another client of the user")?;
+    ensure!(
+        read == 0,
+        "the bus sent another client of the user something"
+    );
+    ensure!(
+        connect(address).await.is_err(),
+        "the bus took another client of the user"
+    );
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 async fn unwritable_client_(address: String) -> anyhow::Result<()> {
     let (client, socket) = client_on_socket(&address).await?;
@@ -997,11 +1065,22 @@ where
     F: FnOnce(String) -> T,
     T: Future<Output = anyhow::Result<()>>,
 {
+    with_bus_of(send_timeout, MAX_OBJECTS, test).await;
+}
+
+/// Run `test` as [`with_bus`] does, against a bus that keeps `max_objects` objects for each user
+/// at most.
+async fn with_bus_of<F, T>(send_timeout: Duration, max_objects: usize, test: F)
+where
+    F: FnOnce(String) -> T,
+    T: Future<Output = anyhow::Result<()>>,
+{
     let s = Alphanumeric.sample_string(&mut rng(), 10);
     let path = temp_dir().join(s);
     let address = format!("unix:path={}", path.display());
     let mut bus = Bus::for_address(Some(&address)).await.unwrap();
     bus.set_send_timeout(send_timeout);
+    bus.set_max_objects_per_user(max_objects);
     let stop = Event::new();
     let stopped = stop.listen();
 
@@ -1447,8 +1526,19 @@ impl RawClient {
     }
 }
 
+/// Connect to the bus on `path`, and start a handshake that the bus rejects, as the client claims
+/// to be of another user than the one that its socket tells, without going on with it.
+fn rejected_handshake(path: &str) -> anyhow::Result<UnixStream> {
+    let mut stream = UnixStream::connect(path)?;
+    let uid = (rustix::process::getuid().as_raw() + 1).to_string();
+    let uid: String = uid.bytes().map(|b| format!("{b:02x}")).collect();
+    stream.write_all(format!("\0AUTH EXTERNAL {uid}\r\n").as_bytes())?;
+    read_line(&stream, "REJECTED")?;
+
+    Ok(stream)
+}
+
 /// Read a line of the handshake, which must start with `expected`.
-#[cfg(target_os = "linux")]
 fn read_line(mut stream: &UnixStream, expected: &str) -> anyhow::Result<()> {
     let mut line = vec![];
     let mut byte = [0];

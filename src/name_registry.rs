@@ -34,8 +34,22 @@ pub struct NameOwner {
 }
 
 impl NameOwner {
+    /// An owner of a name, or one that queues for it, which lets another take the name over from
+    /// it if `allow_replacement`.
+    pub fn new(unique_name: OwnedUniqueName, allow_replacement: bool) -> Self {
+        Self {
+            unique_name,
+            allow_replacement,
+        }
+    }
+
     pub fn unique_name(&self) -> &OwnedUniqueName {
         &self.unique_name
+    }
+
+    /// Whether the owner lets another take the name over from it.
+    pub fn allow_replacement(&self) -> bool {
+        self.allow_replacement
     }
 }
 
@@ -190,6 +204,21 @@ impl NameRegistry {
 
     pub fn all_names(&self) -> &HashMap<OwnedWellKnownName, NameEntry> {
         &self.names
+    }
+
+    /// Give `name` to `owner`, with `waiting_list` queuing for it, in that order, as another
+    /// instance of the bus had it when it handed over.
+    pub fn insert(
+        &mut self,
+        name: OwnedWellKnownName,
+        owner: NameOwner,
+        waiting_list: impl IntoIterator<Item = NameOwner>,
+    ) {
+        let entry = NameEntry {
+            owner,
+            waiting_list: waiting_list.into_iter().collect(),
+        };
+        self.names.insert(name, entry);
     }
 
     pub fn waiting_list(

@@ -1,11 +1,13 @@
-use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
-use crate::warn;
-use futures_util::StreamExt;
+#[cfg(target_os = "linux")]
+use zbus::MessageStream;
 use zbus::{
     names::{BusName, OwnedUniqueName},
-    Connection, MessageStream,
+    Connection,
 };
+use zruntime::{Event, EventListener};
 
 use crate::{match_rules::MatchRules, name_registry::NameRegistry, user::Charge};
 
@@ -21,6 +23,13 @@ pub struct Monitor {
     match_rules: MatchRules,
     /// The monitor, as an object that the bus keeps for its user, as it was as a peer.
     _charge: Option<Charge>,
+    /// Notified as the monitor goes, and as the bus pauses to hand over, for the task that serves
+    /// the monitor to see why.
+    canceled_event: Event,
+    /// The stream of the messages of the monitor, once the task that served the monitor, or the
+    /// peer that it was, gave it back, as the bus pauses to hand over.
+    #[cfg(target_os = "linux")]
+    paused: Option<MessageStream>,
 }
 
 impl Monitor {
@@ -43,6 +52,10 @@ impl Monitor {
         &self.unique_name
     }
 
+    pub fn match_rules(&self) -> &MatchRules {
+        &self.match_rules
+    }
+
     /// # Panics
     ///
     /// Same as [`MatchRules::matches`].
@@ -55,20 +68,22 @@ impl Monitor {
         self.match_rules.matches(msg, name_registry)
     }
 
-    /// Monitor the monitor.
-    ///
-    /// This method returns once the monitor connection is closed.
-    pub fn monitor(&self) -> impl Future<Output = ()> + 'static {
-        let mut stream = MessageStream::from(&self.conn);
-        let unique_name = self.unique_name.clone();
-        async move {
-            if let Some(Ok(_)) = stream.next().await {
-                warn!(
-                    "Monitor {} sent a message, which is against the rules.",
-                    unique_name
-                );
-            }
-        }
+    pub fn listen_cancellation(&self) -> EventListener {
+        self.canceled_event.listen()
+    }
+
+    /// Pause the monitor, as the bus hands over from `since`, as [`Peer::pause`] pauses a peer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pause(&self, since: Instant) {
+        self.recipient.hand_over_from(since);
+        self.canceled_event.notify(usize::MAX);
+    }
+
+    /// The stream of the messages of the monitor, if the task that served the monitor, or the peer
+    /// that it was, gave it back, as the bus pauses to hand over.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn paused(&mut self) -> &mut Option<MessageStream> {
+        &mut self.paused
     }
 
     pub(super) fn new(mut peer: Peer, match_rules: MatchRules) -> Self {
@@ -79,6 +94,15 @@ impl Monitor {
             unique_name: peer.unique_name().clone(),
             match_rules,
             _charge: peer.charge.take(),
+            canceled_event: Event::new(),
+            #[cfg(target_os = "linux")]
+            paused: peer.paused.take(),
         }
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        self.canceled_event.notify(usize::MAX);
     }
 }
