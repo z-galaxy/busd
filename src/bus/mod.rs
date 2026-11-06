@@ -1,5 +1,9 @@
 use crate::{debug, info, trace, warn};
 use anyhow::{bail, Context, Ok, Result};
+#[cfg(target_os = "linux")]
+use rustix::net::{sockopt, AddressFamily, SocketType};
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
 use std::{
     env, io,
     path::{Path, PathBuf},
@@ -34,6 +38,9 @@ use crate::{
 pub struct Bus {
     inner: Inner,
     listener: zruntime::net::unix::UnixListener<Shared>,
+    /// Whether the bus bound the socket that it listens on itself, rather than take it from
+    /// whoever passed it, such as systemd's socket activation, which then owns the socket's file.
+    bound: bool,
 }
 
 // All (cheaply) cloneable fields of `Bus` go here.
@@ -68,7 +75,21 @@ impl Bus {
             .with_context(|| format!("failed to listen on {unix}"))?;
         let address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
 
-        Self::new(listener, address, guid).await
+        Self::new(listener, address, guid, true).await
+    }
+
+    /// Create a bus that listens on `listener`, a socket that listens already, such as the one that
+    /// systemd's socket activation passes.
+    ///
+    /// The bus gives the address of the socket out as its own, with a GUID of its own. The socket
+    /// stays with whoever passed it: the bus doesn't remove its file as it goes.
+    #[cfg(target_os = "linux")]
+    pub async fn for_listener(listener: OwnedFd) -> Result<Self> {
+        let (listener, unix) = Self::listener(listener)?;
+        let guid = Guid::generate();
+        let address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
+
+        Self::new(listener, address, guid.into(), false).await
     }
 
     pub fn address(&self) -> &Address {
@@ -105,6 +126,9 @@ impl Bus {
 
     // AsyncDrop would have been nice!
     pub async fn cleanup(self) -> Result<()> {
+        if !self.bound {
+            return Ok(());
+        }
         match self.inner.address.transport() {
             Transport::Unix(unix) => match unix.path() {
                 UnixSocket::File(path) => remove_file(path).await.map_err(Into::into),
@@ -122,11 +146,13 @@ impl Bus {
         &self.inner.guid
     }
 
-    /// A bus that listens on `listener`, at `address`.
+    /// A bus that listens on `listener`, at `address`: `bound` says whether it bound the listener
+    /// itself.
     async fn new(
         listener: zruntime::net::unix::UnixListener<Shared>,
         address: Address,
         guid: OwnedGuid,
+        bound: bool,
     ) -> Result<Self> {
         let peers = Peers::new();
 
@@ -162,7 +188,34 @@ impl Bus {
                 send_timeout: SEND_TIMEOUT,
                 _self_conn: service_conn,
             },
+            bound,
         })
+    }
+
+    /// The listener on `listener`, a socket that listens already, and the socket that clients
+    /// connect to, to reach it.
+    #[cfg(target_os = "linux")]
+    fn listener(listener: OwnedFd) -> Result<(zruntime::net::unix::UnixListener<Shared>, Unix)> {
+        if !sockopt::socket_acceptconn(&listener)? {
+            bail!("The socket to listen on doesn't listen.");
+        }
+        if sockopt::socket_type(&listener)? != SocketType::STREAM {
+            bail!("The socket to listen on isn't a stream socket.");
+        }
+        let family = sockopt::socket_domain(&listener)?;
+        if family != AddressFamily::UNIX {
+            bail!(
+                "The socket to listen on is of the {family:?} family: the bus only listens on unix \
+                 sockets."
+            );
+        }
+        let listener = std::os::unix::net::UnixListener::from(listener);
+        let socket = Self::unix_socket(&listener.local_addr()?)?;
+        info!("Listening on the UNIX socket `{socket}` that was passed.");
+        let runtime = SharedRuntime::current()?;
+        let listener = zruntime::net::unix::UnixListener::from_std(&runtime, listener)?;
+
+        Ok((listener, Unix::new(socket)))
     }
 
     /// The address to listen on for `unix`, and the socket that clients connect to.
@@ -214,6 +267,24 @@ impl Bus {
         let std_listener = zruntime::unblock(move || bind(&addr)).await?;
 
         zruntime::net::unix::UnixListener::from_std(&runtime, std_listener).map_err(Into::into)
+    }
+
+    /// The socket that clients connect to, to reach a listener bound to `addr`.
+    #[cfg(target_os = "linux")]
+    fn unix_socket(addr: &std::os::unix::net::SocketAddr) -> Result<UnixSocket> {
+        use std::{
+            ffi::OsStr,
+            os::{linux::net::SocketAddrExt, unix::ffi::OsStrExt},
+        };
+
+        if let Some(path) = addr.as_pathname() {
+            return Ok(UnixSocket::File(path.to_owned()));
+        }
+        if let Some(name) = addr.as_abstract_name() {
+            return Ok(UnixSocket::Abstract(OsStr::from_bytes(name).to_owned()));
+        }
+
+        bail!("The UNIX socket to listen on has no name.")
     }
 
     async fn accept_next(&mut self) -> Result<()> {
