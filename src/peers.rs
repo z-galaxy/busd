@@ -84,31 +84,8 @@ impl Peers {
         // handling, etc.).
         let (peer, peer_stream) =
             Peer::new(guid.clone(), id, builder, send_timeout, user, charge).await?;
-        let unique_name = peer.unique_name().clone();
-        let listener = peer.listen_cancellation();
-        let pending_calls = peer.pending_calls().clone();
-        let caller = peer.caller().clone();
-        let id = peer.id();
 
-        let mut routing = self.routing_mut().await;
-        match routing.peers.get(&unique_name) {
-            Some(peer) => panic!(
-                "Unique name `{}` re-used. We're in deep trouble if this happens",
-                peer.unique_name()
-            ),
-            None => {
-                spawn(self.clone().serve_peer(
-                    peer_stream,
-                    listener,
-                    unique_name.clone(),
-                    id,
-                    pending_calls,
-                    caller,
-                ))
-                .detach();
-                routing.peers.insert(unique_name.clone(), peer);
-            }
-        }
+        self.insert(&mut *self.routing_mut().await, peer, peer_stream);
 
         Ok(())
     }
@@ -126,31 +103,8 @@ impl Peers {
         // The user of the process of the bus, as with dbus-broker.
         let user = self.users.user(rustix::process::getuid().as_raw());
         let (peer, peer_stream) = Peer::new_us(msg_stream, user).await?;
-        let unique_name = peer.unique_name().clone();
-        let listener = peer.listen_cancellation();
-        let pending_calls = peer.pending_calls().clone();
-        let caller = peer.caller().clone();
-        let id = peer.id();
 
-        let mut routing = self.routing_mut().await;
-        match routing.peers.get(&unique_name) {
-            Some(peer) => panic!(
-                "Unique name `{}` re-used. We're in deep trouble if this happens",
-                peer.unique_name()
-            ),
-            None => {
-                spawn(self.clone().serve_peer(
-                    peer_stream,
-                    listener,
-                    unique_name.clone(),
-                    id,
-                    pending_calls,
-                    caller,
-                ))
-                .detach();
-                routing.peers.insert(unique_name.clone(), peer);
-            }
-        }
+        self.insert(&mut *self.routing_mut().await, peer, peer_stream);
 
         Ok(())
     }
@@ -237,6 +191,25 @@ impl Peers {
         }
 
         Ok(())
+    }
+
+    /// Serve `peer`, whose messages come out of `peer_stream`, and add it to the peers of
+    /// `routing`.
+    fn insert(self: &Arc<Self>, routing: &mut Routing, peer: Peer, peer_stream: Stream) {
+        let unique_name = peer.unique_name().clone();
+        if routing.peers.contains_key(&unique_name) {
+            panic!("Unique name `{unique_name}` re-used. We're in deep trouble if this happens");
+        }
+        spawn(self.clone().serve_peer(
+            peer_stream,
+            peer.listen_cancellation(),
+            unique_name.clone(),
+            peer.id(),
+            peer.pending_calls().clone(),
+            peer.caller().clone(),
+        ))
+        .detach();
+        routing.peers.insert(unique_name, peer);
     }
 
     /// Serve the peer `unique_name`, numbered `id`, whose messages come out of `peer_stream`, whose
