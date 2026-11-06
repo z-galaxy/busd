@@ -64,7 +64,8 @@ impl Peer {
         // that doesn't hold what its signature says, as with dbus-broker.
         //
         // A client authenticates with the EXTERNAL mechanism, the only one that dbus-broker takes
-        // too: as the uid that its socket tells.
+        // too: as the uid that its socket tells. zbus keeps the credentials that it looks up for
+        // that, so it has them without waiting for the sends to the client, when asked for them.
         let msg_stream = builder
             .server(guid)
             .p2p()

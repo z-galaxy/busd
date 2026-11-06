@@ -217,7 +217,10 @@ impl DBus {
         bus_name: BusName<'_>,
     ) -> Result<Arc<ConnectionCredentials>> {
         let owner = self.get_name_owner(bus_name.clone()).await?;
-        // Not under the lock of the routing: this waits for any send to the peer that is under way.
+        // Not under the lock of the routing, as zbus looks the credentials up through the
+        // connection of the peer unless it knows them already, which waits for any send to the peer
+        // that is under way. It knows those of each client, which it looks up as the client
+        // connects.
         let conn = self
             .peers()?
             .routing()
