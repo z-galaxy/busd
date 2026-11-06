@@ -137,6 +137,14 @@ impl Peers {
         let Some(peer) = routing.peers.remove(peer_name.as_str()) else {
             return false;
         };
+        // A monitor makes no calls and answers none, as with a peer that goes. This is done here,
+        // as the bus answers the call that makes the monitor, rather than by the task that served
+        // the peer, which only gets to it later, so that the bus has sent all that the peer's
+        // change of role takes by the time it answered.
+        for other in routing.peers.values() {
+            other.pending_calls().forget(peer.id());
+        }
+        let waiting = peer.pending_calls().take();
         let monitor = peer.become_monitor(match_rules);
         let monitor_monitoring_fut = monitor.monitor();
         let unique_name = monitor.unique_name().clone();
@@ -150,6 +158,12 @@ impl Peers {
             debug!("Monitor {} disconnected", unique_name);
         })
         .detach();
+        for (caller, serial) in waiting {
+            match no_reply(&caller, serial) {
+                Ok(error) => self.send_from_bus(&error).await,
+                Err(e) => warn!("Failed to build the error for the call of {caller}: {e}"),
+            }
+        }
 
         true
     }
