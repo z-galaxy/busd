@@ -1,10 +1,6 @@
-use std::future::Future;
-
-use crate::warn;
-use futures_util::StreamExt;
 use zbus::{
     names::{BusName, OwnedUniqueName},
-    Connection, MessageStream,
+    Connection,
 };
 
 use crate::{match_rules::MatchRules, name_registry::NameRegistry, user::Charge};
@@ -53,22 +49,6 @@ impl Monitor {
             return true;
         }
         self.match_rules.matches(msg, name_registry)
-    }
-
-    /// Monitor the monitor.
-    ///
-    /// This method returns once the monitor connection is closed.
-    pub fn monitor(&self) -> impl Future<Output = ()> + 'static {
-        let mut stream = MessageStream::from(&self.conn);
-        let unique_name = self.unique_name.clone();
-        async move {
-            if let Some(Ok(_)) = stream.next().await {
-                warn!(
-                    "Monitor {} sent a message, which is against the rules.",
-                    unique_name
-                );
-            }
-        }
     }
 
     pub(super) fn new(mut peer: Peer, match_rules: MatchRules) -> Self {

@@ -16,7 +16,7 @@ use std::{
 use zbus::{
     connection, message,
     names::{BusName, OwnedUniqueName, UniqueName},
-    Connection, Message, Optional, OwnedGuid,
+    Connection, Message, MessageStream, Optional, OwnedGuid,
 };
 use zruntime::{lock::RwLock, spawn, EventListener};
 
@@ -145,19 +145,13 @@ impl Peers {
             other.pending_calls().forget(peer.id());
         }
         let waiting = peer.pending_calls().take();
+        // The task that served the peer serves the monitor from now on, once it is done with what
+        // it took of the peer: dropping the peer tells it.
         let monitor = peer.become_monitor(match_rules);
-        let monitor_monitoring_fut = monitor.monitor();
-        let unique_name = monitor.unique_name().clone();
-        routing.monitors.insert(unique_name.clone(), monitor);
+        routing
+            .monitors
+            .insert(monitor.unique_name().clone(), monitor);
         drop(routing);
-
-        let peers = self.clone();
-        spawn(async move {
-            monitor_monitoring_fut.await;
-            peers.routing_mut().await.monitors.remove(&unique_name);
-            debug!("Monitor {} disconnected", unique_name);
-        })
-        .detach();
         for (caller, serial) in waiting {
             match no_reply(&caller, serial) {
                 Ok(error) => self.send_from_bus(&error).await,
@@ -223,7 +217,8 @@ impl Peers {
         routing.peers.insert(unique_name, peer);
     }
 
-    /// Serve `peer`, whose messages come out of `peer_stream`, until it goes.
+    /// Serve `peer`, whose messages come out of `peer_stream`, until it goes, and then the monitor
+    /// that it becomes, if it becomes one.
     async fn serve_peer(
         self: Arc<Self>,
         mut peer_stream: Stream,
@@ -238,13 +233,11 @@ impl Peers {
         } = peer;
         let mut batch = Vec::new();
         let mut outbox = Outbox::default();
-        loop {
+        // Whether the peer became a monitor, rather than the peer went.
+        let canceled = loop {
             let msg = match select(cancellation_listener, peer_stream.next()).await {
-                Either::Left(_) | Either::Right((None, _)) => {
-                    trace!("Peer `{}` disconnected", unique_name);
-
-                    break;
-                }
+                Either::Left(_) => break true,
+                Either::Right((None, _)) => break false,
                 Either::Right((Some(msg), listener)) => {
                     cancellation_listener = listener;
 
@@ -299,47 +292,58 @@ impl Peers {
                      {MAX_MESSAGE_FDS} file descriptors"
                 );
 
-                break;
+                break false;
             }
             if ended {
-                trace!("Peer `{}` disconnected", unique_name);
+                break false;
+            }
+        };
+        if canceled {
+            self.serve_on(peer_stream.into_inner(), unique_name, id)
+                .await;
 
-                break;
+            return Ok(());
+        }
+        trace!("Peer `{}` disconnected", unique_name);
+
+        // Stream is done means the peer disconnected, unless the peer sent a message that gets it
+        // disconnected. Remove it from the list of peers, or from that of the monitors if it became
+        // one meanwhile: that, and the end of its stream, close its connection.
+        {
+            let mut routing = self.routing_mut().await;
+            if routing.peers.remove(&unique_name).is_none() {
+                // The bus cleaned up after the peer as it turned it into a monitor, and the
+                // `Monitoring` interface emits the signals then.
+                routing.monitors.remove(&unique_name);
+                // This task may have forwarded calls that the peer sent after the one that made it
+                // a monitor, which can't get their replies to it either.
+                for peer in routing.peers.values() {
+                    peer.pending_calls().forget(id);
+                }
+
+                return Ok(());
             }
         }
 
-        // Stream is done means the peer disconnected or it became a monitor, unless the peer sent
-        // a message that gets it disconnected. Remove it from the list of peers: that, and the end
-        // of its stream, close its connection.
-        let removed = self
-            .routing_mut()
-            .await
-            .peers
-            .remove(&unique_name)
-            .is_some();
         // The calls that the peer made won't get their replies to it now.
         for peer in self.routing().await.peers.values() {
             peer.pending_calls().forget(id);
         }
-        // Not being in the list means the peer was turned into a monitor. `Monitoring` iface
-        // emits the signals then.
-        if removed {
-            let names_changes = self
-                .routing_mut()
-                .await
-                .name_registry
-                .release_all(unique_name.inner().clone())
-                .await;
-            for changed in names_changes {
-                self.notify_name_changes(changed).await?;
-            }
-            self.notify_name_changes(NameOwnerChanged {
-                name: BusName::from(unique_name.clone()).into(),
-                old_owner: Some(unique_name.clone()),
-                new_owner: None,
-            })
-            .await?;
+        let names_changes = self
+            .routing_mut()
+            .await
+            .name_registry
+            .release_all(unique_name.inner().clone())
+            .await;
+        for changed in names_changes {
+            self.notify_name_changes(changed).await?;
         }
+        self.notify_name_changes(NameOwnerChanged {
+            name: BusName::from(unique_name.clone()).into(),
+            old_owner: Some(unique_name.clone()),
+            new_owner: None,
+        })
+        .await?;
         // Nor will the calls that wait on the peer get its replies, so they get an error from the
         // bus instead, as with dbus-broker, rather than wait for as long as their callers do.
         for (caller, serial) in pending_calls.take() {
@@ -348,6 +352,48 @@ impl Peers {
         }
 
         Ok(())
+    }
+
+    /// Go on with the peer `unique_name`, numbered `id`, whose messages come out of `stream`, now
+    /// that the task that served it was canceled: serve the monitor that it became.
+    async fn serve_on(
+        self: Arc<Self>,
+        stream: MessageStream,
+        unique_name: OwnedUniqueName,
+        id: usize,
+    ) {
+        {
+            let routing = self.routing().await;
+            if !routing.monitors.contains_key(&unique_name) {
+                return;
+            }
+            // This task may have forwarded calls that the peer sent after the one that made it a
+            // monitor, as the bus cleaned up after it, which can't get their replies to it either.
+            for peer in routing.peers.values() {
+                peer.pending_calls().forget(id);
+            }
+        }
+
+        self.serve_monitor(stream, unique_name).await;
+    }
+
+    /// Serve the monitor `unique_name`, whose messages come out of `stream`, until it goes.
+    ///
+    /// A monitor is to send nothing, so it gets disconnected as soon as it sends anything.
+    async fn serve_monitor(
+        self: Arc<Self>,
+        mut stream: MessageStream,
+        unique_name: OwnedUniqueName,
+    ) {
+        if let Some(Ok(_)) = stream.next().await {
+            warn!(
+                "Monitor {} sent a message, which is against the rules.",
+                unique_name
+            );
+        }
+        // Removing the monitor, and the end of its stream, close its connection.
+        self.routing_mut().await.monitors.remove(&unique_name);
+        debug!("Monitor {} disconnected", unique_name);
     }
 
     /// Forward `msgs`, which the peer `sender`, numbered `sender_id`, sent in this order, to their
