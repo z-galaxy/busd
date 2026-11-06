@@ -299,13 +299,20 @@ async fn stall_holds_up_no_one_else_(address: String) -> anyhow::Result<()> {
     ensure!(!flooding.is_finished(), "the flood didn't wait");
 
     // Meanwhile, which takes each lock of the bus to change what it holds: a client connects, asks
-    // for a name and releases it, and gets a signal from another one, and a third one becomes a
-    // monitor.
+    // for a name and releases it, and for the credentials of the stalled client, which a lookup
+    // through the connection of that client would wait for the flood to go on for, and gets a
+    // signal from another one, and a third one becomes a monitor.
+    let stalled_name = BusName::from(stalled.unique_name().context("no unique name")?.clone());
     let runtime = SharedRuntime::current()?;
     runtime
         .timeout(LONG_TIMEOUT / 4, async {
             let newcomer = connect(&address).await?;
             let dbus = DBusProxy::new(&newcomer).await?;
+            let uid = dbus.get_connection_unix_user(stalled_name).await?;
+            ensure!(
+                uid == rustix::process::getuid().as_raw(),
+                "the stalled client's UID is {uid}"
+            );
             let name = WellKnownName::try_from("org.zbus.Others")?;
             dbus.request_name(name.clone(), RequestNameFlags::empty())
                 .await?;
