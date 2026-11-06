@@ -68,41 +68,7 @@ impl Bus {
             .with_context(|| format!("failed to listen on {unix}"))?;
         let address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
 
-        let peers = Peers::new();
-
-        let dbus = DBus::new(peers.clone(), guid.clone());
-        let monitoring = Monitoring::new(peers.clone());
-
-        // Create a peer for ourselves.
-        trace!("Creating self-dial connection.");
-        let (client_socket, peer_socket) = zbus::connection::socket::Channel::pair();
-        let service_conn = connection::Builder::authenticated_socket(client_socket, guid.clone())
-            .p2p()
-            .unique_name(fdo::BUS_NAME)
-            .name(fdo::BUS_NAME)
-            .serve_at(fdo::DBus::PATH, dbus)
-            .serve_at(fdo::Monitoring::PATH, monitoring)
-            .build()
-            .await?;
-        let peer_stream = connection::Builder::authenticated_socket(peer_socket, guid.clone())
-            .p2p()
-            .build_message_stream()
-            .await?;
-
-        peers.add_us(peer_stream, service_conn.clone()).await?;
-        trace!("Self-dial connection created.");
-
-        Ok(Self {
-            listener,
-            inner: Inner {
-                address,
-                peers,
-                guid,
-                next_id: 0,
-                send_timeout: SEND_TIMEOUT,
-                _self_conn: service_conn,
-            },
-        })
+        Self::new(listener, address, guid).await
     }
 
     pub fn address(&self) -> &Address {
@@ -154,6 +120,49 @@ impl Bus {
 
     pub fn guid(&self) -> &OwnedGuid {
         &self.inner.guid
+    }
+
+    /// A bus that listens on `listener`, at `address`.
+    async fn new(
+        listener: zruntime::net::unix::UnixListener<Shared>,
+        address: Address,
+        guid: OwnedGuid,
+    ) -> Result<Self> {
+        let peers = Peers::new();
+
+        let dbus = DBus::new(peers.clone(), guid.clone());
+        let monitoring = Monitoring::new(peers.clone());
+
+        // Create a peer for ourselves.
+        trace!("Creating self-dial connection.");
+        let (client_socket, peer_socket) = zbus::connection::socket::Channel::pair();
+        let service_conn = connection::Builder::authenticated_socket(client_socket, guid.clone())
+            .p2p()
+            .unique_name(fdo::BUS_NAME)
+            .name(fdo::BUS_NAME)
+            .serve_at(fdo::DBus::PATH, dbus)
+            .serve_at(fdo::Monitoring::PATH, monitoring)
+            .build()
+            .await?;
+        let peer_stream = connection::Builder::authenticated_socket(peer_socket, guid.clone())
+            .p2p()
+            .build_message_stream()
+            .await?;
+
+        peers.add_us(peer_stream, service_conn.clone()).await?;
+        trace!("Self-dial connection created.");
+
+        Ok(Self {
+            listener,
+            inner: Inner {
+                address,
+                peers,
+                guid,
+                next_id: 0,
+                send_timeout: SEND_TIMEOUT,
+                _self_conn: service_conn,
+            },
+        })
     }
 
     /// The address to listen on for `unix`, and the socket that clients connect to.
