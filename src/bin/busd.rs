@@ -15,6 +15,7 @@ use busd::{bus, config::Config, error, info, warn};
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::future::{select, Either};
+use rustix::process::{getrlimit, setrlimit, Resource};
 use zruntime::{
     signal::{Signal, Signals},
     SharedRuntime,
@@ -62,19 +63,28 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Before the runtime, or anything else, opens file descriptors of its own.
+    let raised = raise_fd_limit();
     // systemd passes file descriptors through environment variables, which busd removes as it
     // takes them: that may only happen before any other thread starts.
     #[cfg(target_os = "linux")]
     let passed = busd::systemd::take_listen_fds()?;
 
     zruntime::block_on(run(
+        raised,
         #[cfg(target_os = "linux")]
         passed,
     ))
 }
 
-async fn run(#[cfg(target_os = "linux")] passed: Vec<OwnedFd>) -> Result<()> {
+async fn run(
+    raised: rustix::io::Result<()>,
+    #[cfg(target_os = "linux")] passed: Vec<OwnedFd>,
+) -> Result<()> {
     busd::tracing_subscriber::init();
+    if let Err(e) = raised {
+        warn!("Failed to raise the limit of open file descriptors: {e}");
+    }
 
     let args = Args::parse();
     let config = read_config(&args, Path::new(SESSION_CONFIG))?;
@@ -148,6 +158,37 @@ async fn run(#[cfg(target_os = "linux")] passed: Vec<OwnedFd>) -> Result<()> {
     Ok(())
 }
 
+/// Raise the soft limit of the file descriptors that busd may have open to the hard limit, or to
+/// `OPEN_MAX` at most on Apple's platforms, which take no more than that.
+///
+/// busd has a socket open for each of its clients, and on Linux a file descriptor for the process
+/// of each. The soft limit that systemd and most shells set, 1024, or 256 on macOS, would hold that
+/// to a few hundred clients, while the hard one, 524288 under systemd, holds plenty. The runtime of
+/// busd waits on its file descriptors with epoll, kqueue or `poll`, or on Apple's platforms with a
+/// `select` whose sets have no fixed size, so none of them is held to the 1024 that the sets of a
+/// fixed size take.
+fn raise_fd_limit() -> rustix::io::Result<()> {
+    let mut limit = getrlimit(Resource::Nofile);
+    // `None` is no limit.
+    let Some(current) = limit.current else {
+        return Ok(());
+    };
+    #[cfg(target_vendor = "apple")]
+    let maximum = Some(
+        limit
+            .maximum
+            .map_or(OPEN_MAX, |maximum| maximum.min(OPEN_MAX)),
+    );
+    #[cfg(not(target_vendor = "apple"))]
+    let maximum = limit.maximum;
+    if maximum.is_some_and(|maximum| maximum <= current) {
+        return Ok(());
+    }
+    limit.current = maximum;
+
+    setrlimit(Resource::Nofile, limit)
+}
+
 /// The configuration that `args` ask for.
 ///
 /// The session configuration, at `session_config`, only has to exist if `--session` asks for it:
@@ -180,6 +221,10 @@ fn read_config(args: &Args, session_config: &Path) -> Result<Config> {
 
 const SESSION_CONFIG: &str = "/usr/share/dbus-1/session.conf";
 const SYSTEM_CONFIG: &str = "/usr/share/dbus-1/system.conf";
+/// The most file descriptors that a process may have open on Apple's platforms, which refuse a soft
+/// limit above that, as `setrlimit(2)` tells.
+#[cfg(target_vendor = "apple")]
+const OPEN_MAX: u64 = 10240;
 
 #[cfg(test)]
 mod tests {
