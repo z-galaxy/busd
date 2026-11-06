@@ -1552,8 +1552,7 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ddb2961d9587ef9f24ad14cde1c3bc4c5edc9f1525932a8cffdd5bd98886eb9"
+source = "git+https://github.com/z-galaxy/zbus?branch=main#d656c1feaf698296c704792f6670bc3e93a981f9"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -1582,8 +1581,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "6.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "083b38add47c340fc12ec560124fb1d9c23acb584f7021099f85ec6587a03c54"
+source = "git+https://github.com/z-galaxy/zbus?branch=main#d656c1feaf698296c704792f6670bc3e93a981f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1594,8 +1592,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af55e52da295311b368c45bcae221f020e28e97a2420360170ce389218e76ec7"
+source = "git+https://github.com/z-galaxy/zbus?branch=main#d656c1feaf698296c704792f6670bc3e93a981f9"
 dependencies = [
  "proc-macro2",
  "quote",

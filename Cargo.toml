@@ -49,7 +49,7 @@ harness = false
 bench = false
 
 [dependencies]
-zbus = { version = "6.2.1", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus", branch = "main", features = [
     "default-rt",
     "bus-impl",
     "service",
@@ -93,7 +93,7 @@ tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
 [dev-dependencies]
 # The tests drive the bus through proxies, which the binary itself does not need. The benchmarks
 # send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte by byte.
-zbus = { version = "6.0.0", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus", branch = "main", features = [
     "proxy",
     "serde_bytes",
 ], default-features = false }
