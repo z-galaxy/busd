@@ -110,6 +110,56 @@ Since auto-starting of services is not yet implemented, you'll have to start ser
 busctl call --user com.intel.dleyna-renderer /com/intel/dLeynaRenderer com.intel.dLeynaRenderer.Manager GetRenderers
 ```
 
+### Under systemd
+
+On Linux, busd listens on the socket that systemd's [socket activation] passes, if any, rather than
+on one of its own, and tells systemd once it's ready, for a service of `Type=notify`.
+
+With a [file descriptor store], under systemd 254 or later, busd survives its restarts without its
+clients noticing anything but a pause. On `SIGTERM`, rather than disconnect them, it stops taking
+their messages, finishes what it took, such as forwarding those messages and answering the calls to
+it among them, and hands their connections and its state over to systemd: their unique names, the
+well-known names that they own or queue for, their match rules, the calls that wait for their
+replies, and what zbus read of their messages but busd hasn't taken yet, as the start of one that a
+client is in the middle of sending, with the file descriptors that came with it. On a restart,
+systemd hands all of that over to the next instance of busd, which serves the clients on from
+there, on the same connections. On a stop, systemd closes them. A session bus, for example:
+
+```ini
+# ~/.config/systemd/user/busd.socket
+[Socket]
+ListenStream=%t/bus
+
+[Install]
+WantedBy=sockets.target
+```
+
+```ini
+# ~/.config/systemd/user/busd.service
+[Service]
+Type=notify
+ExecStart=/usr/bin/busd --session
+# One for each client, and for each file descriptor that came with the messages of a client that
+# busd didn't take as it stops, and two more. Those that don't fit get disconnected on a restart.
+FileDescriptorStoreMax=4096
+# systemd passes the next instance what was stored under its soft limit of open files, which has to
+# take that and a few more.
+LimitNOFILE=8192:524288
+```
+
+`systemctl --user restart busd` then restarts busd, as after an update, with its clients connected
+throughout. The store only keeps what busd hands over until the next instance takes it, which
+`systemctl restart` starts right away, while `systemctl stop` followed by `systemctl start` doesn't
+keep it. Without socket activation, busd keeps the socket that it listens on in the store too, and
+as it can't tell a stop from a restart, it leaves the file of the socket behind on a stop, which it
+replaces as it starts again. That takes the address of a socket file (`unix:path=`), rather than of
+a directory for busd to make one in (`unix:dir=`, `unix:tmpdir=`), where it makes one of another
+name each time that it starts afresh, and the files that it left behind stay. A new address only
+applies once busd starts afresh, too, after a stop, as a restart keeps the socket that busd listens
+on. Lower `LimitNOFILE=` with a stop and a start as well, rather than a restart: busd fits what it
+hands over under the limit that it started with, and systemd fails to start the next instance if
+that doesn't fit under the lower one.
+
 ### Profile-guided optimization
 
 Those who build busd for others, such as distributions, can optimize it for the traffic of a bus,
@@ -179,6 +229,8 @@ addition of [peer credentials] to every message, which can avoid round trips on 
 
 [specification]: https://dbus.freedesktop.org/doc/dbus-specification.html
 [profile-guided optimization]: https://doc.rust-lang.org/rustc/profile-guided-optimization.html
+[socket activation]: https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html
+[file descriptor store]: https://systemd.io/FILE_DESCRIPTOR_STORE/
 [peer credentials]: https://github.com/z-galaxy/busd/issues/29
 [dbus-broker]: https://github.com/bus1/dbus-broker
 [dbus-daemon]: https://gitlab.freedesktop.org/dbus/dbus
