@@ -1,7 +1,7 @@
 use crate::{debug, info, trace, warn};
 use anyhow::{bail, Context, Ok, Result};
 use std::{
-    env,
+    env, io,
     os::fd::AsFd,
     path::{Path, PathBuf},
     str::FromStr,
@@ -193,8 +193,7 @@ impl Bus {
         addr: std::os::unix::net::SocketAddr,
     ) -> Result<zruntime::net::unix::UnixListener<Shared>> {
         let runtime = SharedRuntime::current()?;
-        let std_listener =
-            zruntime::unblock(move || std::os::unix::net::UnixListener::bind_addr(&addr)).await?;
+        let std_listener = zruntime::unblock(move || bind(&addr)).await?;
 
         zruntime::net::unix::UnixListener::from_std(&runtime, std_listener).map_err(Into::into)
     }
@@ -314,4 +313,167 @@ fn default_address() -> String {
         .unwrap_or_else(env::temp_dir);
 
     format!("unix:dir={}", dir.display())
+}
+
+/// A socket bound to `addr`, in place of a socket file there that no one listens on anymore, as one
+/// that a bus left behind when it was killed.
+///
+/// On Linux, the file goes only if it's a socket that refuses connections. Elsewhere, as on macOS,
+/// a socket also refuses connections while more of them wait for its bus than it takes, so the file
+/// stays. The reference implementation of D-Bus removes any socket file in its way, even one that
+/// another bus still listens on, which this leaves alone.
+fn bind(addr: &std::os::unix::net::SocketAddr) -> io::Result<std::os::unix::net::UnixListener> {
+    let error = match std::os::unix::net::UnixListener::bind_addr(addr) {
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => e,
+        result => return result,
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(path) = addr.as_pathname() {
+        return replace_stale(addr, path, error);
+    }
+
+    Err(error)
+}
+
+/// A socket bound to `addr` in place of the socket file at `path`, the path of `addr`, if no one
+/// listens on that anymore, or else `error`, which binding `addr` failed with.
+#[cfg(target_os = "linux")]
+fn replace_stale(
+    addr: &std::os::unix::net::SocketAddr,
+    path: &Path,
+    error: io::Error,
+) -> io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::{fs::FileTypeExt, net::UnixListener};
+
+    // The file goes as the bus that it's of does, which may be in the meantime.
+    let is_socket = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return UnixListener::bind_addr(addr),
+        Err(e) => return Err(e),
+        io::Result::Ok(metadata) => metadata.file_type().is_socket(),
+    };
+    if !is_socket {
+        return Err(error);
+    }
+    match probe(path)? {
+        Probe::InUse => return Err(error),
+        Probe::Gone => return UnixListener::bind_addr(addr),
+        Probe::Stale => (),
+    }
+    info!(
+        "Replacing the socket file `{}`, which no one listens on.",
+        path.display()
+    );
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => (),
+    }
+
+    UnixListener::bind_addr(addr)
+}
+
+/// What connecting to the socket at `path` tells of it.
+///
+/// The connection doesn't wait: a bus that listens on the socket but doesn't accept the connections
+/// that wait for it, as one that hangs, would have it wait for ever.
+#[cfg(target_os = "linux")]
+fn probe(path: &Path) -> io::Result<Probe> {
+    use rustix::{
+        io::{ioctl_fionbio, Errno},
+        net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType},
+    };
+
+    let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    ioctl_fionbio(&socket, true)?;
+    let addr = SocketAddrUnix::new(path)?;
+
+    io::Result::Ok(match connect(&socket, &addr) {
+        Err(Errno::CONNREFUSED) => Probe::Stale,
+        Err(Errno::NOENT) => Probe::Gone,
+        _ => Probe::InUse,
+    })
+}
+
+/// What connecting to a socket file tells of it.
+#[cfg(target_os = "linux")]
+enum Probe {
+    /// A bus listens on it, or it can't be told whether one does.
+    InUse,
+    /// No one listens on it anymore: it refuses connections.
+    Stale,
+    /// The file went in the meantime.
+    Gone,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{
+        fs,
+        os::unix::net::{SocketAddr, UnixListener, UnixStream},
+    };
+
+    use ntest::timeout;
+    use rand::{
+        distr::{Alphanumeric, SampleString},
+        rng,
+    };
+
+    use super::*;
+
+    /// A socket file that no one listens on gets replaced, but not one that a bus listens on, nor a
+    /// file of another kind.
+    #[test]
+    fn bind_replaces_a_stale_socket_file() {
+        let path = env::temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+        let addr = SocketAddr::from_pathname(&path).unwrap();
+        // A listener that goes leaves its file behind.
+        UnixListener::bind_addr(&addr).unwrap();
+        assert!(path.exists());
+
+        {
+            let _listener = bind(&addr).unwrap();
+            UnixStream::connect(&path).unwrap();
+            let error = bind(&addr).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        }
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"").unwrap();
+        let error = bind(&addr).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(path.is_file());
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// A socket file that a bus listens on stays, and the bus finds so at once, even if the bus
+    /// doesn't accept the connections that wait for it.
+    #[test]
+    #[timeout(10000)]
+    fn bind_leaves_a_busy_socket_file() {
+        use rustix::{
+            io::{ioctl_fionbio, Errno},
+            net::{self, connect, listen, socket, AddressFamily, SocketAddrUnix, SocketType},
+        };
+
+        let path = env::temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+        let unix = SocketAddrUnix::new(&path).unwrap();
+        let listener = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        net::bind(&listener, &unix).unwrap();
+        listen(&listener, 0).unwrap();
+        // The connections wait until the queue of the listener is full.
+        let mut waiting = Vec::new();
+        loop {
+            let client = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+            ioctl_fionbio(&client, true).unwrap();
+            match connect(&client, &unix) {
+                Err(Errno::AGAIN) => break,
+                Err(e) => panic!("Failed to connect: {e}"),
+                _ => waiting.push(client),
+            }
+        }
+
+        let error = bind(&SocketAddr::from_pathname(&path).unwrap()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(path.exists());
+        fs::remove_file(&path).unwrap();
+    }
 }
