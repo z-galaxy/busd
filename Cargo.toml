@@ -53,6 +53,7 @@ zbus = { git = "https://github.com/z-galaxy/zbus", branch = "main", features = [
     "default-rt",
     "bus-impl",
     "service",
+    "handover",
 ], default-features = false }
 clap = { version = "4.5.4", features = [
     "derive",

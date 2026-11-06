@@ -58,7 +58,9 @@ impl Monitoring {
         // Otherwise, some clients (e.g `busctl monitor`) can get confused.
         let (response, listener) = ResponseDispatchNotifier::new(());
         let ctxt = ctxt.to_owned();
+        let chore = peers.chore();
         spawn(async move {
+            let _chore = chore;
             listener.await;
 
             let names_changes = peers

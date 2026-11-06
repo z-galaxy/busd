@@ -105,7 +105,7 @@ impl Charge {
     /// So, once charged, `actor` has at most 1/(n + 1) of the objects of `user` that no other user
     /// has: those left and its own.
     pub fn new(user: &Arc<User>, actor: &User) -> Option<Self> {
-        let mut objects = user.objects();
+        let objects = user.objects();
         let left = objects.max.saturating_sub(objects.used);
         let share = objects.shares.get(&actor.uid).copied().unwrap_or(0);
         let allowed = if actor.uid == user.uid {
@@ -119,14 +119,31 @@ impl Charge {
         if !allowed {
             return None;
         }
+
+        Some(Self::kept(user, actor, objects))
+    }
+
+    /// Charge an object to `user`, on behalf of `actor`, that another instance of the bus handed
+    /// over, whatever the objects of `user` that `actor` has already.
+    ///
+    /// That instance kept all of the objects that it hands over at once, but it charged them in
+    /// another order, and with others that went meanwhile, which the share that [`Charge::new`]
+    /// allows `actor` depends on.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn taken_over(user: &Arc<User>, actor: &User) -> Self {
+        Self::kept(user, actor, user.objects())
+    }
+
+    /// Charge an object to `user`, on behalf of `actor`, in `objects`, the account of `user`.
+    fn kept(user: &Arc<User>, actor: &User, mut objects: MutexGuard<'_, Objects>) -> Self {
         objects.used += 1;
         *objects.shares.entry(actor.uid).or_default() += 1;
         drop(objects);
 
-        Some(Self {
+        Self {
             user: user.clone(),
             actor: actor.uid,
-        })
+        }
     }
 }
 
@@ -235,6 +252,26 @@ mod tests {
         // With 2 objects left, the first object of another user needs `(0 + 1) * (2 + 1) - 0` of
         // them, as the other one counts itself in with the user.
         assert!(Charge::new(&user, &other).is_none());
+        assert!(!user.objects().shares.contains_key(&2));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn taken_over_whatever_the_share() {
+        let users = Users::new(3);
+        let user = users.user(1);
+        let other = users.user(2);
+        let _own = Charge::new(&user, &user).unwrap();
+        assert!(Charge::new(&user, &other).is_none());
+
+        // An object that another instance of the bus handed over counts, as any other, beyond the
+        // share of `other`.
+        {
+            let _taken_over = Charge::taken_over(&user, &other);
+            assert_eq!(user.objects().used, 2);
+            assert_eq!(user.objects().shares.get(&2), Some(&1));
+        }
+        assert_eq!(user.objects().used, 1);
         assert!(!user.objects().shares.contains_key(&2));
     }
 

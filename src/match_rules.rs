@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zbus::{names::BusName, OwnedMatchRule, Type};
 
 use crate::name_registry::NameRegistry;
 
 /// A collection of match rules.
-#[derive(Debug, Default, Deserialize, Type)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Type)]
 pub struct MatchRules(HashSet<OwnedMatchRule>);
 
 impl MatchRules {

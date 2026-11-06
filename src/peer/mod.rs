@@ -16,7 +16,11 @@ use zbus::{
     names::{BusName, OwnedUniqueName},
     Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
+#[cfg(target_os = "linux")]
+use {anyhow::Context, std::time::Instant};
 
+#[cfg(target_os = "linux")]
+use crate::user::Users;
 use crate::{
     fdo,
     match_rules::MatchRules,
@@ -40,7 +44,13 @@ pub struct Peer {
     /// bus itself. A monitor that the peer becomes takes it over.
     charge: Option<Charge>,
     greeted: bool,
+    /// Notified as the peer goes, and as the bus pauses to hand over, for the task that serves the
+    /// peer to see why.
     canceled_event: Event,
+    /// The stream of the messages of the peer, once the task that served the peer gave it back, as
+    /// the bus pauses to hand over.
+    #[cfg(target_os = "linux")]
+    paused: Option<MessageStream>,
 }
 
 impl Peer {
@@ -87,6 +97,8 @@ impl Peer {
             pending_calls: Arc::new(PendingCalls::new(user)),
             greeted: false,
             canceled_event: Event::new(),
+            #[cfg(target_os = "linux")]
+            paused: None,
         };
         let stream = Stream::for_peer(&peer, msg_stream);
         Ok((peer, stream))
@@ -112,9 +124,11 @@ impl Peer {
             charge: None,
             unique_name,
             match_rules: MatchRules::default(),
-            pending_calls: Arc::new(PendingCalls::new(user)),
+            pending_calls: Arc::new(PendingCalls::of_bus()),
             greeted: true,
             canceled_event: Event::new(),
+            #[cfg(target_os = "linux")]
+            paused: None,
         };
         let stream = Stream::for_peer(&peer, msg_stream);
         Ok((peer, stream))
@@ -147,6 +161,15 @@ impl Peer {
     /// The peer, as the caller of the calls that wait for replies.
     pub fn caller(&self) -> &Arc<Caller> {
         &self.caller
+    }
+
+    /// Whether the peer called `Hello`.
+    pub fn greeted(&self) -> bool {
+        self.greeted
+    }
+
+    pub fn match_rules(&self) -> &MatchRules {
+        &self.match_rules
     }
 
     pub fn listen_cancellation(&self) -> EventListener {
@@ -195,12 +218,105 @@ impl Peer {
     pub fn become_monitor(self, match_rules: MatchRules) -> Monitor {
         Monitor::new(self, match_rules)
     }
+
+    /// The peer that another instance of the bus handed over, `client`.
+    ///
+    /// The peer is an object of its user among `users`, as it was in the instance that handed it
+    /// over, whatever the quota of the user. It fails if its credentials can't be looked up, which
+    /// tell its user.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn handed_over(
+        client: HandedOver,
+        send_timeout: Duration,
+        users: &Users,
+    ) -> Result<(Self, Stream)> {
+        let HandedOver {
+            id,
+            handover,
+            greeted,
+            match_rules,
+        } = client;
+        debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
+        let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
+        // The client authenticated with the instance of the bus that handed it over, and the
+        // connection goes on from where that instance left it: with the messages that zbus read of
+        // the client and that the bus didn't take, and the part of the one that the client was in
+        // the middle of sending, if any, before what the socket holds.
+        let msg_stream = connection::Builder::take_over(handover)
+            .validate_bodies()
+            .build_message_stream()
+            .await?;
+        let conn = Connection::from(&msg_stream);
+        trace!("handed over: {:?}", conn);
+        // No handshake looked the credentials of the client up, as for a new client, so they are
+        // looked up now, before anything is sent to the client, which a lookup would wait for.
+        // zbus keeps them. They tell the user of the client too.
+        let uid = conn
+            .peer_creds()
+            .await?
+            .unix_user_id()
+            .context("The client has no user")?;
+        let user = users.user(uid);
+
+        let peer = Self {
+            recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
+            conn,
+            id,
+            caller: Caller::new(unique_name.clone(), user.clone()),
+            charge: Some(Charge::taken_over(&user, &user)),
+            unique_name,
+            match_rules,
+            pending_calls: Arc::new(PendingCalls::new(user)),
+            greeted,
+            canceled_event: Event::new(),
+            paused: None,
+        };
+        let stream = Stream::for_peer(&peer, msg_stream);
+        Ok((peer, stream))
+    }
+
+    /// Whether the peer is the bus itself.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_bus(&self) -> bool {
+        self.id == BUS_ID
+    }
+
+    /// Pause the peer, as the bus hands over from `since`: have the task that serves the peer give
+    /// the stream of its messages back, once it is done with those that it took, and give the peer
+    /// as long as it has to take a message, from `since` on, to take all that the bus sends it from
+    /// then on.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pause(&self, since: Instant) {
+        self.recipient.hand_over_from(since);
+        self.canceled_event.notify(usize::MAX);
+    }
+
+    /// The stream of the messages of the peer, if the task that served the peer gave it back, as
+    /// the bus pauses to hand over.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn paused(&mut self) -> &mut Option<MessageStream> {
+        &mut self.paused
+    }
 }
 
 impl Drop for Peer {
     fn drop(&mut self) {
         self.canceled_event.notify(usize::MAX);
     }
+}
+
+/// A client that another instance of the bus handed over, as [`Peer::handed_over`] takes it.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct HandedOver {
+    /// The number of the client.
+    pub(crate) id: usize,
+    /// The connection of the client, as the instance of the bus that handed it over left it.
+    pub(crate) handover: connection::Handover,
+    /// Whether the client called `Hello`.
+    pub(crate) greeted: bool,
+    /// The match rules that the client added.
+    pub(crate) match_rules: MatchRules,
 }
 
 /// The number of the bus, as a peer of its own.

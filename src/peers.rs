@@ -4,6 +4,8 @@ use futures_util::{
     future::{join_all, select, Either},
     stream::StreamExt,
 };
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap},
     future::poll_fn,
@@ -18,7 +20,10 @@ use zbus::{
     names::{BusName, OwnedUniqueName, UniqueName},
     Connection, Message, MessageStream, Optional, OwnedGuid,
 };
-use zruntime::{lock::RwLock, spawn, EventListener};
+use zruntime::{lock::RwLock, spawn, Event, EventListener};
+
+#[cfg(target_os = "linux")]
+mod handover;
 
 use crate::{
     fdo,
@@ -48,6 +53,13 @@ pub struct Peers {
     bus_conn: Mutex<Option<Connection>>,
     /// The users of the peers, and of the bus itself.
     users: Users,
+    /// What the bus does on its own, besides forwarding the messages of its peers.
+    chores: Mutex<Chores>,
+    /// Notified on each change of `chores`.
+    chores_changed: Event,
+    /// Notified once the bus takes no more clients, as it is done pausing: see [`Peers::add`].
+    #[cfg(target_os = "linux")]
+    sealed: Event,
 }
 
 impl Peers {
@@ -56,6 +68,10 @@ impl Peers {
             routing: RwLock::new(Routing::default()),
             bus_conn: Mutex::new(None),
             users: Users::new(MAX_OBJECTS),
+            chores: Mutex::new(Chores::default()),
+            chores_changed: Event::new(),
+            #[cfg(target_os = "linux")]
+            sealed: Event::new(),
         })
     }
 
@@ -68,6 +84,10 @@ impl Peers {
     ///
     /// The client is an object of its user from the start, as with dbus-broker, so the bus refuses
     /// a client beyond the quota of its user before the client authenticates.
+    ///
+    /// A client whose handshake is still under way once the bus is done pausing, as it hands over,
+    /// gets disconnected then, before it has a name: the bus hands over the clients that it paused,
+    /// and only those.
     pub async fn add(
         self: &Arc<Self>,
         guid: &OwnedGuid,
@@ -79,13 +99,36 @@ impl Peers {
         let user = self.users.user(uid);
         let charge = Charge::new(&user, &user)
             .ok_or_else(|| anyhow!("the bus keeps as many objects for the user {uid} as it may"))?;
+        let _connecting = Connecting::new(self);
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
-        let (peer, peer_stream) =
-            Peer::new(guid.clone(), id, builder, send_timeout, user, charge).await?;
+        let handshake = Peer::new(guid.clone(), id, builder, send_timeout, user, charge);
+        // Dropping the handshake closes the connection, and lets go of the charge.
+        #[cfg(target_os = "linux")]
+        let Some(handshake) = self.unless_sealed(handshake).await
+        else {
+            debug!("Disconnecting a client in the middle of its handshake, as the bus hands over");
 
-        self.insert(&mut *self.routing_mut().await, peer, peer_stream);
+            return Ok(());
+        };
+        #[cfg(not(target_os = "linux"))]
+        let handshake = handshake.await;
+        let (peer, peer_stream) = handshake?;
+
+        let mut routing = self.routing_mut().await;
+        // The bus takes no more clients once it is done pausing, as it hands over. Dropping this
+        // one closes its connection.
+        #[cfg(target_os = "linux")]
+        if routing.sealed {
+            debug!(
+                "Disconnecting `{}`, as its handshake ended too late for it to be handed over",
+                peer.unique_name()
+            );
+
+            return Ok(());
+        }
+        self.insert(&mut routing, peer, peer_stream);
 
         Ok(())
     }
@@ -201,12 +244,37 @@ impl Peers {
         Ok(())
     }
 
+    /// Note a chore of the bus, under way until the returned guard goes.
+    ///
+    /// A chore is work that the bus does on its own, besides forwarding the messages of its peers,
+    /// and that sends messages, such as the signals that it sends once it answered a call, or its
+    /// clean-up after a peer that goes. A hand-over waits for them.
+    pub(crate) fn chore(self: &Arc<Self>) -> Chore {
+        let mut chores = self.chores();
+        chores.running += 1;
+        chores.started += 1;
+
+        Chore(self.clone())
+    }
+
     /// Serve `peer`, whose messages come out of `peer_stream`, and add it to the peers of
     /// `routing`.
+    ///
+    /// A peer added while the bus pauses to hand over pauses right away: the bus takes none of its
+    /// messages.
     fn insert(self: &Arc<Self>, routing: &mut Routing, peer: Peer, peer_stream: Stream) {
         let unique_name = peer.unique_name().clone();
         if routing.peers.contains_key(&unique_name) {
             panic!("Unique name `{unique_name}` re-used. We're in deep trouble if this happens");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(since) = routing.handing_over {
+            let mut peer = peer;
+            peer.pause(since);
+            *peer.paused() = Some(peer_stream.into_inner());
+            routing.peers.insert(unique_name, peer);
+
+            return;
         }
         let served = Served::new(&peer);
         spawn(
@@ -231,9 +299,12 @@ impl Peers {
             pending_calls,
             caller,
         } = peer;
+        #[cfg(target_os = "linux")]
+        let from_bus = *unique_name == fdo::BUS_NAME;
         let mut batch = Vec::new();
         let mut outbox = Outbox::default();
-        // Whether the peer became a monitor, rather than the peer went.
+        // Whether the peer became a monitor, or the bus pauses to hand over, rather than the peer
+        // went.
         let canceled = loop {
             let msg = match select(cancellation_listener, peer_stream.next()).await {
                 Either::Left(_) => break true,
@@ -276,6 +347,14 @@ impl Peers {
                 }
             }
 
+            // The replies to the barriers of a hand-over come back to the bus itself, which they
+            // end the wait of once the messages of the bus before them are on their way too.
+            #[cfg(target_os = "linux")]
+            let barrier = if from_bus {
+                handover::take_barriers(&mut batch)
+            } else {
+                None
+            };
             self.forward(
                 &unique_name,
                 id,
@@ -286,6 +365,10 @@ impl Peers {
             )
             .await?;
             batch.clear();
+            #[cfg(target_os = "linux")]
+            if let Some(serial) = barrier {
+                self.barrier_returned(serial);
+            }
             if too_many_fds {
                 warn!(
                     "Disconnecting `{unique_name}`, as it sent a message with more than \
@@ -306,6 +389,8 @@ impl Peers {
         }
         trace!("Peer `{}` disconnected", unique_name);
 
+        // The bus sends what follows on its own, which a hand-over has to wait for.
+        let _chore = self.chore();
         // Stream is done means the peer disconnected, unless the peer sent a message that gets it
         // disconnected. Remove it from the list of peers, or from that of the monitors if it became
         // one meanwhile: that, and the end of its stream, close its connection.
@@ -325,6 +410,104 @@ impl Peers {
             }
         }
 
+        self.clean_up(&unique_name, id, pending_calls.take().collect())
+            .await
+    }
+
+    /// Go on with the peer `unique_name`, numbered `id`, whose messages come out of `stream`, now
+    /// that the task that served it was canceled: serve the monitor that it became, unless the bus
+    /// pauses to hand over, which takes the stream back.
+    async fn serve_on(
+        self: Arc<Self>,
+        stream: MessageStream,
+        unique_name: OwnedUniqueName,
+        id: usize,
+    ) {
+        let Some((stream, listener)) = self.monitor_to_serve(stream, &unique_name, id).await else {
+            return;
+        };
+
+        self.serve_monitor(stream, listener, unique_name).await;
+    }
+
+    /// What the task that served the peer `unique_name`, numbered `id`, whose messages come out of
+    /// `stream`, serves the monitor that the peer became with: `stream`, and the listener of the
+    /// cancellation of the task, taken under the lock that a pause takes, so that the task hears of
+    /// any pause that it missed. Nothing if the peer is gone, or if the bus pauses to hand over,
+    /// which takes `stream` back, as it does if the peer is still one.
+    async fn monitor_to_serve(
+        &self,
+        stream: MessageStream,
+        unique_name: &OwnedUniqueName,
+        id: usize,
+    ) -> Option<(MessageStream, EventListener)> {
+        let mut guard = self.routing_mut().await;
+        let routing = &mut *guard;
+        #[cfg(target_os = "linux")]
+        if let Some(peer) = routing.peers.get_mut(unique_name) {
+            *peer.paused() = Some(stream);
+
+            return None;
+        }
+        let monitor = routing.monitors.get_mut(unique_name)?;
+        // This task may have forwarded calls that the peer sent after the one that made it a
+        // monitor, as the bus cleaned up after it, which can't get their replies to it either.
+        for peer in routing.peers.values() {
+            peer.pending_calls().forget(id);
+        }
+        #[cfg(target_os = "linux")]
+        if routing.handing_over.is_some() {
+            *monitor.paused() = Some(stream);
+
+            return None;
+        }
+
+        Some((stream, monitor.listen_cancellation()))
+    }
+
+    /// Serve the monitor `unique_name`, whose messages come out of `stream`, until it goes, or
+    /// until the bus pauses to hand over, which `cancellation_listener` tells.
+    ///
+    /// A monitor is to send nothing, so it gets disconnected as soon as it sends anything.
+    async fn serve_monitor(
+        self: Arc<Self>,
+        mut stream: MessageStream,
+        cancellation_listener: EventListener,
+        unique_name: OwnedUniqueName,
+    ) {
+        let msg = match select(cancellation_listener, stream.next()).await {
+            Either::Left(_) => None,
+            Either::Right((msg, _)) => Some(msg),
+        };
+        let Some(msg) = msg else {
+            // The bus pauses to hand over, which takes the stream back, unless it let go of the
+            // monitor.
+            #[cfg(target_os = "linux")]
+            if let Some(monitor) = self.routing_mut().await.monitors.get_mut(&unique_name) {
+                *monitor.paused() = Some(stream);
+            }
+
+            return;
+        };
+        if let Some(Ok(_)) = msg {
+            warn!(
+                "Monitor {} sent a message, which is against the rules.",
+                unique_name
+            );
+        }
+        // Removing the monitor, and the end of its stream, close its connection.
+        self.routing_mut().await.monitors.remove(&unique_name);
+        debug!("Monitor {} disconnected", unique_name);
+    }
+
+    /// Clean up after the peer `unique_name`, numbered `id`, which went, and whose calls that
+    /// waited for its replies were those of `waiting`: the caller and the serial of each.
+    async fn clean_up(
+        &self,
+        unique_name: &OwnedUniqueName,
+        id: usize,
+        waiting: Vec<(OwnedUniqueName, NonZeroU32)>,
+    ) -> Result<()> {
         // The calls that the peer made won't get their replies to it now.
         for peer in self.routing().await.peers.values() {
             peer.pending_calls().forget(id);
@@ -335,6 +518,20 @@ impl Peers {
             .name_registry
             .release_all(unique_name.inner().clone())
             .await;
+
+        self.finish_clean_up(unique_name, names_changes, waiting)
+            .await
+    }
+
+    /// Finish cleaning up after the peer `unique_name`, which went, and whose names changed owners
+    /// with `names_changes`, as they were released: signal the changes, and answer the calls that
+    /// waited for its replies, `waiting`, with errors.
+    async fn finish_clean_up(
+        &self,
+        unique_name: &OwnedUniqueName,
+        names_changes: Vec<NameOwnerChanged>,
+        waiting: Vec<(OwnedUniqueName, NonZeroU32)>,
+    ) -> Result<()> {
         for changed in names_changes {
             self.notify_name_changes(changed).await?;
         }
@@ -346,54 +543,12 @@ impl Peers {
         .await?;
         // Nor will the calls that wait on the peer get its replies, so they get an error from the
         // bus instead, as with dbus-broker, rather than wait for as long as their callers do.
-        for (caller, serial) in pending_calls.take() {
+        for (caller, serial) in waiting {
             let error = no_reply(&caller, serial)?;
             self.send_from_bus(&error).await;
         }
 
         Ok(())
-    }
-
-    /// Go on with the peer `unique_name`, numbered `id`, whose messages come out of `stream`, now
-    /// that the task that served it was canceled: serve the monitor that it became.
-    async fn serve_on(
-        self: Arc<Self>,
-        stream: MessageStream,
-        unique_name: OwnedUniqueName,
-        id: usize,
-    ) {
-        {
-            let routing = self.routing().await;
-            if !routing.monitors.contains_key(&unique_name) {
-                return;
-            }
-            // This task may have forwarded calls that the peer sent after the one that made it a
-            // monitor, as the bus cleaned up after it, which can't get their replies to it either.
-            for peer in routing.peers.values() {
-                peer.pending_calls().forget(id);
-            }
-        }
-
-        self.serve_monitor(stream, unique_name).await;
-    }
-
-    /// Serve the monitor `unique_name`, whose messages come out of `stream`, until it goes.
-    ///
-    /// A monitor is to send nothing, so it gets disconnected as soon as it sends anything.
-    async fn serve_monitor(
-        self: Arc<Self>,
-        mut stream: MessageStream,
-        unique_name: OwnedUniqueName,
-    ) {
-        if let Some(Ok(_)) = stream.next().await {
-            warn!(
-                "Monitor {} sent a message, which is against the rules.",
-                unique_name
-            );
-        }
-        // Removing the monitor, and the end of its stream, close its connection.
-        self.routing_mut().await.monitors.remove(&unique_name);
-        debug!("Monitor {} disconnected", unique_name);
     }
 
     /// Forward `msgs`, which the peer `sender`, numbered `sender_id`, sent in this order, to their
@@ -408,8 +563,9 @@ impl Peers {
     /// of its caller has as many of the objects of the user of the callee as it may, in which case
     /// the bus refuses it, with an error, as dbus-broker does. A reply, or an error, of `sender`
     /// only goes on to its destination if it answers one of the calls that wait on `sender`,
-    /// `pending_calls`. The bus answers each call to it itself, so those aren't recorded, and its
-    /// own replies go on as they are.
+    /// `pending_calls`. The calls to the bus are recorded too, so that a hand-over can wait for the
+    /// bus to answer them, but the bus never refuses them, nor counts them against any user, and
+    /// its own replies go on whatever they answer.
     ///
     /// A call to a name that no peer has gets an error from the bus, as with dbus-broker, unless
     /// it expects no reply, and so does one with file descriptors to a callee that didn't negotiate
@@ -436,6 +592,7 @@ impl Peers {
                 peers,
                 monitors,
                 name_registry,
+                ..
             } = &*routing;
             for (i, msg) in msgs.iter().enumerate() {
                 if msg.message_type() == message::Type::Signal {
@@ -466,14 +623,17 @@ impl Peers {
                             .and_then(|owner| peers.get_key_value(owner.as_str())),
                     };
                     let msg_type = msg.message_type();
-                    let answers_none = !from_bus
-                        && matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
-                        && match (peer, header.reply_serial()) {
-                            (Some((_, peer)), Some(serial)) => {
-                                !pending_calls.remove(peer.id(), serial)
+                    // A reply takes the record of the call that it answers away. One of the bus,
+                    // which records the calls to it too, goes on whatever it answers.
+                    let answers_none =
+                        matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
+                            && !match (peer, header.reply_serial()) {
+                                (Some((_, peer)), Some(serial)) => {
+                                    pending_calls.remove(peer.id(), serial)
+                                }
+                                _ => false,
                             }
-                            _ => true,
-                        };
+                            && !from_bus;
                     let primary = msg.primary_header();
                     let flags = primary.flags();
                     let expects_reply = msg_type == message::Type::MethodCall
@@ -483,7 +643,7 @@ impl Peers {
                             debug!("{msg:?} answers no call that waits on {sender}")
                         }
                         Some((name, peer)) => {
-                            let refusal = if expects_reply && *name != fdo::BUS_NAME {
+                            let refusal = if expects_reply {
                                 peer.pending_calls()
                                     .add(sender_id, caller, primary.serial_num())
                                     .err()
@@ -491,10 +651,10 @@ impl Peers {
                                 None
                             };
                             match refusal {
-                                Some(refusal) => {
+                                Some(refusal) if *name != fdo::BUS_NAME => {
                                     rejected.push((msg.clone(), Rejection::from(refusal)))
                                 }
-                                None => outbox.add(msgs, peer.id(), peer.recipient(), i),
+                                _ => outbox.add(msgs, peer.id(), peer.recipient(), i),
                             }
                         }
                         None => {
@@ -568,6 +728,11 @@ impl Peers {
         Ok(())
     }
 
+    fn chores(&self) -> MutexGuard<'_, Chores> {
+        // Nothing can panic while the lock is held.
+        self.chores.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Send `msg` on the connection of the bus, as the bus, unless the bus is going.
     async fn send_from_bus(&self, msg: &Message) {
         let Some(bus) = self.bus_conn().clone() else {
@@ -600,6 +765,25 @@ pub struct Routing {
     pub name_registry: NameRegistry,
     /// The monitors, by their unique names.
     monitors: BTreeMap<OwnedUniqueName, Monitor>,
+    /// Since when the bus is handing over to its next instance, if it is, so that it takes none of
+    /// the messages of the clients that connect.
+    #[cfg(target_os = "linux")]
+    handing_over: Option<Instant>,
+    /// Whether the bus takes no more clients, as it is done pausing those that it hands over: see
+    /// [`Peers::add`].
+    #[cfg(target_os = "linux")]
+    sealed: bool,
+}
+
+/// A chore of the bus, under way until this goes: see [`Peers::chore`].
+#[derive(Debug)]
+pub(crate) struct Chore(Arc<Peers>);
+
+impl Drop for Chore {
+    fn drop(&mut self) {
+        self.0.chores().running -= 1;
+        self.0.chores_changed.notify(usize::MAX);
+    }
 }
 
 /// What the task that serves a peer keeps of the peer: see [`Peers::serve_peer`].
@@ -623,6 +807,42 @@ impl Served {
             caller: peer.caller().clone(),
         }
     }
+}
+
+/// A client whose connection the bus is setting up, until this goes.
+struct Connecting<'p>(&'p Peers);
+
+impl<'p> Connecting<'p> {
+    fn new(peers: &'p Peers) -> Self {
+        peers.chores().connecting += 1;
+
+        Self(peers)
+    }
+}
+
+impl Drop for Connecting<'_> {
+    fn drop(&mut self) {
+        self.0.chores().connecting -= 1;
+        self.0.chores_changed.notify(usize::MAX);
+    }
+}
+
+/// What the bus does on its own, besides forwarding the messages of its peers.
+#[derive(Debug, Default)]
+struct Chores {
+    /// How many chores are under way.
+    running: usize,
+    /// How many chores have started, ever, so that a wait for the bus to settle can tell whether
+    /// one started meanwhile.
+    started: u64,
+    /// How many clients the bus is setting the connections of up: their handshakes are under way.
+    connecting: usize,
+    /// The serial of the last barrier that the bus made, and of the last one whose reply came
+    /// back.
+    #[cfg(target_os = "linux")]
+    barriers_sent: u32,
+    #[cfg(target_os = "linux")]
+    barrier: u32,
 }
 
 /// The `NoReply` error, from the bus, to the call of `caller` with `serial`, as dbus-broker sends

@@ -63,7 +63,8 @@ impl DBus {
 // The bus answers the calls one at a time, in the order that they come in, rather than in a task of
 // its own for each, as the reference implementation of D-Bus and dbus-broker do: the calls that a
 // client makes one after the other get their replies, and have the bus send their signals, in that
-// order.
+// order. On Linux, a call of the bus to itself, as a barrier, so comes back once the bus is done
+// with the calls before it: see `Peers::settle`.
 //
 // So a method must never wait for anything that waits for the bus to take the calls after the one
 // that it answers, or the bus waits for ever. The calls on their way to the bus wait for it to take
@@ -98,7 +99,9 @@ impl DBus {
         let unique_name = peer.unique_name().clone();
         let (response, listener) = ResponseDispatchNotifier::new(unique_name.clone());
         let ctxt = emitter.to_owned();
+        let chore = peers.chore();
         spawn(async move {
+            let _chore = chore;
             listener.await;
             let owner = UniqueName::from(unique_name);
 
@@ -235,7 +238,8 @@ impl DBus {
         // Not under the lock of the routing, as zbus looks the credentials up through the
         // connection of the peer unless it knows them already, which waits for any send to the peer
         // that is under way. It knows those of each client, which it looks up as the client
-        // connects, and those of the bus itself, which the bus looks up before it serves anyone.
+        // connects, or as the bus takes the client over, and those of the bus itself, which the bus
+        // looks up before it serves anyone.
         let conn = self
             .peers()?
             .routing()

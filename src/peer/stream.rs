@@ -30,8 +30,8 @@ impl Stream {
     }
 
     /// The stream of the messages of the connection of the peer, which this takes them from: the
-    /// one that has had all of them, from the first, as the monitor that the peer becomes takes
-    /// it.
+    /// one that has had all of them, from the first, as the monitor that the peer becomes, and a
+    /// hand-over of the connection, take it.
     pub fn into_inner(self) -> MessageStream {
         self.msg_stream
     }
