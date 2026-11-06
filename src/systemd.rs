@@ -1,20 +1,33 @@
-//! The protocol of systemd that lets a service take its sockets from it.
+//! The protocols of systemd that let a service take its sockets from it, and tell it how it's
+//! doing.
 //!
 //! A service that systemd starts gets the sockets of the socket units that activate it:
-//! [`take_listen_fds`] takes those. This is the protocol of [`sd_listen_fds(3)`], with nothing of
-//! the bus in it.
+//! [`take_listen_fds`] takes those. A service tells the manager that it's ready, among other
+//! things, with [`Notifier::notify`].
+//!
+//! These are the protocols of [`sd_listen_fds(3)`] and [`sd_notify(3)`], with nothing of the bus in
+//! them. The manager only takes notifications from the processes that the `NotifyAccess=` of the
+//! unit allows: the main process, unless the unit says otherwise.
 //!
 //! [`sd_listen_fds(3)`]: https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html
+//! [`sd_notify(3)`]: https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html
 
 use std::{
     env::{self, VarError},
+    ffi::OsStr,
     io::{self, ErrorKind},
-    os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
+    os::{
+        fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
     process,
     str::FromStr,
 };
 
-use rustix::io::{fcntl_setfd, FdFlags};
+use rustix::{
+    io::{fcntl_setfd, FdFlags},
+    net::{sendto, socket_with, AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType},
+};
 
 /// The file descriptors that systemd passed to this process.
 ///
@@ -50,6 +63,87 @@ pub fn take_listen_fds() -> io::Result<Vec<OwnedFd>> {
     };
 
     take_fds(count)
+}
+
+/// The notification socket of the service manager, `$NOTIFY_SOCKET`.
+///
+/// A service sends it its state, such as `READY=1`. The manager takes the messages one at a time,
+/// in the order they came, and ties each to a service by the process that sent it, so they have to
+/// come from a process that the `NotifyAccess=` of the service lets.
+///
+/// A send blocks while the queue of the socket of the manager is full, which only happens if the
+/// manager is far behind, but it doesn't wait for the manager to read the message. The manager
+/// says nothing back.
+#[derive(Debug)]
+pub struct Notifier {
+    socket: OwnedFd,
+    address: SocketAddrUnix,
+}
+
+impl Notifier {
+    /// The one that `$NOTIFY_SOCKET` names, if it's set and not empty.
+    ///
+    /// Systemd sets it for the services that take notifications, so `None` means that this isn't
+    /// one, or isn't a service of systemd at all. It leaves the variable in the environment.
+    pub fn from_env() -> io::Result<Option<Self>> {
+        match env::var_os("NOTIFY_SOCKET") {
+            Some(address) if !address.is_empty() => Self::new(address).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The one at `address`, in the form of `$NOTIFY_SOCKET`.
+    ///
+    /// That is the path of a socket if `address` starts with a `/`, and the name of an abstract
+    /// socket after an `@` if it starts with that. A `/` or an `@` alone names nothing, which
+    /// fails with [`ErrorKind::InvalidInput`]. Systemd also has `vsock:` addresses, by which a
+    /// virtual machine tells its host that it has booted: they fail with
+    /// [`ErrorKind::Unsupported`], as does anything else that is neither of the two.
+    pub fn new(address: impl AsRef<OsStr>) -> io::Result<Self> {
+        let address = match address.as_ref().as_bytes() {
+            [b'/' | b'@'] => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "the notification socket has no name",
+                ))
+            }
+            path @ [b'/', ..] => SocketAddrUnix::new(path)?,
+            [b'@', name @ ..] => SocketAddrUnix::new_abstract_name(name)?,
+            other => {
+                return Err(io::Error::new(
+                    ErrorKind::Unsupported,
+                    format!(
+                        "the notification socket `{}` is neither a path nor an abstract name",
+                        String::from_utf8_lossy(other),
+                    ),
+                ))
+            }
+        };
+        let socket = socket_with(
+            AddressFamily::UNIX,
+            SocketType::DGRAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )?;
+
+        Ok(Self { socket, address })
+    }
+
+    /// Send `state`.
+    ///
+    /// `state` is a list of assignments such as `READY=1`, each on a line of its own. The manager
+    /// takes a message of 4096 bytes at most, and ignores a longer one, as well as one that it
+    /// can't make sense of, so this only fails if the message can't be sent.
+    pub fn notify(&self, state: &str) -> io::Result<()> {
+        sendto(
+            &self.socket,
+            state.as_bytes(),
+            SendFlags::NOSIGNAL,
+            &self.address,
+        )?;
+
+        Ok(())
+    }
 }
 
 /// The value of the environment variable `name`, if it is set.
@@ -131,9 +225,28 @@ const START: RawFd = 3;
 
 #[cfg(test)]
 mod tests {
-    use std::{os::fd::AsRawFd, path::Path, process::Command};
+    use std::{
+        env::temp_dir,
+        fs::remove_file,
+        io::IoSliceMut,
+        os::fd::AsRawFd,
+        path::{Path, PathBuf},
+        process::Command,
+        time::Duration,
+    };
 
-    use rustix::io::{fcntl_getfd, Errno};
+    use rand::{
+        distr::{Alphanumeric, SampleString},
+        rng,
+    };
+    use rustix::{
+        io::{fcntl_getfd, Errno},
+        net::{
+            bind, recvmsg,
+            sockopt::{set_socket_timeout, Timeout},
+            RecvAncillaryBuffer, RecvFlags, ReturnFlags,
+        },
+    };
 
     use super::*;
 
@@ -183,6 +296,83 @@ mod tests {
     }
 
     #[test]
+    fn notify() {
+        for (manager, notifier) in managers() {
+            notifier.notify("READY=1\nSTATUS=Up").unwrap();
+
+            let state = manager.receive();
+            assert_eq!(state, "READY=1\nSTATUS=Up");
+        }
+    }
+
+    #[test]
+    fn notify_without_a_manager() {
+        let notifier = Notifier::new(unique_path()).unwrap();
+
+        let error = notifier.notify("READY=1").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn notifier_addresses() {
+        // The socket of the notifier is not connected, so these don't need a manager.
+        Notifier::new("/run/systemd/notify").unwrap();
+        Notifier::new("@/org/freedesktop/systemd1/notify").unwrap();
+        // The longest names that fit a socket address: 108 bytes for a path, 107 for an abstract
+        // name.
+        Notifier::new(format!("/{}", "a".repeat(107))).unwrap();
+        Notifier::new(format!("@{}", "a".repeat(107))).unwrap();
+
+        for address in ["/", "@"] {
+            let error = Notifier::new(address).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput, "{address:?}");
+        }
+        for address in [
+            "",
+            "x",
+            "relative/path",
+            "unix:/run/notify",
+            "vsock:2:1234",
+            "vsock-stream:2:1234",
+        ] {
+            let error = Notifier::new(address).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported, "{address:?}");
+        }
+        for address in [
+            format!("/{}", "a".repeat(108)),
+            format!("@{}", "a".repeat(108)),
+        ] {
+            let error = Notifier::new(&address).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(Errno::NAMETOOLONG.raw_os_error()),
+                "{address:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn notifier_from_the_environment() {
+        let exports = "NOTIFY_SOCKET=/run/systemd/notify";
+        if !in_own_process("notifier_from_the_environment", exports) {
+            return;
+        }
+
+        assert!(Notifier::from_env().unwrap().is_some());
+        // The variable stays, for the processes that this one starts to inherit.
+        assert!(env::var_os("NOTIFY_SOCKET").is_some());
+
+        env::set_var("NOTIFY_SOCKET", "");
+        assert!(Notifier::from_env().unwrap().is_none());
+        env::remove_var("NOTIFY_SOCKET");
+        assert!(Notifier::from_env().unwrap().is_none());
+
+        env::set_var("NOTIFY_SOCKET", "vsock:2:1234");
+        let error = Notifier::from_env().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
     fn take_listen_fds_from_the_environment() {
         let exports = "LISTEN_PID=$$ LISTEN_FDS=2 LISTEN_FDNAMES=first:second LISTEN_PIDFDID=1";
         if !in_own_process("take_listen_fds_from_the_environment", exports) {
@@ -225,6 +415,78 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(Errno::BADF.raw_os_error()));
         assert!(!is_open(3) && !is_open(4));
         assert_listen_variables_removed();
+    }
+
+    /// A manager at a socket file, and another at an abstract socket, with a notifier for each.
+    fn managers() -> [(Manager, Notifier); 2] {
+        [Manager::at_path(), Manager::at_abstract_name()]
+    }
+
+    /// A socket that a notifier sends to: the notification socket of the manager.
+    struct Manager {
+        socket: OwnedFd,
+        /// The file of the socket, if it's not an abstract one.
+        path: Option<PathBuf>,
+    }
+
+    impl Manager {
+        fn at_path() -> (Self, Notifier) {
+            let path = unique_path();
+            let address = SocketAddrUnix::new(&path).unwrap();
+            let manager = Self::bind(&address, Some(path.clone()));
+
+            (manager, Notifier::new(&path).unwrap())
+        }
+
+        fn at_abstract_name() -> (Self, Notifier) {
+            let name = Alphanumeric.sample_string(&mut rng(), 10);
+            let address = SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap();
+            let manager = Self::bind(&address, None);
+
+            (manager, Notifier::new(format!("@{name}")).unwrap())
+        }
+
+        fn bind(address: &SocketAddrUnix, path: Option<PathBuf>) -> Self {
+            let socket = socket_with(
+                AddressFamily::UNIX,
+                SocketType::DGRAM,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .unwrap();
+            bind(&socket, address).unwrap();
+            // Fail, rather than wait for ever, for a message that never comes.
+            set_socket_timeout(&socket, Timeout::Recv, Some(Duration::from_secs(10))).unwrap();
+
+            Self { socket, path }
+        }
+
+        /// The text of the next message.
+        fn receive(&self) -> String {
+            let mut text = [0; 8192];
+            let message = recvmsg(
+                &self.socket,
+                &mut [IoSliceMut::new(&mut text)],
+                &mut RecvAncillaryBuffer::new(&mut []),
+                RecvFlags::empty(),
+            )
+            .unwrap();
+            assert!(!message.flags.contains(ReturnFlags::TRUNC));
+
+            String::from_utf8(text[..message.bytes].to_vec()).unwrap()
+        }
+    }
+
+    impl Drop for Manager {
+        fn drop(&mut self) {
+            if let Some(path) = &self.path {
+                let _ = remove_file(path);
+            }
+        }
+    }
+
+    fn unique_path() -> PathBuf {
+        temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10))
     }
 
     /// Whether this is the process that the test `test` runs itself in.

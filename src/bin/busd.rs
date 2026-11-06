@@ -93,6 +93,12 @@ async fn run(#[cfg(target_os = "linux")] passed: Vec<OwnedFd>) -> Result<()> {
         [Signal::Interrupt, Signal::Terminate],
     )?;
 
+    #[cfg(target_os = "linux")]
+    let notifier = busd::systemd::Notifier::from_env().unwrap_or_else(|e| {
+        warn!("Ignoring `$NOTIFY_SOCKET`: {e}");
+
+        None
+    });
     // Under systemd's socket activation, the bus listens on the socket that systemd passes.
     #[cfg(target_os = "linux")]
     let mut bus = bus::Bus::for_systemd(passed, address.as_deref()).await?;
@@ -108,6 +114,14 @@ async fn run(#[cfg(target_os = "linux")] passed: Vec<OwnedFd>) -> Result<()> {
 
     if args.print_address {
         println!("{}", bus.address());
+    }
+
+    // Under systemd, a service of `Type=notify` tells systemd once it's ready.
+    #[cfg(target_os = "linux")]
+    if let Some(notifier) = &notifier {
+        if let Err(e) = notifier.notify("READY=1") {
+            warn!("Failed to tell systemd that the bus is ready: {e}");
+        }
     }
 
     {

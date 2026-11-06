@@ -8,6 +8,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use std::{
+    fs,
+    os::unix::net::{UnixDatagram, UnixStream},
+};
 
 use ntest::timeout;
 use rand::{
@@ -15,7 +20,8 @@ use rand::{
     rng,
 };
 use rustix::process::{kill_process, Pid, Signal};
-use zbus::Address;
+use zbus::{connection, Address};
+use zruntime::SharedRuntime;
 
 /// On SIGTERM, which service managers and `kill` send to stop a service, busd stops as it does on
 /// SIGINT: it removes the file of its socket, and exits successfully.
@@ -50,6 +56,60 @@ fn print_address() {
     assert_eq!(rest, "", "busd printed more than its address");
 }
 
+/// Under systemd, busd tells the service manager once it listens, for a service of `Type=notify` to
+/// be ready then.
+#[cfg(target_os = "linux")]
+#[test]
+#[timeout(30000)]
+fn notifies_readiness() {
+    let path = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+    let notify_socket = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+    let manager = UnixDatagram::bind(&notify_socket).unwrap();
+    manager
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
+    command.env("NOTIFY_SOCKET", &notify_socket);
+    let mut busd = Busd::start(command);
+
+    let mut state = [0; 4096];
+    let len = manager.recv(&mut state).unwrap();
+    assert_eq!(&state[..len], b"READY=1");
+    UnixStream::connect(&path).expect("busd doesn't listen once it's ready");
+
+    let status = busd.stop(Signal::TERM);
+    assert!(status.success(), "busd exited with {status}");
+    fs::remove_file(&notify_socket).unwrap();
+}
+
+/// A `$NOTIFY_SOCKET` that no one listens on doesn't keep busd from starting and serving: it only
+/// can't tell systemd that it's ready.
+#[test]
+#[timeout(30000)]
+fn notify_socket_nobody_listens_on() {
+    let s = Alphanumeric.sample_string(&mut rng(), 10);
+    let path = temp_dir().join(s);
+    let address = format!("unix:path={}", path.display());
+    let mut command = Busd::command(&address, None);
+    command.env("NOTIFY_SOCKET", temp_dir().join("busd-nobody-listens-here"));
+    let mut busd = Busd::start(command);
+    let address = busd.address();
+
+    let connection = zruntime::block_on(async {
+        let connecting = connection::Builder::address(address).build();
+        SharedRuntime::current()
+            .unwrap()
+            .timeout(Duration::from_secs(10), connecting)
+            .await
+            .expect("Timed out")
+    })
+    .unwrap();
+    assert!(connection.unique_name().is_some());
+
+    let status = busd.stop(Signal::TERM);
+    assert!(status.success(), "busd exited with {status}");
+}
+
 /// A busd process, killed if it's still running when dropped.
 struct Busd {
     child: Child,
@@ -62,9 +122,14 @@ impl Busd {
     /// It reads the session configuration of the tests, rather than the one of the system. Without
     /// `log`, it logs its errors alone, as it does without `RUST_LOG`, whatever the `RUST_LOG` of
     /// the tests.
+    fn spawn(address: &str, log: Option<&str>) -> Self {
+        Self::start(Self::command(address, log))
+    }
+
+    /// The command that [`Busd::spawn`] runs.
     ///
     /// busd runs as it would without systemd, whatever the environment of the tests tells of it.
-    fn spawn(address: &str, log: Option<&str>) -> Self {
+    fn command(address: &str, log: Option<&str>) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_busd"));
         command
             .args(["--config", CONFIG, "--address", address, "--print-address"])
@@ -77,6 +142,12 @@ impl Busd {
         for var in SYSTEMD_VARS {
             command.env_remove(var);
         }
+
+        command
+    }
+
+    /// Starts busd with `command`, as [`Busd::command`] makes it.
+    fn start(mut command: Command) -> Self {
         let mut child = command.spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -121,10 +192,12 @@ impl Drop for Busd {
 
 const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/session.conf");
 
-/// What systemd tells a service of in its environment: the sockets that it passes.
-const SYSTEMD_VARS: [&str; 4] = [
+/// What systemd tells a service of in its environment: the sockets that it passes, and the socket
+/// to send notifications to.
+const SYSTEMD_VARS: [&str; 5] = [
     "LISTEN_PID",
     "LISTEN_PIDFDID",
     "LISTEN_FDS",
     "LISTEN_FDNAMES",
+    "NOTIFY_SOCKET",
 ];

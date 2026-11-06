@@ -82,8 +82,8 @@ zruntime = { version = "0.2.2", features = [
 fastrand = "2.2.0"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
-# `net` is for the sockets of the bus. `std` makes rustix share the types of std with its callers
-# (`OwnedFd`, `io::Error`).
+# `net` is for the sockets of the bus, and the notification socket of systemd. `std` makes rustix
+# share the types of std with its callers (`OwnedFd`, `io::Error`).
 rustix = { version = "1.1.2", default-features = false, features = [
     "net",
     "process",
