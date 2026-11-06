@@ -62,6 +62,8 @@ impl Busd {
     /// It reads the session configuration of the tests, rather than the one of the system. Without
     /// `log`, it logs its errors alone, as it does without `RUST_LOG`, whatever the `RUST_LOG` of
     /// the tests.
+    ///
+    /// busd runs as it would without systemd, whatever the environment of the tests tells of it.
     fn spawn(address: &str, log: Option<&str>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_busd"));
         command
@@ -72,6 +74,9 @@ impl Busd {
             Some(log) => command.env("RUST_LOG", log),
             None => command.env_remove("RUST_LOG"),
         };
+        for var in SYSTEMD_VARS {
+            command.env_remove(var);
+        }
         let mut child = command.spawn().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
 
@@ -115,3 +120,11 @@ impl Drop for Busd {
 }
 
 const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/session.conf");
+
+/// What systemd tells a service of in its environment: the sockets that it passes.
+const SYSTEMD_VARS: [&str; 4] = [
+    "LISTEN_PID",
+    "LISTEN_PIDFDID",
+    "LISTEN_FDS",
+    "LISTEN_FDNAMES",
+];

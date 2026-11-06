@@ -22,6 +22,9 @@ use zbus::{
 };
 use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
 
+#[cfg(target_os = "linux")]
+mod systemd;
+
 use crate::{
     fdo::{self, DBus, Monitoring},
     peer::SEND_TIMEOUT,

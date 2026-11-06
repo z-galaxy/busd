@@ -1,5 +1,7 @@
 extern crate busd;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
 use std::{
     fs::File,
     io::Write,
@@ -60,10 +62,18 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    zruntime::block_on(run())
+    // systemd passes file descriptors through environment variables, which busd removes as it
+    // takes them: that may only happen before any other thread starts.
+    #[cfg(target_os = "linux")]
+    let passed = busd::systemd::take_listen_fds()?;
+
+    zruntime::block_on(run(
+        #[cfg(target_os = "linux")]
+        passed,
+    ))
 }
 
-async fn run() -> Result<()> {
+async fn run(#[cfg(target_os = "linux")] passed: Vec<OwnedFd>) -> Result<()> {
     busd::tracing_subscriber::init();
 
     let args = Args::parse();
@@ -83,6 +93,10 @@ async fn run() -> Result<()> {
         [Signal::Interrupt, Signal::Terminate],
     )?;
 
+    // Under systemd's socket activation, the bus listens on the socket that systemd passes.
+    #[cfg(target_os = "linux")]
+    let mut bus = bus::Bus::for_systemd(passed, address.as_deref()).await?;
+    #[cfg(not(target_os = "linux"))]
     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
 
     if let Some(fd) = args.ready_fd {
