@@ -192,12 +192,13 @@ impl Drop for Busd {
 
 const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/session.conf");
 
-/// What systemd tells a service of in its environment: the sockets that it passes, and the socket
-/// to send notifications to.
-const SYSTEMD_VARS: [&str; 5] = [
+/// What systemd tells a service of in its environment: the sockets that it passes, the socket to
+/// send notifications to, and how many file descriptors it may store.
+const SYSTEMD_VARS: [&str; 6] = [
     "LISTEN_PID",
     "LISTEN_PIDFDID",
     "LISTEN_FDS",
     "LISTEN_FDNAMES",
     "NOTIFY_SOCKET",
+    "FDSTORE",
 ];

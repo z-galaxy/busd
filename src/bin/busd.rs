@@ -63,6 +63,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // The next instance of busd, which it hands over to, starts with the same limit.
+    #[cfg(target_os = "linux")]
+    let fd_limit = getrlimit(Resource::Nofile).current;
     // Before the runtime, or anything else, opens file descriptors of its own.
     let raised = raise_fd_limit();
     // systemd passes file descriptors through environment variables, which busd removes as it
@@ -73,13 +76,16 @@ fn main() -> Result<()> {
     zruntime::block_on(run(
         raised,
         #[cfg(target_os = "linux")]
+        fd_limit,
+        #[cfg(target_os = "linux")]
         passed,
     ))
 }
 
 async fn run(
     raised: rustix::io::Result<()>,
-    #[cfg(target_os = "linux")] passed: Vec<OwnedFd>,
+    #[cfg(target_os = "linux")] fd_limit: Option<u64>,
+    #[cfg(target_os = "linux")] passed: Vec<(String, OwnedFd)>,
 ) -> Result<()> {
     busd::tracing_subscriber::init();
     if let Err(e) = raised {
@@ -109,9 +115,10 @@ async fn run(
 
         None
     });
-    // Under systemd's socket activation, the bus listens on the socket that systemd passes.
+    // Under systemd, the bus takes over from its previous instance, or listens on the socket of the
+    // socket activation, if systemd passes either.
     #[cfg(target_os = "linux")]
-    let mut bus = bus::Bus::for_systemd(passed, address.as_deref()).await?;
+    let mut bus = bus::Bus::for_systemd(passed, notifier.as_ref(), address.as_deref()).await?;
     #[cfg(not(target_os = "linux"))]
     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
 
@@ -149,6 +156,14 @@ async fn run(
             Either::Right((Ok(()), _)) => warn!("Bus stopped, shutting down.."),
             Either::Right((Err(e), _)) => error!("Bus stopped with an error: {}", e),
         }
+    }
+
+    // With a file descriptor store of systemd's to keep the clients in, the bus hands them over to
+    // its next instance rather than disconnect them. On a restart, systemd starts the next instance
+    // with them, and on a stop, it closes them.
+    #[cfg(target_os = "linux")]
+    if let Some(notifier) = &notifier {
+        return bus.hand_over_to_systemd(notifier, fd_limit).await;
     }
 
     if let Err(e) = bus.cleanup().await {

@@ -48,6 +48,10 @@ pub struct Bus {
     /// Whether the bus bound the socket that it listens on itself, rather than take it from
     /// whoever passed it, such as systemd's socket activation, which then owns the socket's file.
     bound: bool,
+    /// The file descriptors that a bus that systemd runs keeps to give up for those that handing
+    /// over to its next instance opens, if it keeps any: see [`Bus::for_systemd`].
+    #[cfg(target_os = "linux")]
+    reserve: Option<systemd::Reserve>,
 }
 
 // All (cheaply) cloneable fields of `Bus` go here.
@@ -196,6 +200,8 @@ impl Bus {
                 _self_conn: service_conn,
             },
             bound,
+            #[cfg(target_os = "linux")]
+            reserve: None,
         })
     }
 
@@ -359,7 +365,8 @@ fn default_address() -> String {
 }
 
 /// A socket bound to `addr`, in place of a socket file there that no one listens on anymore, as one
-/// that a bus left behind when it was killed.
+/// that a bus left behind when it was killed, or when it handed its socket over to its next
+/// instance, through systemd's file descriptor store, on a stop rather than a restart.
 ///
 /// On Linux, the file goes only if it's a socket that refuses connections. Elsewhere, as on macOS,
 /// a socket also refuses connections while more of them wait for its bus than it takes, so the file
