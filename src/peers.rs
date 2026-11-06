@@ -115,11 +115,17 @@ impl Peers {
 
     /// Add the bus itself, which serves the D-Bus API on `conn`: what the bus sends on it comes out
     /// of `msg_stream`.
-    pub async fn add_us(self: &Arc<Self>, msg_stream: zbus::MessageStream, conn: Connection) {
+    ///
+    /// It fails as [`Peer::new_us`] does.
+    pub async fn add_us(
+        self: &Arc<Self>,
+        msg_stream: zbus::MessageStream,
+        conn: Connection,
+    ) -> Result<()> {
         *self.bus_conn() = Some(conn);
         // The user of the process of the bus, as with dbus-broker.
         let user = self.users.user(rustix::process::getuid().as_raw());
-        let (peer, peer_stream) = Peer::new_us(msg_stream, user).await;
+        let (peer, peer_stream) = Peer::new_us(msg_stream, user).await?;
         let unique_name = peer.unique_name().clone();
         let listener = peer.listen_cancellation();
         let pending_calls = peer.pending_calls().clone();
@@ -145,6 +151,8 @@ impl Peers {
                 routing.peers.insert(unique_name.clone(), peer);
             }
         }
+
+        Ok(())
     }
 
     /// Let go of the connection on which the bus serves the D-Bus API, as the bus goes.

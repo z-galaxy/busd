@@ -92,10 +92,17 @@ impl Peer {
         Ok((peer, stream))
     }
 
-    // This is the bus itself, serving the FDO D-Bus API, of `user`.
-    pub async fn new_us(msg_stream: MessageStream, user: Arc<User>) -> (Self, Stream) {
+    /// The bus itself, serving the FDO D-Bus API, of `user`.
+    ///
+    /// It fails if the credentials of the bus can't be looked up. zbus looks them up through
+    /// `msg_stream`'s connection, and waits for the sends on it: the calls on their way to the bus,
+    /// which may only go on once the bus answers the call that asks for its credentials. So the
+    /// bus looks them up before it serves anyone, while nothing is sent on the connection, and
+    /// zbus keeps them.
+    pub async fn new_us(msg_stream: MessageStream, user: Arc<User>) -> Result<(Self, Stream)> {
         let unique_name = OwnedUniqueName::try_from(fdo::BUS_NAME).unwrap();
         let conn = Connection::from(&msg_stream);
+        conn.peer_creds().await?;
 
         let peer = Self {
             recipient: Recipient::bus(conn.clone()),
@@ -110,7 +117,7 @@ impl Peer {
             canceled_event: Event::new(),
         };
         let stream = Stream::for_peer(&peer, msg_stream);
-        (peer, stream)
+        Ok((peer, stream))
     }
 
     pub fn unique_name(&self) -> &OwnedUniqueName {

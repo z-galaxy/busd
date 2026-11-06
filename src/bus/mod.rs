@@ -88,7 +88,7 @@ impl Bus {
             .build_message_stream()
             .await?;
 
-        peers.add_us(peer_stream, service_conn.clone()).await;
+        peers.add_us(peer_stream, service_conn.clone()).await?;
         trace!("Self-dial connection created.");
 
         Ok(Self {

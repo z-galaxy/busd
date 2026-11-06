@@ -60,7 +60,22 @@ impl DBus {
     }
 }
 
-#[interface(interface = "org.freedesktop.DBus", introspection_docs = false)]
+// The bus answers the calls one at a time, in the order that they come in, rather than in a task of
+// its own for each, as the reference implementation of D-Bus and dbus-broker do: the calls that a
+// client makes one after the other get their replies, and have the bus send their signals, in that
+// order.
+//
+// So a method must never wait for anything that waits for the bus to take the calls after the one
+// that it answers, or the bus waits for ever. The calls on their way to the bus wait for it to take
+// them, and hold the connection that they go over while they do, its lock included: nothing that
+// goes through that connection may be waited for, such as a lookup of the credentials of the bus
+// itself, which the bus makes before it serves anyone. `every_call_to_the_bus_among_calls` of the
+// tests calls each method among many other calls, to make sure.
+#[interface(
+    interface = "org.freedesktop.DBus",
+    introspection_docs = false,
+    spawn = false
+)]
 impl DBus {
     /// This is already called & handled and we only need to handle it once.
     async fn hello(
@@ -220,7 +235,7 @@ impl DBus {
         // Not under the lock of the routing, as zbus looks the credentials up through the
         // connection of the peer unless it knows them already, which waits for any send to the peer
         // that is under way. It knows those of each client, which it looks up as the client
-        // connects.
+        // connects, and those of the bus itself, which the bus looks up before it serves anyone.
         let conn = self
             .peers()?
             .routing()
