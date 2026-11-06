@@ -125,11 +125,6 @@ serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtr
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2.191"
 
-# `getpeereid`, which tells the uid of a client on the platforms other than Linux that have it, and
-# which rustix has no call for.
-[target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
-libc = "0.2.191"
-
 [profile.release]
 lto = "fat"
 codegen-units = 1
