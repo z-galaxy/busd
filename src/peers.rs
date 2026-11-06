@@ -214,30 +214,28 @@ impl Peers {
         if routing.peers.contains_key(&unique_name) {
             panic!("Unique name `{unique_name}` re-used. We're in deep trouble if this happens");
         }
-        spawn(self.clone().serve_peer(
-            peer_stream,
-            peer.listen_cancellation(),
-            unique_name.clone(),
-            peer.id(),
-            peer.pending_calls().clone(),
-            peer.caller().clone(),
-        ))
+        let served = Served::new(&peer);
+        spawn(
+            self.clone()
+                .serve_peer(peer_stream, peer.listen_cancellation(), served),
+        )
         .detach();
         routing.peers.insert(unique_name, peer);
     }
 
-    /// Serve the peer `unique_name`, numbered `id`, whose messages come out of `peer_stream`, whose
-    /// calls that wait for its replies are `pending_calls`, and which is `caller` as it makes
-    /// calls, until it goes.
+    /// Serve `peer`, whose messages come out of `peer_stream`, until it goes.
     async fn serve_peer(
         self: Arc<Self>,
         mut peer_stream: Stream,
         mut cancellation_listener: EventListener,
-        unique_name: OwnedUniqueName,
-        id: usize,
-        pending_calls: Arc<PendingCalls>,
-        caller: Arc<Caller>,
+        peer: Served,
     ) -> Result<()> {
+        let Served {
+            unique_name,
+            id,
+            pending_calls,
+            caller,
+        } = peer;
         let mut batch = Vec::new();
         let mut outbox = Outbox::default();
         loop {
@@ -556,6 +554,29 @@ pub struct Routing {
     pub name_registry: NameRegistry,
     /// The monitors, by their unique names.
     monitors: BTreeMap<OwnedUniqueName, Monitor>,
+}
+
+/// What the task that serves a peer keeps of the peer: see [`Peers::serve_peer`].
+struct Served {
+    unique_name: OwnedUniqueName,
+    /// The number of the peer.
+    id: usize,
+    /// The calls to the peer that wait for its reply.
+    pending_calls: Arc<PendingCalls>,
+    /// The peer, as the caller of the calls that wait for replies.
+    caller: Arc<Caller>,
+}
+
+impl Served {
+    /// What the task that serves `peer` keeps of it.
+    fn new(peer: &Peer) -> Self {
+        Self {
+            unique_name: peer.unique_name().clone(),
+            id: peer.id(),
+            pending_calls: peer.pending_calls().clone(),
+            caller: peer.caller().clone(),
+        }
+    }
 }
 
 /// The `NoReply` error, from the bus, to the call of `caller` with `serial`, as dbus-broker sends
