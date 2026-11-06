@@ -82,6 +82,7 @@ zruntime = { version = "0.2.2", features = [
 fastrand = "2.2.0"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
+# `net` is for the sockets of the bus.
 rustix = { version = "1.1.2", default-features = false, features = ["net", "process"] }
 foldhash = "0.2.0"
 
