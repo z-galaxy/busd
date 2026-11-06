@@ -148,6 +148,14 @@ impl Bus {
         }
     }
 
+    pub fn peers(&self) -> &Arc<Peers> {
+        &self.inner.peers
+    }
+
+    pub fn guid(&self) -> &OwnedGuid {
+        &self.inner.guid
+    }
+
     /// The address to listen on for `unix`, and the socket that clients connect to.
     ///
     /// For a directory, the socket is a file of a random name in it.
@@ -232,14 +240,6 @@ impl Bus {
         .detach();
 
         Ok(())
-    }
-
-    pub fn peers(&self) -> &Arc<Peers> {
-        &self.inner.peers
-    }
-
-    pub fn guid(&self) -> &OwnedGuid {
-        &self.inner.guid
     }
 
     fn next_id(&mut self) -> usize {
