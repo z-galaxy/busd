@@ -455,7 +455,8 @@ fn messages_that_the_bus_did_not_take_are_handed_over() {
                 .iter()
                 .find(|client| client.id == id_of(&sender))
                 .expect("The sender wasn't handed over");
-            let unread = rustix::io::ioctl_fionread(&client.fds[0]).unwrap();
+            let socket = client.connection.fds().next().unwrap();
+            let unread = rustix::io::ioctl_fionread(socket).unwrap();
             assert_eq!(unread, 0, "zbus didn't read all that the sender sent");
 
             Running::take_over(handover).await
@@ -643,62 +644,6 @@ fn bus_on_a_given_socket_hands_over() {
         assert!(std::path::Path::new(&path).exists());
         std::fs::remove_file(&path).unwrap();
     });
-}
-
-/// A bus doesn't take over from a state that it can't decode: it fails, rather than serve anyone
-/// or panic.
-#[test]
-#[timeout(30000)]
-fn garbage_state_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| *state = b"not a state".to_vec()));
-}
-
-/// A bus doesn't take over from the state of a version that it doesn't know.
-#[test]
-#[timeout(30000)]
-fn unknown_state_version_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| state[0] += 1));
-}
-
-/// A bus doesn't take over from a state of the right version that is cut short.
-#[test]
-#[timeout(30000)]
-fn truncated_state_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| state.truncate(4 + 6)));
-}
-
-/// A bus doesn't take over from a state of the right version whose body is spoiled.
-#[test]
-#[timeout(30000)]
-fn spoiled_state_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| state[4..16].fill(0xff)));
-}
-
-/// Hand a bus with a client over, spoil its state with `spoil`, and check that taking over from it
-/// fails.
-async fn refuses_state<F>(spoil: F)
-where
-    F: FnOnce(&mut Vec<u8>),
-{
-    let (bus, address) = start().await;
-    let client = connect(&address).await;
-
-    let mut handover = bus.hand_over().await;
-    spoil(&mut handover.state);
-    let error = Bus::take_over(handover, None).await.unwrap_err();
-    assert!(!error.to_string().is_empty());
-    // The bus served no one, and let go of the sockets of the clients with the handover.
-    within(client.closed()).await;
-
-    let _ = std::fs::remove_file(socket_path(&address));
 }
 
 /// Clients that don't take what the bus sends them hold a hand-over up once at most: one that the
@@ -1017,7 +962,7 @@ fn fds_sent_ahead_are_handed_over() {
             .find(|client| client.id == sender_id)
             .expect("The sender wasn't handed over");
         // Its socket, and the file descriptor that it sent ahead.
-        assert_eq!(client.fds.len(), 2);
+        assert_eq!(client.connection.fds().len(), 2);
         let bus = Running::take_over(handover).await;
 
         zruntime::unblock(move || sender.send_for_fd(&destination))

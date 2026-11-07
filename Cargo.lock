@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.2.1"
-source = "git+https://github.com/z-galaxy/zbus?branch=main#d656c1feaf698296c704792f6670bc3e93a981f9"
+source = "git+https://github.com/z-galaxy/zbus?branch=ai%2Fstoic-brahmagupta-2570gx#215e330ae5e5f358095eedfc7c7f90258f72577e"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -1581,7 +1581,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "6.2.1"
-source = "git+https://github.com/z-galaxy/zbus?branch=main#d656c1feaf698296c704792f6670bc3e93a981f9"
+source = "git+https://github.com/z-galaxy/zbus?branch=ai%2Fstoic-brahmagupta-2570gx#215e330ae5e5f358095eedfc7c7f90258f72577e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1592,7 +1592,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.1.0"
-source = "git+https://github.com/z-galaxy/zbus?branch=main#d656c1feaf698296c704792f6670bc3e93a981f9"
+source = "git+https://github.com/z-galaxy/zbus?branch=ai%2Fstoic-brahmagupta-2570gx#215e330ae5e5f358095eedfc7c7f90258f72577e"
 dependencies = [
  "proc-macro2",
  "quote",
