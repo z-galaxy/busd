@@ -62,5 +62,10 @@ argument parsing via clap). Key modules:
 - **`tracing_subscriber.rs`** — logging setup (behind the default `tracing-subscriber`
   feature).
 
+The library is internal to busd: it's only there for the binary, the tests and the
+benchmarks to share the code, and is only published along with the binary. Its `pub` items
+are public for those alone, so there's no public API to keep stable, to document for
+users, or to list as new in pull requests.
+
 busd builds on zbus releases from crates.io, so bus-side changes in a new zbus release
 can require updating this crate.
