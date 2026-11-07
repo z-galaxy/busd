@@ -4,8 +4,6 @@ use futures_util::{
     future::{join_all, select, Either},
     stream::StreamExt,
 };
-#[cfg(target_os = "linux")]
-use std::time::Instant;
 use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap},
     future::poll_fn,
@@ -268,9 +266,9 @@ impl Peers {
             panic!("Unique name `{unique_name}` re-used. We're in deep trouble if this happens");
         }
         #[cfg(target_os = "linux")]
-        if let Some(since) = routing.handing_over {
+        if routing.handing_over {
             let mut peer = peer;
-            peer.pause(since);
+            peer.pause();
             *peer.paused() = Some(peer_stream.into_inner());
             routing.peers.insert(unique_name, peer);
 
@@ -456,7 +454,7 @@ impl Peers {
             peer.pending_calls().forget(id);
         }
         #[cfg(target_os = "linux")]
-        if routing.handing_over.is_some() {
+        if routing.handing_over {
             *monitor.paused() = Some(stream);
 
             return None;
@@ -765,10 +763,10 @@ pub struct Routing {
     pub name_registry: NameRegistry,
     /// The monitors, by their unique names.
     monitors: BTreeMap<OwnedUniqueName, Monitor>,
-    /// Since when the bus is handing over to its next instance, if it is, so that it takes none of
-    /// the messages of the clients that connect.
+    /// Whether the bus is handing over to its next instance, so that it pauses the clients that
+    /// connect, and takes none of their messages.
     #[cfg(target_os = "linux")]
-    handing_over: Option<Instant>,
+    handing_over: bool,
     /// Whether the bus takes no more clients, as it is done pausing those that it hands over: see
     /// [`Peers::add`].
     #[cfg(target_os = "linux")]

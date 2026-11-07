@@ -3,7 +3,6 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    cell::Cell,
     collections::HashSet,
     env::temp_dir,
     future::IntoFuture,
@@ -30,7 +29,7 @@ use busd::{
     peer::SEND_TIMEOUT,
 };
 use futures_util::{
-    future::{join, select, Either},
+    future::{select, Either},
     StreamExt,
 };
 use ntest::timeout;
@@ -128,7 +127,7 @@ fn credentials_of_a_stalled_client_that_was_handed_over() {
     zruntime::block_on(async {
         let (bus, address) = start().await;
         let mut stalled = connect(&address).await;
-        // Mind the queue of one signal: see `hand_over_waits_for_a_slow_receiver`.
+        // Mind the queue of one signal: see `hand_over_does_not_wait_for_a_slow_receiver`.
         let _signals = listen(&stalled, signal_rule("Flood")).await;
         stalled.set_max_queued(NonZeroUsize::MIN);
         let flooder = connect(&address).await;
@@ -337,13 +336,14 @@ fn calls_to_the_bus_get_their_replies() {
     });
 }
 
-/// A bus that hands over waits for what it took of its clients to reach its other clients: a
-/// receiver that stops taking signals holds the hand-over up until it takes those, and gets them
-/// all, once and in order, the others from the next instance, as it gets those that come after the
-/// next instance took over.
+/// A bus that hands over doesn't wait for its clients to take what it sends them: a receiver that
+/// stops taking signals holds no hand-over up, and is handed over with what the bus didn't write to
+/// it. It gets the signals all the same, once and in order, the others from the next instance,
+/// which writes it what the bus didn't first, as it gets those that come after the next instance
+/// took over.
 #[test]
 #[timeout(30000)]
-fn hand_over_waits_for_a_slow_receiver() {
+fn hand_over_does_not_wait_for_a_slow_receiver() {
     init_tracing();
 
     zruntime::block_on(async {
@@ -367,25 +367,24 @@ fn hand_over_waits_for_a_slow_receiver() {
         // The bus reads all that the sender emits, as it fits in the queue of the sender, but sends
         // no more than the receiver takes.
         within(sending).await.unwrap().unwrap();
-        let runtime = SharedRuntime::current().unwrap();
-        runtime.sleep(FILL_UP).await;
+        SharedRuntime::current().unwrap().sleep(FILL_UP).await;
 
-        // A hand-over that doesn't wait for the bus to send what it took is done by now.
-        let handing_over = pin!(bus.hand_over());
-        let Either::Right((_, handing_over)) =
-            select(handing_over, pin!(runtime.sleep(PAUSE))).await
-        else {
-            panic!("The bus handed over though a receiver had not taken all of its signals");
-        };
-        // The receiver takes the signals from now on, from this instance and from the next.
-        let taking = within(async {
-            for _ in TAKEN..CHUNKS {
-                ticks.push(next_tick(&mut signals).await.unwrap());
-            }
-        });
-        let taking_over = async { Running::take_over(handing_over.await).await };
-        let ((), bus) = join(taking, taking_over).await;
+        // The receiver takes no signal while the bus hands over, which the bus doesn't wait for.
+        let handover = within(bus.hand_over()).await;
+        let unwritten = handover
+            .clients
+            .iter()
+            .find(|client| client.id == id_of(&receiver))
+            .expect("The receiver wasn't handed over")
+            .connection
+            .unwritten_len();
+        assert!(unwritten > 0, "The bus wrote the receiver all that it sent");
+        let bus = Running::take_over(handover).await;
 
+        // The receiver takes the signals from now on, from the next instance.
+        for _ in TAKEN..CHUNKS {
+            ticks.push(next_tick(&mut signals).await.unwrap());
+        }
         // The next instance passes the signals on as well.
         send_ticks(sender.clone(), CHUNKS..CHUNKS + MORE, 0)
             .await
@@ -404,7 +403,8 @@ fn hand_over_waits_for_a_slow_receiver() {
 /// The messages that zbus read of a client, and that the bus didn't take by the time that it
 /// paused, go to the next instance, which passes them on: the bus is passing one of them on to a
 /// receiver that doesn't take it as the hand-over starts, while zbus read the others, none of which
-/// is left in the socket of the sender. The receiver gets them all, once and in order.
+/// is left in the socket of the sender. The receiver gets them all, once and in order, the rest of
+/// the one that the bus was passing on first.
 #[test]
 #[timeout(30000)]
 fn messages_that_the_bus_did_not_take_are_handed_over() {
@@ -416,7 +416,7 @@ fn messages_that_the_bus_did_not_take_are_handed_over() {
         let (bus, address) = serve(bus);
         let mut receiver = connect(&address).await;
         let mut signals = listen(&receiver, signal_rule("Tick")).await;
-        // Mind the queue of one signal: see `hand_over_waits_for_a_slow_receiver`.
+        // Mind the queue of one signal: see `hand_over_does_not_wait_for_a_slow_receiver`.
         receiver.set_max_queued(NonZeroUsize::MIN);
         let sender = connect(&address).await;
 
@@ -425,42 +425,27 @@ fn messages_that_the_bus_did_not_take_are_handed_over() {
         within(send_ticks(sender.clone(), 0..CHUNKS, CHUNK))
             .await
             .unwrap();
-        let runtime = SharedRuntime::current().unwrap();
-        runtime.sleep(FILL_UP).await;
+        SharedRuntime::current().unwrap().sleep(FILL_UP).await;
 
-        // The bus waits for the receiver to take the signal that it is passing on.
-        let handing_over = pin!(bus.hand_over());
-        let Either::Right((_, handing_over)) =
-            select(handing_over, pin!(runtime.sleep(PAUSE))).await
-        else {
-            panic!("The bus handed over though a receiver had not taken the signal that it took");
-        };
-        let taken = Cell::new(0);
-        let taking = within(async {
-            let mut ticks = Vec::new();
-            for _ in 0..CHUNKS {
-                ticks.push(next_tick(&mut signals).await.unwrap());
-                taken.set(ticks.len());
-            }
-            ticks
-        });
-        let taking_over = async {
-            let handover = handing_over.await;
-            assert!(
-                taken.get() < CHUNKS as usize,
-                "All of the signals came through before the bus handed over"
-            );
-            let client = handover
-                .clients
-                .iter()
-                .find(|client| client.id == id_of(&sender))
-                .expect("The sender wasn't handed over");
-            let unread = rustix::io::ioctl_fionread(&client.fds[0]).unwrap();
-            assert_eq!(unread, 0, "zbus didn't read all that the sender sent");
+        let handover = within(bus.hand_over()).await;
+        let client = handover
+            .clients
+            .iter()
+            .find(|client| client.id == id_of(&sender))
+            .expect("The sender wasn't handed over");
+        assert!(
+            client.connection.unread_len() > 0,
+            "The bus took all of the signals"
+        );
+        let socket = client.connection.fds().next().unwrap();
+        let unread = rustix::io::ioctl_fionread(socket).unwrap();
+        assert_eq!(unread, 0, "zbus didn't read all that the sender sent");
+        let bus = Running::take_over(handover).await;
 
-            Running::take_over(handover).await
-        };
-        let (ticks, bus) = join(taking, taking_over).await;
+        let mut ticks = Vec::new();
+        for _ in 0..CHUNKS {
+            ticks.push(next_tick(&mut signals).await.unwrap());
+        }
         assert_eq!(ticks, (0..CHUNKS).collect::<Vec<_>>());
         get_id(&sender).await;
         get_id(&receiver).await;
@@ -471,8 +456,8 @@ fn messages_that_the_bus_did_not_take_are_handed_over() {
 
 /// Clients send signals and `BecomeMonitor` in one go, while a receiver of the signals doesn't take
 /// them, so that the bus is still passing the signals on when it has made the clients monitors: a
-/// hand-over waits for that, and the receiver gets the signals of each client whole and in order,
-/// from the bus that took over, with the monitors still monitoring.
+/// hand-over doesn't wait for that, and the receiver gets the signals of each client whole and in
+/// order, from the bus that took over, with the monitors still monitoring.
 #[test]
 #[timeout(30000)]
 fn monitor_batch_is_forwarded_before_a_hand_over() {
@@ -482,7 +467,8 @@ fn monitor_batch_is_forwarded_before_a_hand_over() {
 }
 
 /// As with `monitor_batch_is_forwarded_before_a_hand_over`, but the monitors go before the bus
-/// hands over, while the bus is still passing their signals on: a hand-over still waits for that.
+/// hands over, while the bus is still passing their signals on: the receiver gets them all the
+/// same.
 #[test]
 #[timeout(30000)]
 fn batch_of_a_monitor_that_went_is_forwarded_before_a_hand_over() {
@@ -492,15 +478,15 @@ fn batch_of_a_monitor_that_went_is_forwarded_before_a_hand_over() {
 }
 
 /// Have clients send signals and `BecomeMonitor` in one go, while a receiver of the signals doesn't
-/// take them, have the monitors disconnect if `leave`, and check that the hand-over waits for the
-/// receiver to get the signals.
+/// take them, have the monitors disconnect if `leave`, and check that the receiver gets the signals
+/// from the next instance, as the hand-over doesn't wait for it to take them.
 async fn monitor_batches_are_forwarded(leave: bool) {
     let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
     bus.set_send_timeout(LONG_SEND_TIMEOUT);
     let (bus, address) = serve(bus);
     let mut receiver = connect(&address).await;
     let mut signals = listen(&receiver, signal_rule("Tick")).await;
-    // Mind the queue of one signal: see `hand_over_waits_for_a_slow_receiver`.
+    // Mind the queue of one signal: see `hand_over_does_not_wait_for_a_slow_receiver`.
     receiver.set_max_queued(NonZeroUsize::MIN);
     let sender = connect(&address).await;
     let path = socket_path(&address);
@@ -541,21 +527,18 @@ async fn monitor_batches_are_forwarded(leave: bool) {
     }
     runtime.sleep(FILL_UP).await;
 
-    // The receiver doesn't take the signals yet, and the bus waits for them to be sent.
-    let handing_over = pin!(bus.hand_over());
-    let Either::Right((_, handing_over)) = select(handing_over, pin!(runtime.sleep(PAUSE))).await
-    else {
-        panic!("The bus handed over though a receiver had not taken all of its signals");
-    };
-    let taking = within(async {
+    // The receiver takes none of the signals while the bus hands over, which the bus doesn't wait
+    // for: what it didn't write to the receiver goes on with the connection of the receiver.
+    let handover = within(bus.hand_over()).await;
+    let bus = Running::take_over(handover).await;
+    let mut ticks = within(async {
         let mut ticks = Vec::new();
         for _ in 0..total {
             ticks.push(next_tick(&mut signals).await.unwrap());
         }
         ticks
-    });
-    let (handover, mut ticks) = join(handing_over, taking).await;
-    let bus = Running::take_over(handover).await;
+    })
+    .await;
 
     // The signals of each client came whole and in order, and one client after the other, as
     // the bus sends a batch in one go.
@@ -645,134 +628,102 @@ fn bus_on_a_given_socket_hands_over() {
     });
 }
 
-/// A bus doesn't take over from a state that it can't decode: it fails, rather than serve anyone
-/// or panic.
+/// Clients that don't take what the bus sends them hold no hand-over up: those that the bus is
+/// passing signals on to as it pauses are handed over with what the bus didn't write to them, as
+/// are the other clients. The next instance, which serves the others on meanwhile, writes them that
+/// first, and disconnects them once they don't take it within the time limit of the bus to send.
 #[test]
 #[timeout(30000)]
-fn garbage_state_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| *state = b"not a state".to_vec()));
-}
-
-/// A bus doesn't take over from the state of a version that it doesn't know.
-#[test]
-#[timeout(30000)]
-fn unknown_state_version_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| state[0] += 1));
-}
-
-/// A bus doesn't take over from a state of the right version that is cut short.
-#[test]
-#[timeout(30000)]
-fn truncated_state_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| state.truncate(4 + 6)));
-}
-
-/// A bus doesn't take over from a state of the right version whose body is spoiled.
-#[test]
-#[timeout(30000)]
-fn spoiled_state_is_refused() {
-    init_tracing();
-
-    zruntime::block_on(refuses_state(|state| state[4..16].fill(0xff)));
-}
-
-/// Hand a bus with a client over, spoil its state with `spoil`, and check that taking over from it
-/// fails.
-async fn refuses_state<F>(spoil: F)
-where
-    F: FnOnce(&mut Vec<u8>),
-{
-    let (bus, address) = start().await;
-    let client = connect(&address).await;
-
-    let mut handover = bus.hand_over().await;
-    spoil(&mut handover.state);
-    let error = Bus::take_over(handover, None).await.unwrap_err();
-    assert!(!error.to_string().is_empty());
-    // The bus served no one, and let go of the sockets of the clients with the handover.
-    within(client.closed()).await;
-
-    let _ = std::fs::remove_file(socket_path(&address));
-}
-
-/// Clients that don't take what the bus sends them hold a hand-over up once at most: one that the
-/// bus is passing a signal on to as it pauses holds the hand-over up for no longer than the time
-/// limit of the bus to send, gets disconnected by then, and is left out and closed. The others,
-/// which the bus passes nothing on to meanwhile, as it took nothing more for them, are handed over,
-/// as are the clients that take what is sent them, and the next instance passes on what the bus
-/// didn't take for them, once they take it.
-#[test]
-#[timeout(30000)]
-fn stalled_receivers_hold_a_hand_over_up_once() {
+fn stalled_receivers_are_handed_over() {
     init_tracing();
 
     zruntime::block_on(async {
+        // The bus doesn't disconnect the receivers as it hands over: it doesn't wait for them.
         let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
-        bus.set_send_timeout(SHORT_SEND_TIMEOUT);
+        bus.set_send_timeout(LONG_SEND_TIMEOUT);
         let (bus, address) = serve(bus);
         let mut stalled = Vec::new();
+        let mut senders = Vec::new();
         for i in 0..STALLED {
             let mut receiver = connect(&address).await;
-            // Mind the queue of one signal: see `hand_over_waits_for_a_slow_receiver`.
+            // Mind the queue of one signal: see `hand_over_does_not_wait_for_a_slow_receiver`.
             let signals = listen(&receiver, signal_rule(&stalled_member(i))).await;
             receiver.set_max_queued(NonZeroUsize::MIN);
             stalled.push((receiver, signals));
+            senders.push(connect(&address).await);
         }
-        let kept = connect(&address).await;
-        let mut kept_signals = listen(&kept, signal_rule("Kept")).await;
-        let sender = connect(&address).await;
+        let watcher = connect(&address).await;
+        let mut changes = listen(&watcher, owner_changes_rule()).await;
 
-        // The signals for the first receiver fill it up, and the bus waits to send the next to it,
-        // while zbus reads the signals for the others.
-        for i in 0..STALLED {
-            emit_chunks(&sender, &stalled_member(i), CHUNKS_EACH).await;
+        // The signals for each receiver, from a sender of its own, fill it up, and the bus waits
+        // to send it the next one.
+        for (i, sender) in (0..).zip(&senders) {
+            emit_chunks(sender, &stalled_member(i), CHUNKS_EACH).await;
         }
-        emit(&sender, "Kept").await;
-        SharedRuntime::current().unwrap().sleep(FILL_UP).await;
+        let runtime = SharedRuntime::current().unwrap();
+        runtime.sleep(FILL_UP).await;
 
-        let started = Instant::now();
-        let handover = bus.hand_over().await;
-        let took = started.elapsed();
-        assert!(
-            took >= SHORT_SEND_TIMEOUT / 2,
-            "The bus handed over after {took:?}, though a receiver had a signal to take"
-        );
-        assert!(
-            took < SHORT_SEND_TIMEOUT * 2,
-            "The bus handed over after {took:?}, more than one stalled receiver having held it up"
-        );
-        let others = &mut stalled[1..];
+        let handover = within(bus.hand_over()).await;
         let mut clients: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
         clients.sort();
-        let mut expected: Vec<_> = others
+        let mut expected: Vec<_> = stalled
             .iter()
-            .map(|(receiver, _)| id_of(receiver))
-            .chain([id_of(&kept), id_of(&sender)])
+            .map(|(receiver, _)| receiver)
+            .chain(&senders)
+            .chain([&watcher])
+            .map(id_of)
             .collect();
         expected.sort();
         assert_eq!(clients, expected);
+        for (receiver, _) in &stalled {
+            let id = id_of(receiver);
+            let client = handover.clients.iter().find(|client| client.id == id);
+            assert!(
+                client.unwrap().connection.unwritten_len() > 0,
+                "The bus wrote `:busd.{id}` all that it sent"
+            );
+        }
+        let started = Instant::now();
         let bus = Running::take_over(handover).await;
 
-        // The signals for the others come from the next instance, as they take them, and those
-        // after them.
-        for (i, (_, signals)) in (1..).zip(others.iter_mut()) {
-            for _ in 0..CHUNKS_EACH {
-                next_message(signals, |msg| is_signal(msg, &stalled_member(i))).await;
+        // The next instance serves the others meanwhile, and disconnects the receivers once their
+        // time is up.
+        get_id(&watcher).await;
+        let mut waiting: HashSet<_> = stalled
+            .iter()
+            .map(|(receiver, _)| receiver.unique_name().unwrap().to_string())
+            .collect();
+        let disconnecting = async {
+            while !waiting.is_empty() {
+                let signal = changes.next().await.unwrap().unwrap();
+                if !is_signal(&signal, "NameOwnerChanged") {
+                    continue;
+                }
+                let (name, _, new_owner): (String, String, String) =
+                    signal.body().deserialize().unwrap();
+                if new_owner.is_empty() {
+                    waiting.remove(&name);
+                }
             }
+        };
+        runtime
+            .timeout(SEND_TIMEOUT + WAIT, disconnecting)
+            .await
+            .expect("The next instance kept the receivers");
+        let took = started.elapsed();
+        assert!(
+            took >= SEND_TIMEOUT,
+            "The next instance disconnected the receivers after {took:?}, before their time was up"
+        );
+        for sender in &senders {
+            get_id(sender).await;
         }
-        next_message(&mut kept_signals, |msg| is_signal(msg, "Kept")).await;
-        get_id(&kept).await;
-        get_id(&sender).await;
-        // Without the signals that it doesn't take, which hold its connection up, the first reads
-        // on, to the end of its connection.
-        let (receiver, _) = stalled.swap_remove(0);
-        within(receiver.closed()).await;
+        // Without the signals that they don't take, which hold their connections up, the receivers
+        // read on, to the ends of their connections.
+        for (receiver, signals) in stalled {
+            drop(signals);
+            within(receiver.closed()).await;
+        }
 
         bus.finish().await;
     });
@@ -1017,7 +968,7 @@ fn fds_sent_ahead_are_handed_over() {
             .find(|client| client.id == sender_id)
             .expect("The sender wasn't handed over");
         // Its socket, and the file descriptor that it sent ahead.
-        assert_eq!(client.fds.len(), 2);
+        assert_eq!(client.connection.fds().len(), 2);
         let bus = Running::take_over(handover).await;
 
         zruntime::unblock(move || sender.send_for_fd(&destination))
@@ -1093,69 +1044,34 @@ fn client_whose_handshake_ends_while_the_bus_pauses_is_handed_over() {
 
 /// A client still in the middle of its handshake once the time for that is up, as the bus hands
 /// over, gets disconnected then, before it has a name, rather than handed over: the end of its
-/// handshake, with its `Hello` in the same write, while the bus is still handing over, finds it
-/// disconnected, and the next instance knows nothing of it, nor does any other client.
+/// handshake, with its `Hello` in the same write, finds it disconnected, and the next instance
+/// knows nothing of it, nor does any other client.
 #[test]
 #[timeout(30000)]
 fn client_whose_handshake_ends_too_late_is_disconnected() {
     init_tracing();
 
     zruntime::block_on(async {
-        let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
-        bus.set_send_timeout(SHORT_SEND_TIMEOUT + STOP_TIMEOUT);
-        let (bus, address) = serve(bus);
+        let (bus, address) = start().await;
         let watcher = connect(&address).await;
         let mut changes = listen(&watcher, owner_changes_rule()).await;
-        let introspection = watcher
-            .call_method(
-                Some(BUS_NAME),
-                BUS_PATH,
-                Some(INTROSPECTABLE),
-                "Introspect",
-                &(),
-            )
-            .await
-            .unwrap();
-        let calls = calls_to_fill(introspection.data().len());
         let path = socket_path(&address);
-        // The replies of the bus fill the socket of the stalled client up, and the bus waits to
-        // send it the others until it disconnects the client, which holds the hand-over up once
-        // the bus paused its clients.
-        let _stalled = {
-            let path = path.clone();
-            zruntime::unblock(move || {
-                let mut client = BatchClient::connect(&path)?;
-                // Each of a serial of its own, as the bus waits for its replies to all of them.
-                let calls: Vec<_> = (0..calls).map(|_| call_introspect()).collect();
-                client.send(&calls)?;
-
-                Ok::<_, io::Error>(client)
-            })
-            .await
-            .unwrap()
-        };
         let late = zruntime::unblock(move || LateClient::connect(&path))
             .await
             .unwrap();
         // The bus numbers its clients in the order that they connect.
-        let stalled_name = format!(":busd.{}", id_of(&watcher) + 1);
-        let late_name = format!(":busd.{}", id_of(&watcher) + 2);
-        let runtime = SharedRuntime::current().unwrap();
-        runtime.sleep(FILL_UP).await;
+        let late_name = format!(":busd.{}", id_of(&watcher) + 1);
 
         let started = Instant::now();
-        let ending = async {
-            runtime.sleep(STOP_TIMEOUT + PAUSE).await;
-
-            zruntime::unblock(move || late.finish()).await
-        };
-        let (handover, ended) = join(bus.hand_over(), ending).await;
+        let handover = bus.hand_over().await;
         let took = started.elapsed();
         assert!(
-            took > STOP_TIMEOUT + 2 * PAUSE,
-            "The bus handed over after {took:?}, before the client ended its handshake"
+            took >= STOP_TIMEOUT,
+            "The bus handed over after {took:?}, before the time for handshakes was up"
         );
-        let error = ended.expect_err("The bus answered the client");
+        let error = zruntime::unblock(move || late.finish())
+            .await
+            .expect_err("The bus answered the client");
         assert!(
             matches!(
                 error.kind(),
@@ -1165,46 +1081,28 @@ fn client_whose_handshake_ends_too_late_is_disconnected() {
             ),
             "The client wasn't disconnected: {error}"
         );
-        // The stalled client is left out too, as the bus disconnected it.
         let clients: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
         assert_eq!(clients, [id_of(&watcher)]);
         let bus = Running::take_over(handover).await;
 
-        // The next instance cleans up after the stalled client, and tells nothing of the other.
-        let mut stalled_gone = false;
-        while !stalled_gone {
-            let signal = next_message(&mut changes, |msg| is_signal(msg, "NameOwnerChanged")).await;
-            let (name, old_owner, new_owner): (String, String, String) =
-                signal.body().deserialize().unwrap();
-            assert!(
-                ![&name, &old_owner, &new_owner].contains(&&late_name),
-                "The late client changed owners: {name}, from `{old_owner}` to `{new_owner}`"
-            );
-            stalled_gone = name == stalled_name && new_owner.is_empty();
-        }
-        let more = runtime.timeout(
+        // The next instance knows nothing of the client, and tells nothing of it.
+        let owner = DBusProxy::new(&watcher)
+            .await
+            .unwrap()
+            .get_name_owner(late_name.as_str().try_into().unwrap())
+            .await;
+        assert!(owner.is_err(), "The client owns its name: {owner:?}");
+        let more = SharedRuntime::current().unwrap().timeout(
             QUIET,
             next_message(&mut changes, |msg| is_signal(msg, "NameOwnerChanged")),
         );
         if let Ok(signal) = more.await {
-            panic!("Another owner changed: {signal:?}");
+            panic!("An owner changed: {signal:?}");
         }
 
         bus.finish().await;
     });
 }
-
-/// How many calls the stalled client of `client_whose_handshake_ends_too_late_is_disconnected`
-/// makes, whose replies are `reply` bytes each: enough for the replies to fill its socket up, and
-/// [`OVERFLOW`] more, which wait for room.
-fn calls_to_fill(reply: usize) -> usize {
-    send_buffer() as usize / reply + OVERFLOW
-}
-
-/// How many replies wait for room in the socket of that client: fewer than the queues between the
-/// object server of the bus and the socket hold, so that they don't hold up the calls of the client
-/// to the bus, and the bus pauses the client all the same, before the other one ends its handshake.
-const OVERFLOW: usize = 32;
 
 /// How many bytes the socket of a client holds of what the bus sends it, at the most: the default
 /// size of the send buffer of a socket.
@@ -1273,19 +1171,15 @@ async fn emit_chunks(conn: &Connection, member: &str, count: u32) {
     }
 }
 
-/// The signal that the `i`th stalled receiver of `stalled_receivers_hold_a_hand_over_up_once` asks
-/// for.
+/// The signal that the `i`th stalled receiver of `stalled_receivers_are_handed_over` asks for.
 fn stalled_member(i: u32) -> String {
     format!("Stalled{i}")
 }
 
-/// How many receivers of `stalled_receivers_hold_a_hand_over_up_once` stop taking signals, and how
-/// many big signals the sender emits for each: enough to fill the receiver up.
+/// How many receivers of `stalled_receivers_are_handed_over` stop taking signals, and how many big
+/// signals a sender emits for each: enough to fill the receiver up.
 const STALLED: u32 = 3;
 const CHUNKS_EACH: u32 = 5;
-
-/// The time limit of the bus to send, in that test.
-const SHORT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Collect the sequence numbers of the signals that `send_ticks` sends, as they come out of
 /// `signals`, and count the ones that came in `received`. There must be no more than [`TICKS`].
@@ -1338,9 +1232,10 @@ async fn send_ticks(sender: Connection, ticks: Range<u32>, padding: usize) -> zb
 /// How many signals `traffic_in_flight` has the bus pass on.
 const TICKS: u32 = 5000;
 
-/// How many signals `hand_over_waits_for_a_slow_receiver` has the bus pass on, and how big they
-/// are: more than a receiver that doesn't take any holds, and not so many that the bus can't read
-/// them all. The receiver takes a few of them, and the bus passes on a few more after it took over.
+/// How many signals `hand_over_does_not_wait_for_a_slow_receiver` has the bus pass on, and how big
+/// they are: more than a receiver that doesn't take any holds, and not so many that the bus can't
+/// read them all. The receiver takes a few of them, and the bus passes on a few more after it took
+/// over.
 const CHUNKS: u32 = 30;
 const CHUNK: usize = 256 * 1024;
 const TAKEN: u32 = 3;
@@ -1695,15 +1590,6 @@ where
         .unwrap()
 }
 
-/// A call to `Introspect` of the bus, whose reply is among the longest that the bus sends.
-fn call_introspect() -> Message {
-    Message::method_call(BUS_PATH, "Introspect")
-        .destination(BUS_NAME)
-        .interface(INTROSPECTABLE)
-        .build(&())
-        .unwrap()
-}
-
 /// Have `conn` ask the bus for the signals that match `rule`, and return the messages that `conn`
 /// gets from then on.
 ///
@@ -1953,10 +1839,9 @@ const INTERFACE: &str = "org.zbus.Handover";
 /// The name that the client of `client_leaves` owns.
 const LEAVER: &str = "org.zbus.Handover.Leaver";
 
-/// The name, interface and path of the bus, and the interface that it introspects itself with.
+/// The name, interface and path of the bus.
 const BUS_NAME: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";
-const INTROSPECTABLE: &str = "org.freedesktop.DBus.Introspectable";
 
 /// How long a test waits for what should come soon, such as a message that is on its way.
 const WAIT: Duration = Duration::from_secs(10);
@@ -1968,8 +1853,8 @@ const QUIET: Duration = Duration::from_millis(200);
 /// while.
 const LONG_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long `hand_over_waits_for_a_slow_receiver` gives the bus to fill up the receiver, and how
-/// long it has the receiver hold the bus up after that.
+/// How long the tests give the bus to fill up a receiver that doesn't take what the bus sends it,
+/// and how long they give a bus that waits for a handshake as it hands over to be done, at least.
 const FILL_UP: Duration = Duration::from_millis(100);
 const PAUSE: Duration = Duration::from_millis(400);
 
