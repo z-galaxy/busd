@@ -34,10 +34,16 @@ the emitter its signals, so that the rounds time the bus rather than the buildin
 | `signal/burst-to-1` | 1000 signals with 1 KiB of data, back to back, to one subscriber |
 | `signal/broadcast-to-20` | 100 such signals to each of 20 subscribers |
 | `connection/hello` | a client connects, authenticates and says `Hello`, then goes |
+| `handover/in-process/100-clients` | the bus hands 100 clients over to its next instance |
+| `handover/fdstore/100-clients` | the same, through the fdstore of a fake systemd |
 
 Each client calls a service of its own, at a well-known name, but for those of
 `method-call/100-clients`, which are called at the unique names of their connections, and those of
 `method-call/100-callers-1-connection`, which share one.
+
+The ids of `handover/`, on Linux alone, time a restart of the bus a round instead, from the bus
+being stopped until its next instance is ready to serve, with clients that keep their connections
+throughout, idle. After their rounds, they check, untimed, that the bus still serves every client.
 
 CodSpeed measures them by the clock, on a bare-metal machine of 16 cores, for every push to `main`
 and every pull request but those of releases, and reports how a pull request changes them

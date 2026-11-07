@@ -28,6 +28,18 @@
 //! - `signal/broadcast-to-20`: a broadcast of such signals to 20 subscribers, so that the bus
 //!   delivers 20 times as many signals as it is sent.
 //! - `connection/hello`: a client connects, authenticates and says `Hello`, and goes again.
+//! - `handover/in-process/100-clients`: the bus hands its 100 clients, which keep their connections
+//!   idle, over to its next instance in this process (`Bus::hand_over`), which takes them over
+//!   (`Bus::take_over`), as a program that restarts a bus of its own would.
+//! - `handover/fdstore/100-clients`: the same through the file descriptor store of systemd, as busd
+//!   restarts under systemd: the bus stores its state and the connections of its clients there
+//!   (`Bus::hand_over_to_systemd`), and the next instance takes them out (`Bus::for_systemd`). A
+//!   fake systemd, on a thread of its own, keeps what is stored, as systemd does.
+//!
+//! The ids of `handover/` time restarts of the bus, each from the bus being stopped until the next
+//! instance is ready to serve, on Linux, the one system that the bus hands over on. They check,
+//! untimed, that the bus still serves every client after them, as the next instance of a bus that
+//! failed to take a client over would start without it, faster.
 //!
 //! The ids keep the numbers of clients of `benches/compare`, but not its threads: where that has a
 //! thread for each client and each service, here up to `THREADS` threads share them, so that every
@@ -37,6 +49,7 @@
 use std::{
     future::Future,
     num::NonZeroUsize,
+    path::PathBuf,
     pin::pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -45,8 +58,16 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use std::{
+    io::IoSliceMut,
+    mem::{self, MaybeUninit},
+    os::{fd::OwnedFd, unix::net::UnixDatagram},
+};
 
 use busd::bus::Bus;
+#[cfg(target_os = "linux")]
+use busd::systemd::Notifier;
 use calls::Caller;
 use cpus::{Cpu, Cpus};
 use crew::{AbortOnPanic, Crew, Member, Rounds};
@@ -55,6 +76,11 @@ use criterion::{
 };
 use futures_util::future::{join_all, select, try_join_all, Either};
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+#[cfg(target_os = "linux")]
+use rustix::{
+    cmsg_space,
+    net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags},
+};
 use shared::SharedConnection;
 use zbus::{connection, names::BusName};
 use zruntime::{mpmc, SharedRuntime};
@@ -70,6 +96,9 @@ mod shared;
 #[path = "common/signals.rs"]
 mod signals;
 
+#[cfg(target_os = "linux")]
+criterion_group!(benches, method_calls, signals, connections, handovers);
+#[cfg(not(target_os = "linux"))]
 criterion_group!(benches, method_calls, signals, connections);
 criterion_main!(benches);
 
@@ -151,6 +180,49 @@ fn connections(c: &mut Criterion) {
         })
     });
     group.finish();
+}
+
+/// Benchmarks the bus handing its clients over to its next instance: the ids of `handover/`.
+#[cfg(target_os = "linux")]
+fn handovers(c: &mut Criterion) {
+    // The bus hands over through the store only if the store takes enough file descriptors, which
+    // systemd tells it in the environment. Nothing else runs in this process by now, which could
+    // read the environment meanwhile.
+    std::env::set_var("FDSTORE", FD_STORE_MAX.to_string());
+    raise_open_files_limit();
+    let mut group = c.benchmark_group("handover");
+    restarts(
+        &mut group,
+        "in-process/100-clients",
+        Restart::InProcess,
+        100,
+    );
+    restarts(&mut group, "fdstore/100-clients", Restart::FdStore, 100);
+    group.finish();
+}
+
+/// How many file descriptors the store of the fake systemd takes, as `FileDescriptorStoreMax=`
+/// does for busd's service in the README.
+#[cfg(target_os = "linux")]
+const FD_STORE_MAX: usize = 4096;
+
+/// Benchmarks the bus restarting, as `how` says, with `clients` clients that keep their
+/// connections throughout, idle: one restart a round.
+#[cfg(target_os = "linux")]
+fn restarts(group: &mut BenchmarkGroup<'_, WallTime>, id: &str, how: Restart, clients: usize) {
+    let mut seats = Seats::new();
+    let bus = RestartingBus::start(how, seats.take(), seats.take());
+    let idle = IdleClients::connect(&bus.address, clients, seats.take());
+
+    group.throughput(Throughput::Elements(clients as u64));
+    group.bench_function(id, |b| {
+        b.iter_custom(|iters| {
+            let took = bus.restart(iters);
+            idle.check();
+
+            took
+        })
+    });
 }
 
 /// Raises the soft limit of open files of the process to `OPEN_FILES`, or to the hard limit where
@@ -474,13 +546,7 @@ impl BusThread {
     /// Starts a bus on a thread pinned to `cpu`, and waits until it listens, on a socket of its
     /// own in the directory for temporary files.
     fn start(cpu: Option<Cpu>) -> Self {
-        static STARTED: AtomicUsize = AtomicUsize::new(0);
-        let n = STARTED.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("busd-bench-{}-{n}", std::process::id()));
-        // A benchmark that failed ended its process at once, without removing the socket of its
-        // bus, which would keep a later process that gets the same pid from listening there.
-        let _ = std::fs::remove_file(&path);
-        let address = format!("unix:path={}", path.display());
+        let address = bus_address();
         let (stop, stopped) = mpmc::unbounded::<()>();
         let (listening, listens) = mpsc::channel();
         let bus_address = address.clone();
@@ -625,4 +691,355 @@ async fn serve(
         }
     });
     join_all(serving).await;
+}
+
+/// The address of a unix socket of its own for a bus of the benchmark.
+fn bus_address() -> String {
+    format!("unix:path={}", socket_path("bus").display())
+}
+
+/// A path of its own for a unix socket of the benchmark, for `what`, in the directory for temporary
+/// files.
+fn socket_path(what: &str) -> PathBuf {
+    static MADE: AtomicUsize = AtomicUsize::new(0);
+    let n = MADE.fetch_add(1, Ordering::Relaxed);
+    let name = format!("busd-bench-{what}-{}-{n}", std::process::id());
+    let path = std::env::temp_dir().join(name);
+    // A benchmark that failed ended its process at once, without removing its sockets, which would
+    // keep a later process that gets the same pid from binding one there.
+    let _ = std::fs::remove_file(&path);
+
+    path
+}
+
+/// How the bus restarts in the ids of `handover/`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Restart {
+    /// In this process: `Bus::hand_over`, then `Bus::take_over`.
+    InProcess,
+    /// Through the file descriptor store of a fake systemd: `Bus::hand_over_to_systemd`, then
+    /// `Bus::for_systemd`.
+    FdStore,
+}
+
+/// A bus, on a thread of its own, that serves the connections of an id, and restarts when asked
+/// to, until this is dropped.
+#[cfg(target_os = "linux")]
+struct RestartingBus {
+    /// The address that the clients connect to.
+    address: String,
+    /// What asks the bus to restart a number of times in a row, with where to say how long that
+    /// took, and stops the bus, by closing the channel once it is dropped.
+    requests: Option<mpmc::Sender<(u64, mpsc::Sender<Duration>)>>,
+    /// The thread of the bus, joined once this is dropped.
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl RestartingBus {
+    /// Starts a bus on a thread pinned to `cpu`, which restarts as `how` says, through a fake
+    /// systemd on a thread pinned to `systemd_cpu` for [`Restart::FdStore`], and waits until it
+    /// listens.
+    fn start(how: Restart, cpu: Option<Cpu>, systemd_cpu: Option<Cpu>) -> Self {
+        let address = bus_address();
+        let (requests, requested) = mpmc::unbounded::<(u64, mpsc::Sender<Duration>)>();
+        let (listening, listens) = mpsc::channel();
+        let bus_address = address.clone();
+        let thread = thread::spawn(move || {
+            let _abort = AbortOnPanic;
+            let _pinned = cpu.map(Cpu::pin);
+            let systemd = match how {
+                Restart::InProcess => None,
+                Restart::FdStore => Some(FakeSystemd::start(systemd_cpu)),
+            };
+            zruntime::block_on(async move {
+                let mut bus = Bus::for_address(Some(&bus_address)).await.expect("a bus");
+                listening
+                    .send(())
+                    .expect("the thread that started the bus waits for it");
+                loop {
+                    let request = {
+                        let running = pin!(bus.run());
+                        let requested = pin!(requested.recv());
+                        match select(running, requested).await {
+                            Either::Left((ran, _)) => {
+                                panic!("the bus stopped before it was asked to: {ran:?}")
+                            }
+                            Either::Right((request, _)) => request,
+                        }
+                    };
+                    // The channel closes once the bus is to stop.
+                    let Ok((times, took)) = request else {
+                        break;
+                    };
+                    let started = Instant::now();
+                    for _ in 0..times {
+                        bus = match &systemd {
+                            None => restart_in_process(bus).await,
+                            Some(systemd) => restart_through(systemd, bus, &bus_address).await,
+                        };
+                    }
+                    took.send(started.elapsed())
+                        .expect("the thread that asked for the restarts waits for them");
+                }
+                bus.cleanup()
+                    .await
+                    .expect("the socket of the bus is removed");
+            });
+        });
+        listens.recv().expect("the bus listens");
+
+        Self {
+            address,
+            requests: Some(requests),
+            thread: Some(thread),
+        }
+    }
+
+    /// Has the bus restart `times` times in a row, and gives how long that took.
+    fn restart(&self, times: u64) -> Duration {
+        let (took, takes) = mpsc::channel();
+        self.requests
+            .as_ref()
+            .expect("the bus runs until this is dropped")
+            .try_send((times, took))
+            .expect("the bus takes requests");
+
+        takes
+            .recv()
+            .expect("the bus says how long the restarts took")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RestartingBus {
+    fn drop(&mut self) {
+        drop(self.requests.take());
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("the thread of the bus aborts the process on a panic");
+        }
+    }
+}
+
+/// The next instance of `bus`, which takes its clients over in this process.
+#[cfg(target_os = "linux")]
+async fn restart_in_process(bus: Bus) -> Bus {
+    let handover = bus.hand_over().await.expect("the bus hands over");
+
+    Bus::take_over(handover, None)
+        .await
+        .expect("the next instance takes over")
+}
+
+/// The next instance of `bus`, which takes its clients over through the store of `systemd`, at
+/// `address`, as busd does at the address that it is told.
+#[cfg(target_os = "linux")]
+async fn restart_through(systemd: &FakeSystemd, bus: Bus, address: &str) -> Bus {
+    bus.hand_over_to_systemd(&systemd.notifier, None)
+        .await
+        .expect("the bus hands over");
+    let stored = systemd.stored();
+
+    Bus::for_systemd(stored, None, Some(address))
+        .await
+        .expect("the next instance starts")
+}
+
+/// A fake systemd, on a thread of its own, that keeps what a bus stores in the file descriptor
+/// store, as systemd does, and passes it to the next instance of the bus: what the bus stored up to
+/// the barrier that it sends once it stored all.
+#[cfg(target_os = "linux")]
+struct FakeSystemd {
+    /// What the bus sends its notifications to the fake with.
+    notifier: Notifier,
+    /// What the bus stored up to each of its barriers, in turn.
+    stored: mpsc::Receiver<Vec<(String, OwnedFd)>>,
+    /// The path of the notification socket, removed once this is dropped.
+    path: PathBuf,
+    /// The thread of the fake, joined once this is dropped.
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl FakeSystemd {
+    /// Starts a fake systemd on a thread pinned to `cpu`, with a notification socket of its own.
+    fn start(cpu: Option<Cpu>) -> Self {
+        let path = socket_path("systemd");
+        let socket = UnixDatagram::bind(&path).expect("the notification socket");
+        let notifier = Notifier::new(&path).expect("a notifier of the fake systemd");
+        let (storing, stored) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let _abort = AbortOnPanic;
+            let _pinned = cpu.map(Cpu::pin);
+            let mut store = Vec::new();
+            loop {
+                // The file descriptors that come with a notification close at the end of the turn,
+                // unless they are stored: the bus goes on from its barrier once the pipe that comes
+                // with it closes, after what it stored is passed on.
+                let (state, fds) = receive(&socket);
+                if let Some(name) = state.strip_prefix("FDSTORE=1\nFDPOLL=0\nFDNAME=") {
+                    store.extend(fds.into_iter().map(|fd| (name.to_owned(), fd)));
+                } else if let Some(name) = state.strip_prefix("FDSTOREREMOVE=1\nFDNAME=") {
+                    store.retain(|(stored, _)| stored != name);
+                } else if state == "BARRIER=1" {
+                    storing
+                        .send(mem::take(&mut store))
+                        .expect("the bus waits for what it stored");
+                } else if state == STOP_FAKE_SYSTEMD {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            notifier,
+            stored,
+            path,
+            thread: Some(thread),
+        }
+    }
+
+    /// What the bus stored as it handed over.
+    fn stored(&self) -> Vec<(String, OwnedFd)> {
+        self.stored
+            .recv()
+            .expect("the fake systemd passes on what the bus stored")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FakeSystemd {
+    fn drop(&mut self) {
+        // The fake waits for notifications, and ends with this one.
+        self.notifier
+            .notify(STOP_FAKE_SYSTEMD)
+            .expect("the fake systemd takes notifications");
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("the thread of the fake systemd aborts the process on a panic");
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// What ends the fake systemd, which systemd knows nothing of.
+#[cfg(target_os = "linux")]
+const STOP_FAKE_SYSTEMD: &str = "X_BENCH_STOP=1";
+
+/// The next notification that `socket` gets, with the file descriptors that came with it.
+#[cfg(target_os = "linux")]
+fn receive(socket: &UnixDatagram) -> (String, Vec<OwnedFd>) {
+    // The bus sends one file descriptor with each, and a few bytes.
+    let mut state = [0; 4096];
+    let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(4))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let received = recvmsg(
+        socket,
+        &mut [IoSliceMut::new(&mut state)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC,
+    )
+    .expect("a notification");
+    assert!(
+        !received
+            .flags
+            .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC),
+        "a notification of the bus is too large for the fake systemd"
+    );
+    let fds = control
+        .drain()
+        .filter_map(|message| match message {
+            RecvAncillaryMessage::ScmRights(fds) => Some(fds),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let state = String::from_utf8_lossy(&state[..received.bytes]).into_owned();
+
+    (state, fds)
+}
+
+/// Clients of a bus, on a thread of their own, that keep their connections, idle, until this is
+/// dropped, and check when asked that the bus still serves each of them.
+#[cfg(target_os = "linux")]
+struct IdleClients {
+    /// What asks the clients to check, with where to say that they did, and lets them go, by
+    /// closing the channel once it is dropped.
+    checks: Option<mpmc::Sender<mpsc::Sender<()>>>,
+    /// The thread of the clients, joined once this is dropped.
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl IdleClients {
+    /// Connects `count` clients to the bus at `address`, on a thread pinned to `cpu`, and waits
+    /// until all of them are connected.
+    fn connect(address: &str, count: usize, cpu: Option<Cpu>) -> Self {
+        let (checks, checking) = mpmc::unbounded::<mpsc::Sender<()>>();
+        let (connected, connects) = mpsc::channel();
+        let address = address.to_owned();
+        let thread = thread::spawn(move || {
+            let _abort = AbortOnPanic;
+            let _pinned = cpu.map(Cpu::pin);
+            zruntime::block_on(async move {
+                let connecting =
+                    (0..count).map(|_| connection::Builder::address(address.as_str()).build());
+                let clients = try_join_all(connecting).await.expect("the clients connect");
+                connected
+                    .send(())
+                    .expect("the thread that connects the clients waits for them");
+                while let Ok(checked) = checking.recv().await {
+                    // The bus answers a call only on a connection that it serves.
+                    let calling = clients.iter().map(|client| {
+                        client.call_method(
+                            Some("org.freedesktop.DBus"),
+                            "/org/freedesktop/DBus",
+                            Some("org.freedesktop.DBus"),
+                            "GetId",
+                            &(),
+                        )
+                    });
+                    within_limit(try_join_all(calling))
+                        .await
+                        .expect("the bus serves every client on");
+                    checked
+                        .send(())
+                        .expect("the thread that asked for the check waits for it");
+                }
+            });
+        });
+        connects.recv().expect("the clients connect");
+
+        Self {
+            checks: Some(checks),
+            thread: Some(thread),
+        }
+    }
+
+    /// Checks that the bus still serves every client.
+    fn check(&self) {
+        let (checked, checks) = mpsc::channel();
+        self.checks
+            .as_ref()
+            .expect("the clients wait until this is dropped")
+            .try_send(checked)
+            .expect("the clients take checks");
+        checks.recv().expect("the clients check");
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IdleClients {
+    fn drop(&mut self) {
+        drop(self.checks.take());
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("the thread of the clients aborts the process on a panic");
+        }
+    }
 }
