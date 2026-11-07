@@ -686,9 +686,10 @@ const CLIENT: &str = "busd-client-";
 /// How long the bus may take to hand over, before busd gives up on it, and its clients get
 /// disconnected as it goes.
 ///
-/// The bus gives each client as long as it has to take a message, `SEND_TIMEOUT`, 10 s, from when
-/// the hand-over starts, to take all that the bus sends it meanwhile, so a client that doesn't read
-/// holds the hand-over up for no longer than that. This is longer, with room for the rest of the
+/// The bus doesn't wait for its clients to take what it sends them as it hands over, but it gives
+/// the hand-over of the connection of a client, which nothing should hold up, as long as the client
+/// has to take a message, `SEND_TIMEOUT`, 10 s, before it gives up on it, as it gives a client to
+/// take what the instance before it left unwritten. This is longer, with room for the rest of the
 /// hand-over, and well within the 90 s that systemd gives a service to stop by default.
 const HAND_OVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long busd waits for the service manager to deal with what busd sent it, before it goes on
