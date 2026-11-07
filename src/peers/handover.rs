@@ -5,7 +5,6 @@ use std::{
     future::Future,
     iter,
     num::NonZeroU32,
-    os::fd::OwnedFd,
     pin::pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -204,13 +203,14 @@ impl Peers {
             names,
         };
         let mut handed_over = Vec::new();
-        for (client, handover) in clients.into_iter().zip(handovers) {
-            let mut state = client.state;
-            if let Some((connection, fds)) = handover {
-                *state.connection() = connection;
-                handed_over.push(ClientHandover { id: client.id, fds });
+        for (client, connection) in clients.into_iter().zip(handovers) {
+            if let Some(connection) = connection {
+                handed_over.push(ClientHandover {
+                    id: client.id,
+                    connection,
+                });
             }
-            match state {
+            match client.state {
                 ClientState::Peer(state) => snapshot.peers.push(state),
                 ClientState::Monitor(state) => snapshot.monitors.push(state),
             }
@@ -249,10 +249,10 @@ impl Peers {
     /// Serve the peers and monitors of `snapshot` on the connections of `clients`, and give the
     /// peers their names, as the instance of the bus that handed them over did.
     ///
-    /// The peers and the monitors whose sockets are missing are gone, as when the service manager
-    /// didn't take their sockets, or let go of them, so the bus cleans up after them as after any
-    /// peer that goes, and after those whose connections it fails to serve as well, such as those
-    /// that lack file descriptors that they sent. It fails, if at all, before it serves any client.
+    /// The peers and the monitors whose connections are missing are gone, as when the service
+    /// manager didn't take their sockets, or let go of them, so the bus cleans up after them as
+    /// after any peer that goes, and after those whose connections it fails to serve as well. It
+    /// fails, if at all, before it serves any client.
     pub(crate) async fn restore(
         self: &Arc<Self>,
         snapshot: Snapshot,
@@ -278,17 +278,13 @@ impl Peers {
 
                 continue;
             };
-            let handed_over = async {
-                let client = HandedOver {
-                    id,
-                    handover: Handover::decode(&state.connection, client.fds)?,
-                    greeted: state.greeted,
-                    match_rules: state.match_rules,
-                };
-
-                Peer::handed_over(client, send_timeout, &self.users).await
+            let client = HandedOver {
+                id,
+                handover: client.connection,
+                greeted: state.greeted,
+                match_rules: state.match_rules,
             };
-            match handed_over.await {
+            match Peer::handed_over(client, send_timeout, &self.users).await {
                 Ok((peer, stream)) => restored.push((peer, stream, records)),
                 Err(e) => {
                     warn!("Disconnecting `{unique_name}`, as serving it failed: {e}");
@@ -302,17 +298,13 @@ impl Peers {
             let Some(client) = clients.remove(&id) else {
                 continue;
             };
-            let handed_over = async {
-                let client = HandedOver {
-                    id,
-                    handover: Handover::decode(&state.connection, client.fds)?,
-                    greeted: true,
-                    match_rules: Default::default(),
-                };
-
-                Peer::handed_over(client, send_timeout, &self.users).await
+            let client = HandedOver {
+                id,
+                handover: client.connection,
+                greeted: true,
+                match_rules: Default::default(),
             };
-            match handed_over.await {
+            match Peer::handed_over(client, send_timeout, &self.users).await {
                 Ok((peer, stream)) => {
                     let monitor = peer.become_monitor(state.match_rules);
                     restored_monitors.push((monitor, stream.into_inner()));
@@ -570,14 +562,14 @@ struct Client {
 
 impl Client {
     /// Hand the connection of the client over, through the stream of its messages, within the time
-    /// that the client has to take a message, and encode it: none if that fails, or takes longer.
+    /// that the client has to take a message: none if that fails, or takes longer.
     ///
     /// A client whose connection ended as the client closed its end, such as once it sent a last
     /// message, is handed over all the same, with what zbus read of it, which the next instance
     /// passes on before it cleans up after the client. A client that the bus is disconnecting
     /// isn't handed over. One whose connection fails to be handed over gets closed, and so does one
     /// whose hand-over takes too long.
-    async fn hand_over(&mut self, runtime: &SharedRuntime) -> Option<(Vec<u8>, Vec<OwnedFd>)> {
+    async fn hand_over(&mut self, runtime: &SharedRuntime) -> Option<Handover> {
         let name = self.recipient.unique_name()?;
         if self.recipient.disconnecting() {
             debug!("Leaving `{name}` out of the hand-over, as the bus is disconnecting it");
@@ -586,9 +578,8 @@ impl Client {
         }
         let stream = self.stream.as_mut()?;
         let timeout = self.recipient.send_timeout()?;
-        let handing_over = async { stream.hand_over().await?.encode() };
-        let error = match runtime.timeout(timeout, handing_over).await {
-            Ok(Ok(encoded)) => return Some(encoded),
+        let error = match runtime.timeout(timeout, stream.hand_over()).await {
+            Ok(Ok(handover)) => return Some(handover),
             Ok(Err(e)) => e.to_string(),
             Err(_) => "it took too long".to_owned(),
         };
@@ -611,20 +602,10 @@ impl Client {
     }
 }
 
-/// What the bus hands over of a client, but for the file descriptors of its connection.
+/// What the state of the bus holds of a client, as the bus hands it over.
 enum ClientState {
     Peer(PeerState),
     Monitor(MonitorState),
-}
-
-impl ClientState {
-    /// What the bus hands over of the connection of the client: its hand-over, as zbus encodes it.
-    fn connection(&mut self) -> &mut Vec<u8> {
-        match self {
-            Self::Peer(state) => &mut state.connection,
-            Self::Monitor(state) => &mut state.connection,
-        }
-    }
 }
 
 /// The records of the calls that wait on a peer, as the bus hands them over, `records`: the number

@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use zbus::{
     address::Transport,
+    connection,
     names::{OwnedUniqueName, OwnedWellKnownName},
     wire::{serialized, to_bytes, LE},
     Address, OwnedGuid, Type,
@@ -70,7 +71,7 @@ impl Bus {
         );
 
         Ok(Handover {
-            state: state.encode()?,
+            state,
             listener,
             clients,
         })
@@ -81,15 +82,14 @@ impl Bus {
     /// The bus listens on `listener`, if given one, such as the socket that systemd's socket
     /// activation passes, or else on the socket of `handover`. It serves the clients of `handover`
     /// as their bus did, with their unique names, names, match rules and calls that wait for their
-    /// replies, from where their bus left them. Those whose sockets are missing went meanwhile, so
-    /// the bus cleans up after them as after any client that goes, as it does after those that
-    /// lack file descriptors that came with the messages that their bus didn't take.
+    /// replies, from where their bus left them. Those whose connections `handover` lacks went
+    /// meanwhile, so the bus cleans up after them as after any client that goes.
     ///
     /// The settings of the bus, such as [`Bus::set_max_objects_per_user`], are those of a new bus,
     /// and apply to the clients that it took over too, once set on the returned bus. The objects
     /// that it took over count, even beyond a maximum that is lower than the previous one.
     pub async fn take_over(handover: Handover, listener: Option<OwnedFd>) -> Result<Self> {
-        let state = State::decode(&handover.state)?;
+        let state = handover.state;
         let (listener, bound) = match (listener, handover.listener) {
             (Some(listener), _) => (listener, false),
             (None, Some(listener)) => (listener, true),
@@ -127,8 +127,8 @@ impl Bus {
 /// replies. The clients notice nothing but a pause.
 #[derive(Debug)]
 pub struct Handover {
-    /// The state of the bus, encoded: its GUID, and its peers, monitors and names.
-    pub state: Vec<u8>,
+    /// The state of the bus: its GUID, and its peers, monitors and names.
+    pub(crate) state: State,
     /// The socket that the bus listened on, unless it was given one, as by systemd's socket
     /// activation, which then gives the next instance the socket too.
     pub listener: Option<OwnedFd>,
@@ -136,18 +136,16 @@ pub struct Handover {
     pub clients: Vec<ClientHandover>,
 }
 
-/// What a bus hands over of a client, besides what the state of the bus holds of it: the file
-/// descriptors of its connection.
+/// What a bus hands over of a client, besides what the state of the bus holds of it: its
+/// connection.
 #[derive(Debug)]
 pub struct ClientHandover {
     /// The number of the client, which its unique name carries.
     pub id: usize,
-    /// The socket of the client, followed by the file descriptors that came with the messages
-    /// that the bus didn't take, in their order: the next instance passes them on with those.
-    ///
-    /// They are those of the hand-over of the connection, as zbus encodes it
-    /// ([`zbus::connection::Handover::encode`]), in its order.
-    pub fds: Vec<OwnedFd>,
+    /// The hand-over of the connection of the client: its socket, with what zbus read of the
+    /// client and the bus didn't take, and the file descriptors that came with that, which the
+    /// next instance passes on.
+    pub connection: connection::Handover,
 }
 
 /// How long a client in the middle of its handshake has to finish that as the bus hands over,
@@ -169,7 +167,7 @@ pub(crate) struct Snapshot {
 
 /// The state of a bus, as it hands it over.
 #[derive(Debug, Deserialize, Serialize, Type)]
-struct State {
+pub(crate) struct State {
     /// The GUID of the bus, which its clients know it by.
     guid: OwnedGuid,
     /// The number of the last client that connected.
@@ -180,15 +178,31 @@ struct State {
 }
 
 impl State {
-    /// The state, encoded in the D-Bus wire format, after the version of its encoding.
-    fn encode(&self) -> Result<Vec<u8>> {
+    /// The records of the hand-overs of the connections of the clients, each with the number of
+    /// its client: those of the peers, then those of the monitors.
+    pub(crate) fn connections_mut(&mut self) -> impl Iterator<Item = (u64, &mut Vec<u8>)> {
+        let peers = self
+            .peers
+            .iter_mut()
+            .map(|peer| (peer.id, &mut peer.connection));
+        let monitors = self
+            .monitors
+            .iter_mut()
+            .map(|monitor| (monitor.id, &mut monitor.connection));
+
+        peers.chain(monitors)
+    }
+
+    /// The state, encoded in the D-Bus wire format, after the version of its encoding, as the bus
+    /// passes it on to its next instance in another process.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         let data = to_bytes(serialized::Context::new(LE, 0), &(VERSION, self))?;
 
         Ok(data.bytes().to_vec())
     }
 
     /// The state that `bytes` encode, as [`State::encode`] encodes it.
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let data = serialized::Data::new(bytes, serialized::Context::new(LE, 0));
         let (version, _) = data
             .deserialize::<u32>()
@@ -211,8 +225,9 @@ pub(crate) struct PeerState {
     pub(crate) id: u64,
     /// Whether the peer called `Hello`.
     pub(crate) greeted: bool,
-    /// The hand-over of the connection of the peer, as zbus encodes it, but for its file
-    /// descriptors, which go apart: see [`ClientHandover`]. It is empty for a peer that the bus
+    /// The record of the hand-over of the connection of the peer, as zbus saves it
+    /// ([`connection::Handover::save`]), for a next instance in another process, which gets the
+    /// file descriptors of the connection apart. It is empty otherwise, as for a peer that the bus
     /// left out of the hand-over.
     pub(crate) connection: Vec<u8>,
     pub(crate) match_rules: MatchRules,
@@ -226,7 +241,8 @@ pub(crate) struct PeerState {
 pub(crate) struct MonitorState {
     /// The number of the peer that became the monitor.
     pub(crate) id: u64,
-    /// The hand-over of the connection of the monitor, as for a peer: see [`PeerState`].
+    /// The record of the hand-over of the connection of the monitor, as for a peer: see
+    /// [`PeerState`].
     pub(crate) connection: Vec<u8>,
     pub(crate) match_rules: MatchRules,
 }
@@ -276,12 +292,39 @@ mod tests {
             }],
         };
 
-        let decoded = State::decode(&state.encode().unwrap()).unwrap();
+        let encoded = state.encode().unwrap();
+        let decoded = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
 
-        let mut other = state.encode().unwrap();
+        let mut other = encoded.clone();
         other[0] = 1;
         let error = State::decode(&other).unwrap_err();
         assert!(error.to_string().contains("version 1"), "{error}");
+    }
+
+    /// A bus doesn't take over from a state that it can't decode, rather than panic: garbage, the
+    /// state of a version that it doesn't know, and one of the right version that is cut short, or
+    /// whose body is spoiled.
+    #[test]
+    fn undecodable_states_are_refused() {
+        let state = State {
+            guid: zbus::Guid::generate().into(),
+            last_id: 1,
+            peers: Vec::new(),
+            monitors: Vec::new(),
+            names: Vec::new(),
+        };
+        let encoded = state.encode().unwrap();
+        let spoils: [fn(&mut Vec<u8>); 4] = [
+            |state| *state = b"not a state".to_vec(),
+            |state| state[0] += 1,
+            |state| state.truncate(4 + 6),
+            |state| state[4..16].fill(0xff),
+        ];
+        for spoil in spoils {
+            let mut spoiled = encoded.clone();
+            spoil(&mut spoiled);
+            assert!(State::decode(&spoiled).is_err(), "{spoiled:?}");
+        }
     }
 }

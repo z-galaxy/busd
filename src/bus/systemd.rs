@@ -3,8 +3,8 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    fmt,
-    os::fd::{AsFd, OwnedFd},
+    fmt, mem,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     str::FromStr,
     time::Duration,
 };
@@ -16,11 +16,11 @@ use rustix::{
 };
 use zbus::{
     address::{transport::UnixSocket, Transport},
-    Address,
+    connection, Address,
 };
 use zruntime::SharedRuntime;
 
-use super::{Bus, ClientHandover, Handover};
+use super::{handover::State, Bus, ClientHandover, Handover};
 use crate::{
     debug, error, info,
     systemd::{self, Notifier},
@@ -267,54 +267,65 @@ impl Bus {
 
 impl Handover {
     /// What the previous instance of the bus handed over, out of what it stored, `stored`, with the
-    /// names that it stored each under, if it stored its state.
+    /// names that it stored each under, if it stored its state, and the state can be decoded.
     ///
-    /// Each client gets the file descriptors of its connection back in the order that they were
-    /// stored in, its socket first, whatever the order that systemd passes them in, and the
-    /// place-holder of a duplicate gets the client a duplicate of the file descriptor that it says,
-    /// in its place, which may be one of another client. Those of a client whose socket is missing
-    /// close, as do those under names that busd doesn't store any under, as ones that a version of
-    /// busd that named them otherwise stored. Without the state, they all close.
+    /// Each client of the state gets its connection back from the record of its connection, which
+    /// the state holds, and the file descriptors of the connection, as [`StoredFds::new`] gives
+    /// them. One whose socket is missing is gone, and so is one whose connection can't be restored,
+    /// as when a file descriptor of it is missing: the next instance cleans up after them as after
+    /// any client that goes. Without the state, or if it can't be decoded, all of the file
+    /// descriptors close, which disconnects the clients.
     fn from_stored(stored: Vec<(String, OwnedFd)>) -> Option<Self> {
-        let mut state = None;
-        let mut listener = None;
-        let mut client_fds = HashMap::<_, Vec<_>>::new();
-        let mut duplicates = Vec::new();
-        for (name, fd) in stored {
-            match name.parse() {
-                Ok(Stored::State) => match systemd::read_memfd(fd.as_fd()) {
-                    Ok(bytes) => state = Some(bytes),
-                    Err(e) => warn!("Failed to read the state of the bus that was stored: {e}"),
-                },
-                Ok(Stored::Listener) => listener = Some(fd),
-                Ok(Stored::Client((id, n))) => client_fds.entry(id).or_default().push((n, fd)),
-                // What was stored for a duplicate only holds its place.
-                Ok(Stored::Duplicate(place, original)) => duplicates.push((place, original)),
-                Err(_) => warn!("Removing `{name}`, which busd doesn't know, from the store"),
-            }
-        }
-        Self::restore_duplicates(&mut client_fds, duplicates);
-        let clients: Vec<_> = client_fds
-            .into_iter()
-            .filter_map(|(id, mut fds)| {
-                fds.sort_unstable_by_key(|(n, _)| *n);
-                if fds.first().is_none_or(|(n, _)| *n != 0) {
-                    return None;
-                }
-
-                Some(ClientHandover {
-                    id,
-                    fds: fds.into_iter().map(|(_, fd)| fd).collect(),
-                })
-            })
-            .collect();
+        let StoredFds {
+            state,
+            listener,
+            clients: mut client_fds,
+        } = StoredFds::new(stored);
         let Some(state) = state else {
-            if !clients.is_empty() || listener.is_some() {
+            if !client_fds.is_empty() || listener.is_some() {
                 warn!("Dropping the sockets that were stored without the state of the bus");
             }
 
             return None;
         };
+        let state = systemd::read_memfd(state.as_fd())
+            .context("Failed to read the state of the bus that was stored")
+            .and_then(|bytes| State::decode(&bytes));
+        let mut state = match state {
+            Ok(state) => state,
+            Err(e) => {
+                error!(
+                    "Failed to take over from the previous instance of the bus, which disconnects \
+                     its {} clients: {e:#}",
+                    client_fds.len()
+                );
+
+                return None;
+            }
+        };
+        let mut clients = Vec::new();
+        for (id, record) in state.connections_mut() {
+            // The record isn't needed once the connection is restored.
+            let record = mem::take(record);
+            let Ok(id) = usize::try_from(id) else {
+                continue;
+            };
+            let Some(fds) = client_fds.remove(&id) else {
+                continue;
+            };
+            match connection::Handover::restore(&record, fds) {
+                Ok(connection) => clients.push(ClientHandover { id, connection }),
+                Err(e) => {
+                    warn!("Leaving `:busd.{id}` out, as its connection can't be restored: {e}")
+                }
+            }
+        }
+        if !client_fds.is_empty() {
+            warn!(
+                "Closing the sockets of {} clients that the state of the bus doesn't have",
+                client_fds.len()
+            );
+        }
 
         Some(Self {
             state,
@@ -323,55 +334,20 @@ impl Handover {
         })
     }
 
-    /// Keep the clients that fit, in order: in the file descriptor store, which takes `max` file
-    /// descriptors, after the state and the socket that the bus listens on, if any, and among those
-    /// that systemd passes the next instance, which starts with `fd_limit` as its soft limit of
-    /// open file descriptors, if any, with room to spare. busd warns if any don't.
-    ///
-    /// Each client takes the file descriptors of its connection, its socket and those that came
-    /// with the messages that the bus didn't take. One that doesn't fit is left out whole, as the
-    /// next instance couldn't serve it without all of them, while those after it, of fewer file
-    /// descriptors, may still fit.
+    /// Keep the clients that fit, in order, as [`fit`] does.
     fn fit(&mut self, max: usize, fd_limit: Option<u64>) {
-        // The next instance gets the state and the socket to listen on, from the store or from the
-        // socket activation, and then the clients.
-        let in_store = max.saturating_sub(1 + usize::from(self.listener.is_some()));
-        let under_limit = fd_limit
-            .and_then(|limit| usize::try_from(limit).ok())
-            .map_or(usize::MAX, |limit| {
-                limit.saturating_sub(FIRST_PASSED_FD + 2 + SPARE_FDS)
-            });
-        let clients = self.clients.len();
-        let mut room = in_store.min(under_limit);
-        self.clients.retain(|client| {
-            let Some(left) = room.checked_sub(client.fds.len()) else {
-                return false;
-            };
-            room = left;
+        let listener = self.listener.is_some();
 
-            true
+        fit(&mut self.clients, listener, max, fd_limit, |client| {
+            client.connection.fds().len()
         });
-        let fit = self.clients.len();
-        if fit < clients {
-            let why = match fd_limit {
-                Some(limit) if under_limit < in_store => format!(
-                    "systemd only passes the next instance as many file descriptors as its soft \
-                     limit of open file descriptors takes, {limit} as busd started: raise that of \
-                     `LimitNOFILE=`"
-                ),
-                _ => format!(
-                    "the file descriptor store takes {max}: raise `FileDescriptorStoreMax=`"
-                ),
-            };
-            warn!("Handing over {fit} of the {clients} clients, as {why} of the service.");
-        }
     }
 
     /// Store the hand-over in the file descriptor store of systemd, which `notifier` reaches, under
     /// the names that [`Stored`] has: the state, the socket that the bus listened on, if it did,
     /// and the file descriptors of the connections of the clients, a place-holder for each
     /// duplicate. Then wait for systemd to have dealt with them.
-    fn store(&self, notifier: &Notifier) -> Result<()> {
+    fn store(mut self, notifier: &Notifier) -> Result<()> {
         self.store_state(notifier)?;
         if let Some(listener) = &self.listener {
             notifier.store(&Stored::Listener.to_string(), &[listener.as_fd()])?;
@@ -384,11 +360,27 @@ impl Handover {
         Ok(())
     }
 
-    /// Store the state of the bus, in a memfd that closes as this returns: the place-holders of the
-    /// duplicates take its place among the open file descriptors.
-    fn store_state(&self, notifier: &Notifier) -> Result<()> {
+    /// Store the state of the bus, with the record of the connection of each client that it hands
+    /// over, in a memfd that closes as this returns: the place-holders of the duplicates take its
+    /// place among the open file descriptors.
+    fn store_state(&mut self, notifier: &Notifier) -> Result<()> {
+        let connections: HashMap<_, _> = self
+            .clients
+            .iter()
+            .map(|client| (client.id as u64, &client.connection))
+            .collect();
+        for (id, record) in self.state.connections_mut() {
+            let Some(connection) = connections.get(&id) else {
+                continue;
+            };
+            let len = connection
+                .saved_len()
+                .expect("the clients of the bus are on unix sockets");
+            *record = vec![0; len];
+            connection.save(record)?;
+        }
         let name = Stored::State.to_string();
-        let state = systemd::memfd(&name, &self.state)?;
+        let state = systemd::memfd(&name, &self.state.encode()?)?;
         notifier.store(&name, &[state.as_fd()])?;
 
         Ok(())
@@ -397,13 +389,17 @@ impl Handover {
     /// Store the file descriptors of the connections of the clients, each under the place that it
     /// has, a place-holder for each duplicate of one before it, and tell how many.
     fn store_clients(&self, notifier: &Notifier) -> Result<usize> {
-        let duplicates = self.duplicates();
+        let clients = self
+            .clients
+            .iter()
+            .map(|client| (client.id, client.connection.fds()));
+        let duplicates = duplicates(clients);
         let mut stored = 0;
         for client in &self.clients {
-            for (n, fd) in client.fds.iter().enumerate() {
+            for (n, fd) in client.connection.fds().enumerate() {
                 let place = (client.id, n);
                 let Some(&original) = duplicates.get(&place) else {
-                    notifier.store(&Stored::Client(place).to_string(), &[fd.as_fd()])?;
+                    notifier.store(&Stored::Client(place).to_string(), &[fd])?;
 
                     continue;
                 };
@@ -411,47 +407,10 @@ impl Handover {
                 let place_holder = systemd::memfd(&name, &[])?;
                 notifier.store(&name, &[place_holder.as_fd()])?;
             }
-            stored += client.fds.len();
+            stored += client.connection.fds().len();
         }
 
         Ok(stored)
-    }
-
-    /// The duplicates among the file descriptors of the connections of the clients: where each one
-    /// is, and where the file descriptor that it duplicates is.
-    ///
-    /// A duplicate is of the same open file description as a file descriptor before it, which
-    /// systemd stores alone. Only file descriptors of the same file can be of the same open file
-    /// description, so only those are compared, and only the kernel tells whether they are
-    /// ([`systemd::same_file`]). Where it doesn't, they are stored as they are, rather than one
-    /// taken for a duplicate of the other, whose place-holder would get a duplicate of the other in
-    /// its place, sharing its offset. systemd may then take them for the same and store the first
-    /// alone, as it guesses that two file descriptors of one file with the same flags are: the
-    /// client lacks the other then, and the next instance fails to serve it, and cleans up after
-    /// it, as after a client that went.
-    fn duplicates(&self) -> HashMap<Place, Place> {
-        let mut by_file = HashMap::<_, Vec<_>>::new();
-        let mut duplicates = HashMap::new();
-        for client in &self.clients {
-            for (n, fd) in client.fds.iter().enumerate() {
-                // A file descriptor whose file can't be told is stored all the same.
-                let Ok(stat) = fstat(fd) else {
-                    continue;
-                };
-                let originals: &mut Vec<_> = by_file.entry((stat.st_dev, stat.st_ino)).or_default();
-                let original = originals.iter().find(|(_, original)| {
-                    systemd::same_file(fd.as_fd(), *original).is_ok_and(|same| same)
-                });
-                match original {
-                    Some((place, _)) => {
-                        duplicates.insert((client.id, n), *place);
-                    }
-                    None => originals.push(((client.id, n), fd.as_fd())),
-                }
-            }
-        }
-
-        duplicates
     }
 
     /// Give each of `duplicates`, at its place among the file descriptors of the connections of the
@@ -478,6 +437,144 @@ impl Handover {
             }
         }
     }
+}
+
+/// The file descriptors that busd stored, by what it stored each as: see [`Stored`].
+#[derive(Debug, Default)]
+struct StoredFds {
+    /// The memfd that holds the state of the bus.
+    state: Option<OwnedFd>,
+    /// The socket that the bus listened on.
+    listener: Option<OwnedFd>,
+    /// The file descriptors of the connection of each client, by the number of the client.
+    clients: HashMap<usize, Vec<OwnedFd>>,
+}
+
+impl StoredFds {
+    /// The file descriptors that busd stored, `stored`, with the names that it stored each under.
+    ///
+    /// Each client gets the file descriptors of its connection back in the order that they were
+    /// stored in, its socket first, whatever the order that systemd passes them in, and the
+    /// place-holder of a duplicate gets the client a duplicate of the file descriptor that it says,
+    /// in its place, which may be one of another client. Those of a client whose socket is missing
+    /// close, as do those under names that busd doesn't store any under, as ones that a version of
+    /// busd that named them otherwise stored.
+    fn new(stored: Vec<(String, OwnedFd)>) -> Self {
+        let mut fds = Self::default();
+        let mut client_fds = HashMap::<_, Vec<_>>::new();
+        let mut duplicates = Vec::new();
+        for (name, fd) in stored {
+            match name.parse() {
+                Ok(Stored::State) => fds.state = Some(fd),
+                Ok(Stored::Listener) => fds.listener = Some(fd),
+                Ok(Stored::Client((id, n))) => client_fds.entry(id).or_default().push((n, fd)),
+                // What was stored for a duplicate only holds its place.
+                Ok(Stored::Duplicate(place, original)) => duplicates.push((place, original)),
+                Err(_) => warn!("Removing `{name}`, which busd doesn't know, from the store"),
+            }
+        }
+        Handover::restore_duplicates(&mut client_fds, duplicates);
+        fds.clients = client_fds
+            .into_iter()
+            .filter_map(|(id, mut fds)| {
+                fds.sort_unstable_by_key(|(n, _)| *n);
+                if fds.first().is_none_or(|(n, _)| *n != 0) {
+                    return None;
+                }
+
+                Some((id, fds.into_iter().map(|(_, fd)| fd).collect()))
+            })
+            .collect();
+
+        fds
+    }
+}
+
+/// Keep the `clients` that fit, in order: in the file descriptor store, which takes `max` file
+/// descriptors, after the state and the socket that the bus listens on, if it stores one, as
+/// `listener` tells, and among those that systemd passes the next instance, which starts with
+/// `fd_limit` as its soft limit of open file descriptors, if any, with room to spare. busd warns if
+/// any don't.
+///
+/// Each client takes the file descriptors of its connection, as many as `fds` tells: its socket and
+/// those that came with the messages that the bus didn't take. One that doesn't fit is left out
+/// whole, as the next instance couldn't serve it without all of them, while those after it, of
+/// fewer file descriptors, may still fit.
+fn fit<C, F>(clients: &mut Vec<C>, listener: bool, max: usize, fd_limit: Option<u64>, fds: F)
+where
+    F: Fn(&C) -> usize,
+{
+    // The next instance gets the state and the socket to listen on, from the store or from the
+    // socket activation, and then the clients.
+    let in_store = max.saturating_sub(1 + usize::from(listener));
+    let under_limit = fd_limit
+        .and_then(|limit| usize::try_from(limit).ok())
+        .map_or(usize::MAX, |limit| {
+            limit.saturating_sub(FIRST_PASSED_FD + 2 + SPARE_FDS)
+        });
+    let all = clients.len();
+    let mut room = in_store.min(under_limit);
+    clients.retain(|client| {
+        let Some(left) = room.checked_sub(fds(client)) else {
+            return false;
+        };
+        room = left;
+
+        true
+    });
+    let fit = clients.len();
+    if fit < all {
+        let why = match fd_limit {
+            Some(limit) if under_limit < in_store => format!(
+                "systemd only passes the next instance as many file descriptors as its soft limit \
+                 of open file descriptors takes, {limit} as busd started: raise that of \
+                 `LimitNOFILE=`"
+            ),
+            _ => format!("the file descriptor store takes {max}: raise `FileDescriptorStoreMax=`"),
+        };
+        warn!("Handing over {fit} of the {all} clients, as {why} of the service.");
+    }
+}
+
+/// The duplicates among the file descriptors of the connections of `clients`, each with the number
+/// of its client: where each one is, and where the file descriptor that it duplicates is.
+///
+/// A duplicate is of the same open file description as a file descriptor before it, which
+/// systemd stores alone. Only file descriptors of the same file can be of the same open file
+/// description, so only those are compared, and only the kernel tells whether they are
+/// ([`systemd::same_file`]). Where it doesn't, they are stored as they are, rather than one
+/// taken for a duplicate of the other, whose place-holder would get a duplicate of the other in
+/// its place, sharing its offset. systemd may then take them for the same and store the first
+/// alone, as it guesses that two file descriptors of one file with the same flags are: the
+/// client lacks the other then, and the next instance fails to serve it, and cleans up after
+/// it, as after a client that went.
+fn duplicates<'f, C, F>(clients: C) -> HashMap<Place, Place>
+where
+    C: IntoIterator<Item = (usize, F)>,
+    F: IntoIterator<Item = BorrowedFd<'f>>,
+{
+    let mut by_file = HashMap::<_, Vec<_>>::new();
+    let mut duplicates = HashMap::new();
+    for (id, fds) in clients {
+        for (n, fd) in fds.into_iter().enumerate() {
+            // A file descriptor whose file can't be told is stored all the same.
+            let Ok(stat) = fstat(fd) else {
+                continue;
+            };
+            let originals: &mut Vec<_> = by_file.entry((stat.st_dev, stat.st_ino)).or_default();
+            let original = originals
+                .iter()
+                .find(|(_, original)| systemd::same_file(fd, *original).is_ok_and(|same| same));
+            match original {
+                Some((place, _)) => {
+                    duplicates.insert((id, n), *place);
+                }
+                None => originals.push(((id, n), fd)),
+            }
+        }
+    }
+
+    duplicates
 }
 
 /// File descriptors that a bus that systemd runs keeps open from when it starts, to give up for
@@ -674,7 +771,9 @@ mod tests {
         assert!(Bus::take_activation(&mut passed).unwrap().is_none());
         let stored: Vec<_> = passed.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(stored, names);
-        assert!(Handover::from_stored(passed).unwrap().clients.is_empty());
+        let fds = StoredFds::new(passed);
+        assert!(fds.state.is_some() && fds.listener.is_some());
+        assert!(fds.clients.is_empty());
     }
 
     /// The place-holder of a duplicate gets the client a duplicate of the file descriptor that it
@@ -691,21 +790,16 @@ mod tests {
             (format!("{CLIENT}2-1-1-1"), null()),
         ];
 
-        let mut clients = Handover::from_stored(stored).unwrap().clients;
-        clients.sort_unstable_by_key(|client| client.id);
-        let [first, second] = &clients[..] else {
-            panic!("{} clients were passed", clients.len());
-        };
-        let original = first.fds[1].as_fd();
+        let clients = StoredFds::new(stored).clients;
+        assert_eq!(clients.len(), 2, "{clients:?}");
+        let (first, second) = (&clients[&1], &clients[&2]);
+        let original = first[1].as_fd();
         let same = |fd: &OwnedFd| systemd::same_file(original, fd.as_fd()).unwrap();
         assert_eq!(
-            first.fds.iter().map(same).collect::<Vec<_>>(),
+            first.iter().map(same).collect::<Vec<_>>(),
             [false, true, true]
         );
-        assert_eq!(
-            second.fds.iter().map(same).collect::<Vec<_>>(),
-            [false, true]
-        );
+        assert_eq!(second.iter().map(same).collect::<Vec<_>>(), [false, true]);
     }
 
     /// A file descriptor of the same open file description as one before it, among those of the
@@ -715,18 +809,16 @@ mod tests {
     fn duplicates_are_found() {
         let shared = null();
         let duplicate = || shared.try_clone().unwrap();
-        let clients = vec![
-            ClientHandover {
-                id: 1,
-                fds: vec![null(), duplicate(), null(), duplicate()],
-            },
-            ClientHandover {
-                id: 2,
-                fds: vec![null(), duplicate()],
-            },
+        let clients = [
+            (1, vec![null(), duplicate(), null(), duplicate()]),
+            (2, vec![null(), duplicate()]),
         ];
 
-        let duplicates = handover(clients).duplicates();
+        let duplicates = duplicates(
+            clients
+                .iter()
+                .map(|(id, fds)| (*id, fds.iter().map(AsFd::as_fd))),
+        );
         let expected = HashMap::from([((1, 3), (1, 1)), ((2, 1), (1, 1))]);
         assert_eq!(duplicates, expected);
     }
@@ -749,12 +841,10 @@ mod tests {
         ];
 
         assert!(Bus::take_activation(&mut passed).unwrap().is_none());
-        let handover = Handover::from_stored(passed).unwrap();
-        let [client] = &handover.clients[..] else {
-            panic!("{} clients were passed", handover.clients.len());
-        };
-        assert_eq!(client.id, 1);
-        let got: Vec<RawFd> = client.fds.iter().map(AsRawFd::as_raw_fd).collect();
+        let clients = StoredFds::new(passed).clients;
+        let ids: Vec<_> = clients.keys().collect();
+        assert_eq!(ids, [&1]);
+        let got: Vec<RawFd> = clients[&1].iter().map(AsRawFd::as_raw_fd).collect();
         assert_eq!(got, raw);
     }
 
@@ -763,31 +853,14 @@ mod tests {
     /// those after it may still fit.
     #[test]
     fn clients_fit_whole() {
-        let clients = [1, 3, 1, 2].into_iter().enumerate().map(client).collect();
-        let mut handover = handover(clients);
+        // The numbers of the clients, and how many file descriptors each takes.
+        let mut clients: Vec<_> = [1, 3, 1, 2].into_iter().enumerate().collect();
 
         // The store takes the state, and the file descriptors of 3 clients.
-        handover.fit(4, None);
+        fit(&mut clients, false, 4, None, |&(_, fds)| fds);
 
-        let ids: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
+        let ids: Vec<_> = clients.iter().map(|&(id, _)| id).collect();
         assert_eq!(ids, [0, 2]);
-    }
-
-    /// A hand-over of `clients`, with no listener.
-    fn handover(clients: Vec<ClientHandover>) -> Handover {
-        Handover {
-            state: Vec::new(),
-            listener: None,
-            clients,
-        }
-    }
-
-    /// The client numbered `id`, with `fds` file descriptors of its connection.
-    fn client((id, fds): (usize, usize)) -> ClientHandover {
-        ClientHandover {
-            id,
-            fds: (0..fds).map(|_| null()).collect(),
-        }
     }
 
     /// A file descriptor of no consequence.
