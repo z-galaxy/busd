@@ -49,7 +49,7 @@ harness = false
 bench = false
 
 [dependencies]
-zbus = { git = "https://github.com/z-galaxy/zbus", branch = "main", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus", branch = "ai/stoic-brahmagupta-2570gx", features = [
     "default-rt",
     "bus-impl",
     "service",
@@ -83,12 +83,13 @@ zruntime = { version = "0.2.2", features = [
 fastrand = "2.2.0"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
-# `net` is for the sockets of the bus, and the notification socket of systemd, and `fs`, `pipe` and
-# `event` are for the rest of the systemd module: its memfds and its barriers. `std` makes rustix
-# share the types of std with its callers (`OwnedFd`, `io::Error`).
+# `net` is for the sockets of the bus, and the notification socket of systemd, and `fs`, `mm`, `pipe`
+# and `event` are for the rest of the systemd module: its memfds, which it maps into memory, and its
+# barriers. `std` makes rustix share the types of std with its callers (`OwnedFd`, `io::Error`).
 rustix = { version = "1.1.2", default-features = false, features = [
     "event",
     "fs",
+    "mm",
     "net",
     "pipe",
     "process",
@@ -110,7 +111,7 @@ tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
 [dev-dependencies]
 # The tests drive the bus through proxies, which the binary itself does not need. The benchmarks
 # send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte by byte.
-zbus = { git = "https://github.com/z-galaxy/zbus", branch = "main", features = [
+zbus = { git = "https://github.com/z-galaxy/zbus", branch = "ai/stoic-brahmagupta-2570gx", features = [
     "proxy",
     "serde_bytes",
 ], default-features = false }
