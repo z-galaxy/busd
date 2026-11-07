@@ -280,7 +280,7 @@ pub(crate) struct NameState {
 
 /// The version of the encoding of the state: an instance of the bus that encodes its state
 /// otherwise doesn't take over from this one, nor this one from it.
-const VERSION: u32 = 2;
+const VERSION: u32 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -327,9 +327,11 @@ mod tests {
         assert_eq!(moved.encode().unwrap().len(), encoded.len());
 
         let mut other = encoded.clone();
-        other[0] = 1;
+        let version = VERSION + 1;
+        other[..4].copy_from_slice(&version.to_le_bytes());
         let error = State::decode(&other).unwrap_err();
-        assert!(error.to_string().contains("version 1"), "{error}");
+        let expected = format!("version {version}");
+        assert!(error.to_string().contains(&expected), "{error}");
     }
 
     /// A bus doesn't take over from a state that it can't decode, rather than panic: garbage, the
