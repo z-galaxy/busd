@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    fmt, mem,
+    fmt,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     str::FromStr,
     time::Duration,
@@ -82,18 +82,18 @@ impl Bus {
     /// systemd.
     ///
     /// The bus hands over as [`Bus::hand_over`] does, and stores what it hands over, for
-    /// [`Bus::for_systemd`] to take over from on the restart: its state, then the socket that it
-    /// listens on, and then the clients that fit, each with the file descriptors of its connection,
-    /// in the order of the hand-over, as many as the store takes and as systemd passes the next
-    /// instance. That instance starts with the soft limit of open file descriptors that busd
-    /// started with, `fd_limit`, `None` for no limit, unless the limit of the unit changed
-    /// meanwhile, and systemd fails to start it with more than that limit takes, after the socket
-    /// of the socket activation, if any. The clients that don't fit get disconnected as the bus
-    /// goes, with a warning. It fails if the bus takes longer than 30 s to hand over, or if storing
-    /// fails, which disconnects the clients as the bus goes. systemd stores one file descriptor of
-    /// each open file description, so a duplicate of one that was stored, as when a client sent the
-    /// same file descriptor twice, goes as a place-holder, under a name that says which file
-    /// descriptor the next instance is to duplicate in its place.
+    /// [`Bus::for_systemd`] to take over from on the restart: its state, with the records of the
+    /// connections of the clients that fit, then the socket that it listens on, and then the file
+    /// descriptors of the connections of those clients, in the order of the hand-over, as many as
+    /// the store takes and as systemd passes the next instance. That instance starts with the soft
+    /// limit of open file descriptors that busd started with, `fd_limit`, `None` for no limit,
+    /// unless the limit of the unit changed meanwhile, and systemd fails to start it with more than
+    /// that limit takes, after the socket of the socket activation, if any. The clients that don't
+    /// fit get disconnected as the bus goes, with a warning. It fails if the bus takes longer than
+    /// 30 s to hand over, or if storing fails, which disconnects the clients as the bus goes.
+    /// systemd stores one file descriptor of each open file description, so a duplicate of one that
+    /// was stored, as when a client sent the same file descriptor twice, goes as a place-holder,
+    /// under a name that says which file descriptor the next instance is to duplicate in its place.
     pub async fn hand_over_to_systemd(
         self,
         notifier: &Notifier,
@@ -269,12 +269,12 @@ impl Handover {
     /// What the previous instance of the bus handed over, out of what it stored, `stored`, with the
     /// names that it stored each under, if it stored its state, and the state can be decoded.
     ///
-    /// Each client of the state gets its connection back from the record of its connection, which
-    /// the state holds, and the file descriptors of the connection, as [`StoredFds::new`] gives
-    /// them. One whose socket is missing is gone, and so is one whose connection can't be restored,
-    /// as when a file descriptor of it is missing: the next instance cleans up after them as after
-    /// any client that goes. Without the state, or if it can't be decoded, all of the file
-    /// descriptors close, which disconnects the clients.
+    /// Each client of the state gets its connection back from the record of its connection, where
+    /// the state says it is in the memfd of the state, read in place, and the file descriptors of
+    /// the connection, as [`StoredFds::new`] gives them. One whose socket is missing is gone, and
+    /// so is one whose connection can't be restored, as when a file descriptor of it is missing:
+    /// the next instance cleans up after them as after any client that goes. Without the state, or
+    /// if it can't be decoded, all of the file descriptors close, which disconnects the clients.
     fn from_stored(stored: Vec<(String, OwnedFd)>) -> Option<Self> {
         let StoredFds {
             state,
@@ -288,11 +288,11 @@ impl Handover {
 
             return None;
         };
-        let state = systemd::read_memfd(state.as_fd())
+        let stored = systemd::view_memfd(state.as_fd())
             .context("Failed to read the state of the bus that was stored")
-            .and_then(|bytes| State::decode(&bytes));
-        let mut state = match state {
-            Ok(state) => state,
+            .and_then(|bytes| Ok((State::decode(&bytes)?, bytes)));
+        let (state, bytes) = match stored {
+            Ok(stored) => stored,
             Err(e) => {
                 error!(
                     "Failed to take over from the previous instance of the bus, which disconnects \
@@ -304,16 +304,17 @@ impl Handover {
             }
         };
         let mut clients = Vec::new();
-        for (id, record) in state.connections_mut() {
-            // The record isn't needed once the connection is restored.
-            let record = mem::take(record);
+        for (id, place) in state.records() {
             let Ok(id) = usize::try_from(id) else {
                 continue;
             };
             let Some(fds) = client_fds.remove(&id) else {
                 continue;
             };
-            match connection::Handover::restore(&record, fds) {
+            let restored = bytes_at(&bytes, place)
+                .context("The record of its connection is beyond the end of the stored state")
+                .and_then(|record| Ok(connection::Handover::restore(record, fds)?));
+            match restored {
                 Ok(connection) => clients.push(ClientHandover { id, connection }),
                 Err(e) => {
                     warn!("Leaving `:busd.{id}` out, as its connection can't be restored: {e}")
@@ -326,6 +327,8 @@ impl Handover {
                 client_fds.len()
             );
         }
+        // The connections hold what they need of their records, and the memfd is unmapped.
+        drop(bytes);
 
         Some(Self {
             state,
@@ -360,28 +363,46 @@ impl Handover {
         Ok(())
     }
 
-    /// Store the state of the bus, with the record of the connection of each client that it hands
-    /// over, in a memfd that closes as this returns: the place-holders of the duplicates take its
+    /// Store the state of the bus, and the record of the connection of each client that it hands
+    /// over, in one memfd that closes as this returns: the place-holders of the duplicates take its
     /// place among the open file descriptors.
+    ///
+    /// The memfd holds the state, then the records, in the order of the clients in the state, each
+    /// where the state says, at an offset that is a multiple of 8. zbus saves each record in its
+    /// place in the memfd, which is mapped into memory, so that the bytes of the connections are
+    /// copied once, and the next instance restores the connections from there.
     fn store_state(&mut self, notifier: &Notifier) -> Result<()> {
         let connections: HashMap<_, _> = self
             .clients
             .iter()
             .map(|client| (client.id as u64, &client.connection))
             .collect();
-        for (id, record) in self.state.connections_mut() {
+        // The state takes as many bytes wherever the records are.
+        let mut end = self.state.encoded_len()?.next_multiple_of(8);
+        let mut records = Vec::with_capacity(connections.len());
+        for (id, record) in self.state.records_mut() {
             let Some(connection) = connections.get(&id) else {
                 continue;
             };
+            // A multiple of 8.
             let len = connection
                 .saved_len()
                 .expect("the clients of the bus are on unix sockets");
-            *record = vec![0; len];
-            connection.save(record)?;
+            *record = (end as u64, len as u64);
+            records.push((end..end + len, *connection));
+            end += len;
         }
+        let state = self.state.encode()?;
         let name = Stored::State.to_string();
-        let state = systemd::memfd(&name, &self.state.encode()?)?;
-        notifier.store(&name, &[state.as_fd()])?;
+        let memfd = systemd::memfd_filled(&name, end, |memfd| -> Result<()> {
+            memfd[..state.len()].copy_from_slice(&state);
+            for (place, connection) in records {
+                connection.save(&mut memfd[place])?;
+            }
+
+            Ok(())
+        })?;
+        notifier.store(&name, &[memfd.as_fd()])?;
 
         Ok(())
     }
@@ -488,6 +509,15 @@ impl StoredFds {
 
         fds
     }
+}
+
+/// The bytes at `place` of `bytes`: from an offset, and as many as a length says, if they are all
+/// there.
+fn bytes_at(bytes: &[u8], (offset, len): (u64, u64)) -> Option<&[u8]> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.checked_add(usize::try_from(len).ok()?)?;
+
+    bytes.get(offset..end)
 }
 
 /// Keep the `clients` that fit, in order: in the file descriptor store, which takes `max` file
