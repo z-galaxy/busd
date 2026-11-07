@@ -25,11 +25,12 @@ use std::{
     fs::File,
     io::{self, ErrorKind, IoSlice},
     mem::MaybeUninit,
+    ops::Deref,
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, fs::FileExt},
     },
-    process,
+    process, ptr, slice,
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -38,8 +39,9 @@ use rustix::{
     buffer::spare_capacity,
     cmsg_space,
     event::{poll, PollFd, PollFlags, Timespec},
-    fs::{fcntl_add_seals, memfd_create, MemfdFlags, SealFlags},
+    fs::{fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create, MemfdFlags, SealFlags},
     io::{fcntl_setfd, pread, retry_on_intr, Errno, FdFlags},
+    mm::{madvise, mmap, munmap, Advice, MapFlags, ProtFlags},
     net::{
         sendmsg_addr, socket_with, AddressFamily, SendAncillaryBuffer, SendAncillaryMessage,
         SendFlags, SocketAddrUnix, SocketFlags, SocketType,
@@ -299,22 +301,45 @@ pub fn fd_store_max() -> Option<usize> {
 /// written here. `name` is for debugging only: it shows as `memfd:<name>` among the files of the
 /// process, and can be 249 bytes at most.
 pub fn memfd(name: &str, bytes: &[u8]) -> io::Result<OwnedFd> {
-    let flags = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING;
-    // With `vm.memfd_noexec=2`, the kernel refuses a memfd that can be made executable, and a
-    // kernel before 6.3 doesn't know the flag that prevents that. This is what systemd does about
-    // both.
-    let fd = match memfd_create(name, flags | MemfdFlags::NOEXEC_SEAL) {
-        Err(Errno::INVAL) => memfd_create(name, flags)?,
-        fd => fd?,
-    };
     // Write at an offset, so that the offset of the file stays at its start, where a reader that
     // doesn't seek expects it.
-    let file = File::from(fd);
+    let file = File::from(new_memfd(name)?);
     file.write_all_at(bytes, 0)?;
     let seals = SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL;
     fcntl_add_seals(&file, seals)?;
 
     Ok(file.into())
+}
+
+/// A sealed memfd of `len` bytes, that `fill` fills in place: it is given the bytes of the memfd,
+/// zeros at first, mapped into memory.
+///
+/// That is [`memfd`] without a copy of the bytes in memory of their own, for bytes that are copied
+/// there from elsewhere anyway. The memory of the memfd is allocated before `fill` writes to it, so
+/// that a lack of memory fails this, rather than kill the process as it writes, from Linux 5.14 on.
+/// It fails with what `fill` fails with, and the memfd goes then.
+pub fn memfd_filled<F, E>(name: &str, len: usize, fill: F) -> Result<OwnedFd, E>
+where
+    F: FnOnce(&mut [u8]) -> Result<(), E>,
+    E: From<io::Error>,
+{
+    let fd = new_memfd(name)?;
+    ftruncate(&fd, len as u64).map_err(io::Error::from)?;
+    // No one can shrink the memfd under the mapping, which a write there would fault on, nor grow
+    // it.
+    let seals = SealFlags::SHRINK | SealFlags::GROW;
+    fcntl_add_seals(&fd, seals).map_err(io::Error::from)?;
+    {
+        let mut mapping = Mapping::shared(fd.as_fd(), len)?;
+        mapping.populate()?;
+        fill(mapping.bytes_mut())?;
+    }
+    // The kernel refuses to seal a memfd against writes while a shared mapping of it is left, a
+    // read-only one included, so the mapping went first.
+    let seals = SealFlags::WRITE | SealFlags::SEAL;
+    fcntl_add_seals(&fd, seals).map_err(io::Error::from)?;
+
+    Ok(fd)
 }
 
 /// All of what the memfd `fd` holds, from its start.
@@ -329,6 +354,38 @@ pub fn read_memfd(fd: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
         let offset = bytes.len() as u64;
         if retry_on_intr(|| pread(fd, spare_capacity(&mut bytes), offset))? == 0 {
             return Ok(bytes);
+        }
+    }
+}
+
+/// All of what the memfd `fd` holds, from its start, to read in place: mapped into memory, if the
+/// memfd is sealed against shrinking and writing, as [`memfd`] and [`memfd_filled`] seal it, or
+/// else read, as [`read_memfd`] reads it, from any file.
+///
+/// The seals keep anyone from changing what the mapping shows, which reading the memfd in place
+/// takes. The mapping is private and read-only, which works however the memfd is sealed: a shared
+/// one fails, on some kernels, through a file descriptor that can write to a memfd that is sealed
+/// against writes, as those that the file descriptor store of systemd gives back can.
+pub fn view_memfd(fd: BorrowedFd<'_>) -> io::Result<MemfdView> {
+    let view = match Mapping::sealed(fd)? {
+        Some(mapping) => View::Mapped(mapping),
+        None => View::Read(read_memfd(fd)?),
+    };
+
+    Ok(MemfdView(view))
+}
+
+/// All of what a memfd holds, as [`view_memfd`] gives it.
+#[derive(Debug)]
+pub struct MemfdView(View);
+
+impl Deref for MemfdView {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &self.0 {
+            View::Mapped(mapping) => mapping.bytes(),
+            View::Read(bytes) => bytes,
         }
     }
 }
@@ -391,6 +448,173 @@ pub fn same_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> io::Result<bool> {
         "the kernel tells neither through `F_DUPFD_QUERY` nor through `kcmp(2)` whether two file \
          descriptors are of the same open file description",
     ))
+}
+
+/// How a memfd is viewed: see [`view_memfd`].
+#[derive(Debug)]
+enum View {
+    /// The memfd, mapped into memory.
+    Mapped(Mapping),
+    /// A copy of what the memfd holds.
+    Read(Vec<u8>),
+}
+
+/// A mapping of the start of a memfd into the memory of the process, which goes as this is dropped.
+///
+/// That takes `unsafe` code, all of which is here: Rust can't tell that the memory stays mapped,
+/// nor that nothing changes it under the slices that the mapping gives, which the memfd and its
+/// seals see to.
+#[derive(Debug)]
+struct Mapping {
+    /// Where the mapping starts.
+    start: *mut u8,
+    /// How long the mapping is, which a slice of it can be.
+    len: SliceLen,
+    /// Whether the mapping is shared and writable, rather than private and read-only.
+    writable: bool,
+}
+
+impl Mapping {
+    /// A shared mapping of the first `len` bytes of the memfd `fd`, to write to the memfd, which
+    /// no other process has yet, nor anything else in this one, and which is sealed against
+    /// shrinking, so that no one else changes what the mapping shows, and it stays as long.
+    fn shared(fd: BorrowedFd<'_>, len: usize) -> io::Result<Self> {
+        Self::new(fd, len, true)
+    }
+
+    /// A private mapping of all of the memfd `fd`, to read, if it is sealed against shrinking and
+    /// writing, so that no one changes what the mapping shows, and it stays as long.
+    fn sealed(fd: BorrowedFd<'_>) -> io::Result<Option<Self>> {
+        let seals = SealFlags::SHRINK | SealFlags::WRITE;
+        if !fcntl_get_seals(fd).is_ok_and(|sealed| sealed.contains(seals)) {
+            return Ok(None);
+        }
+        Self::new(fd, fstat(fd)?.st_size, false).map(Some)
+    }
+
+    /// A mapping of the first `len` bytes of the memfd `fd`, shared and writable if `writable`, or
+    /// else private and read-only. It fails with `EOVERFLOW` for more bytes than a slice can have.
+    fn new<L>(fd: BorrowedFd<'_>, len: L, writable: bool) -> io::Result<Self>
+    where
+        L: TryInto<SliceLen, Error = Errno>,
+    {
+        let len = len.try_into()?;
+        // `mmap(2)` maps no empty range, and there is nothing to map then.
+        if len.get() == 0 {
+            return Ok(Self {
+                start: ptr::NonNull::dangling().as_ptr(),
+                len,
+                writable,
+            });
+        }
+        let (prot, flags) = match writable {
+            true => (ProtFlags::READ | ProtFlags::WRITE, MapFlags::SHARED),
+            false => (ProtFlags::READ, MapFlags::PRIVATE),
+        };
+        // SAFETY: The kernel puts the mapping where nothing is mapped, as it is given no address.
+        let start = unsafe { mmap(ptr::null_mut(), len.get(), prot, flags, fd, 0) }?;
+
+        Ok(Self {
+            start: start.cast(),
+            len,
+            writable,
+        })
+    }
+
+    /// Have the kernel allocate the memory of the mapping now (`MADV_POPULATE_WRITE`), so that a
+    /// lack of memory fails this, rather than a write to the mapping, which `SIGBUS` would kill
+    /// the process on. A kernel before 5.14 lacks that, and allocates the memory as it is written,
+    /// as without this.
+    fn populate(&self) -> io::Result<()> {
+        let len = self.len.get();
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: The advice is for the memory of the mapping, and changes none of it: the kernel
+        // allocates what it maps, as a write would.
+        match unsafe { madvise(self.start.cast(), len, Advice::LinuxPopulateWrite) } {
+            Ok(()) | Err(Errno::INVAL) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The bytes that the mapping shows.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: The mapping is of `len` readable bytes from `start`, which a slice can have, as
+        // `SliceLen` sees to, for as long as `self` lives, which the slice can't outlive, and
+        // nothing changes them meanwhile: a shared mapping is of a memfd that no one else writes
+        // to, and a private one of a memfd sealed against writes. Neither memfd can shrink, which
+        // would leave part of the mapping without memory.
+        unsafe { slice::from_raw_parts(self.start, self.len.get()) }
+    }
+
+    /// The bytes that a shared mapping shows, to write to the memfd.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        assert!(self.writable, "a read-only mapping to write to");
+        // SAFETY: As for `bytes`, and the mapping is writable, and borrowed for as long as the
+        // slice is.
+        unsafe { slice::from_raw_parts_mut(self.start, self.len.get()) }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        let len = self.len.get();
+        if len == 0 {
+            return;
+        }
+        // SAFETY: The mapping is this one's, and no slice of it is left, as each borrows `self`.
+        let unmapped = unsafe { munmap(self.start.cast(), len) };
+        debug_assert!(unmapped.is_ok(), "failed to unmap a memfd: {unmapped:?}");
+    }
+}
+
+/// A number of bytes that a slice can have: `isize::MAX` at most, which a mapping can be longer
+/// than on a 32-bit system.
+///
+/// It converts from a length, and from the size of a file, as `fstat(2)` gives it, and fails with
+/// `EOVERFLOW` for one that no slice can have.
+#[derive(Debug, Clone, Copy)]
+struct SliceLen(usize);
+
+impl SliceLen {
+    fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl TryFrom<usize> for SliceLen {
+    type Error = Errno;
+
+    fn try_from(len: usize) -> Result<Self, Errno> {
+        if isize::try_from(len).is_err() {
+            return Err(Errno::OVERFLOW);
+        }
+
+        Ok(Self(len))
+    }
+}
+
+impl TryFrom<i64> for SliceLen {
+    type Error = Errno;
+
+    fn try_from(size: i64) -> Result<Self, Errno> {
+        let len = usize::try_from(size).map_err(|_| Errno::OVERFLOW)?;
+
+        Self::try_from(len)
+    }
+}
+
+/// A memfd named `name`, empty, that can be sealed.
+fn new_memfd(name: &str) -> io::Result<OwnedFd> {
+    let flags = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING;
+    // With `vm.memfd_noexec=2`, the kernel refuses a memfd that can be made executable, and a
+    // kernel before 6.3 doesn't know the flag that prevents that. This is what systemd does about
+    // both.
+    match memfd_create(name, flags | MemfdFlags::NOEXEC_SEAL) {
+        Err(Errno::INVAL) => Ok(memfd_create(name, flags)?),
+        fd => Ok(fd?),
+    }
 }
 
 /// The value of the environment variable `name`, if it is set.
@@ -931,6 +1155,76 @@ mod tests {
             Errno::PERM
         );
         assert_eq!(read_memfd(fd.as_fd()).unwrap(), b"state");
+    }
+
+    #[test]
+    fn memfd_filled_round_trip() {
+        for len in [0, 5, 3 * READ_CHUNK + 1] {
+            let bytes: Vec<_> = (0..=u8::MAX).cycle().take(len).collect();
+            let filling = |memfd: &mut [u8]| {
+                assert!(memfd.iter().all(|&byte| byte == 0), "the memfd isn't empty");
+                memfd.copy_from_slice(&bytes);
+
+                Ok::<_, io::Error>(())
+            };
+            let fd = memfd_filled("busd-test", len, filling).unwrap();
+
+            assert_eq!(read_memfd(fd.as_fd()).unwrap(), bytes);
+            assert!(fcntl_getfd(&fd).unwrap().contains(FdFlags::CLOEXEC));
+            // Sealed as `memfd` seals it.
+            let seals = SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL;
+            assert!(fcntl_get_seals(&fd).unwrap().contains(seals));
+            assert_eq!(pwrite(&fd, b"x", 0).unwrap_err(), Errno::PERM);
+        }
+    }
+
+    #[test]
+    fn memfd_filled_fails_as_it_is_filled() {
+        let failing = |_: &mut [u8]| Err(io::Error::from(ErrorKind::InvalidData));
+
+        let error = memfd_filled("busd-test", 8, failing).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn view_memfd_maps_sealed_memfds() {
+        for bytes in [&b""[..], b"state"] {
+            let fd = memfd("busd-test", bytes).unwrap();
+
+            let view = view_memfd(fd.as_fd()).unwrap();
+            assert!(matches!(view.0, View::Mapped(_)), "{view:?}");
+            assert_eq!(&*view, bytes);
+        }
+    }
+
+    /// A mapping longer than a slice can be is refused before anything is mapped, as that of a
+    /// sealed memfd of 2 GiB or more would be on a 32-bit system, and so is one of a size that no
+    /// file has.
+    #[test]
+    fn mapping_longer_than_a_slice_is_refused() {
+        let fd = memfd("busd-test", b"state").unwrap();
+        for writable in [false, true] {
+            let e = Mapping::new(fd.as_fd(), isize::MAX.unsigned_abs() + 1, writable).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(Errno::OVERFLOW.raw_os_error()));
+        }
+        let e = Mapping::new(fd.as_fd(), -1_i64, false).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(Errno::OVERFLOW.raw_os_error()));
+    }
+
+    #[test]
+    fn view_memfd_reads_other_files() {
+        // A memfd that isn't sealed, as one of another process may not be.
+        let fd = memfd_create("busd-test", MemfdFlags::CLOEXEC).unwrap();
+        assert_eq!(pwrite(&fd, b"state", 0).unwrap(), 5);
+        let view = view_memfd(fd.as_fd()).unwrap();
+        assert!(matches!(view.0, View::Read(_)), "{view:?}");
+        assert_eq!(&*view, b"state");
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/systemd.rs");
+        let file = File::open(path).unwrap();
+        let view = view_memfd(file.as_fd()).unwrap();
+        assert!(matches!(view.0, View::Read(_)), "{view:?}");
+        assert_eq!(&*view, std::fs::read(path).unwrap());
     }
 
     #[test]

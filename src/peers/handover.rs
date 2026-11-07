@@ -153,7 +153,7 @@ impl Peers {
                 let state = PeerState {
                     id: peer.id() as u64,
                     greeted: peer.greeted(),
-                    connection: Vec::new(),
+                    record: (0, 0),
                     match_rules: peer.match_rules().clone(),
                     pending_calls: peer
                         .pending_calls()
@@ -172,7 +172,7 @@ impl Peers {
             for monitor in routing.monitors.values_mut() {
                 let state = MonitorState {
                     id: monitor.id() as u64,
-                    connection: Vec::new(),
+                    record: (0, 0),
                     match_rules: monitor.match_rules().clone(),
                 };
                 clients.push(Client {

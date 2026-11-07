@@ -13,7 +13,7 @@ use zbus::{
     address::Transport,
     connection,
     names::{OwnedUniqueName, OwnedWellKnownName},
-    wire::{serialized, to_bytes, LE},
+    wire::{serialized, serialized_size, to_bytes, LE},
     Address, OwnedGuid, Type,
 };
 
@@ -179,19 +179,40 @@ pub(crate) struct State {
 }
 
 impl State {
-    /// The records of the hand-overs of the connections of the clients, each with the number of
-    /// its client: those of the peers, then those of the monitors.
-    pub(crate) fn connections_mut(&mut self) -> impl Iterator<Item = (u64, &mut Vec<u8>)> {
+    /// Where the record of the hand-over of the connection of each client is, as
+    /// [`PeerState::record`] says, with the number of the client: those of the peers, then those of
+    /// the monitors.
+    pub(crate) fn records(&self) -> impl Iterator<Item = (u64, (u64, u64))> + '_ {
+        let peers = self.peers.iter().map(|peer| (peer.id, peer.record));
+        let monitors = self
+            .monitors
+            .iter()
+            .map(|monitor| (monitor.id, monitor.record));
+
+        peers.chain(monitors)
+    }
+
+    /// Where the record of the hand-over of the connection of each client is, as
+    /// [`State::records`] gives them, to set.
+    pub(crate) fn records_mut(&mut self) -> impl Iterator<Item = (u64, &mut (u64, u64))> {
         let peers = self
             .peers
             .iter_mut()
-            .map(|peer| (peer.id, &mut peer.connection));
+            .map(|peer| (peer.id, &mut peer.record));
         let monitors = self
             .monitors
             .iter_mut()
-            .map(|monitor| (monitor.id, &mut monitor.connection));
+            .map(|monitor| (monitor.id, &mut monitor.record));
 
         peers.chain(monitors)
+    }
+
+    /// How long the state is, encoded, as [`State::encode`] encodes it, which doesn't depend on
+    /// where the records are.
+    pub(crate) fn encoded_len(&self) -> Result<usize> {
+        let len = serialized_size(serialized::Context::new(LE, 0), &(VERSION, self))?;
+
+        Ok(*len)
     }
 
     /// The state, encoded in the D-Bus wire format, after the version of its encoding, as the bus
@@ -226,11 +247,12 @@ pub(crate) struct PeerState {
     pub(crate) id: u64,
     /// Whether the peer called `Hello`.
     pub(crate) greeted: bool,
-    /// The record of the hand-over of the connection of the peer, as zbus saves it
-    /// ([`connection::Handover::save`]), for a next instance in another process, which gets the
-    /// file descriptors of the connection apart. It is empty otherwise, as for a peer that the bus
-    /// left out of the hand-over.
-    pub(crate) connection: Vec<u8>,
+    /// Where the record of the hand-over of the connection of the peer is, as zbus saves it
+    /// ([`connection::Handover::save`]), in the memfd that the bus stores the state in, for a next
+    /// instance in another process: its offset from the start of the memfd, and its length. That
+    /// instance gets the file descriptors of the connection apart. It is (0, 0) otherwise, as for
+    /// a peer that the bus left out of the hand-over.
+    pub(crate) record: (u64, u64),
     pub(crate) match_rules: MatchRules,
     /// The calls to the peer that wait for its reply: the number of the caller, its unique name,
     /// and the serial of the call.
@@ -242,9 +264,9 @@ pub(crate) struct PeerState {
 pub(crate) struct MonitorState {
     /// The number of the peer that became the monitor.
     pub(crate) id: u64,
-    /// The record of the hand-over of the connection of the monitor, as for a peer: see
-    /// [`PeerState`].
-    pub(crate) connection: Vec<u8>,
+    /// Where the record of the hand-over of the connection of the monitor is, as for a peer: see
+    /// [`PeerState::record`].
+    pub(crate) record: (u64, u64),
     pub(crate) match_rules: MatchRules,
 }
 
@@ -278,13 +300,13 @@ mod tests {
             peers: vec![PeerState {
                 id: 1,
                 greeted: true,
-                connection: b"\x01l\x01\0\x01".to_vec(),
+                record: (64, 104),
                 match_rules,
                 pending_calls: vec![(2, name(2), 7)],
             }],
             monitors: vec![MonitorState {
                 id: 3,
-                connection: Vec::new(),
+                record: (0, 0),
                 match_rules: MatchRules::default(),
             }],
             names: vec![NameState {
@@ -296,6 +318,13 @@ mod tests {
         let encoded = state.encode().unwrap();
         let decoded = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
+        assert_eq!(state.encoded_len().unwrap(), encoded.len());
+        // The records take as many bytes wherever they are.
+        let mut moved = decoded;
+        for (_, record) in moved.records_mut() {
+            *record = (u64::MAX, u64::MAX);
+        }
+        assert_eq!(moved.encode().unwrap().len(), encoded.len());
 
         let mut other = encoded.clone();
         other[0] = 1;
