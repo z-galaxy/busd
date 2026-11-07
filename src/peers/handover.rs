@@ -33,24 +33,24 @@ impl Peers {
     /// pause as soon as they are connected, and those in the middle of their handshakes have
     /// `timeout` to be done with them.
     ///
-    /// The clients have as long as they have to take a message, from now on, to take all that the
-    /// bus sends them meanwhile, so that a client that doesn't read holds the hand-over up for no
-    /// longer than that, rather than for that long each time that the bus sends it something. A
-    /// wait for a task to be done with what it took is bounded by that too. Once the bus is
-    /// paused, it takes no more clients: one whose handshake is still under way by then gets
-    /// disconnected at once, as [`Peers::add`] says.
+    /// No send to a client waits for the client to take what the bus sends it from now on: what a
+    /// client doesn't take goes on with the hand-over of its connection, for the next instance to
+    /// write to the client first. So a client that doesn't read holds no hand-over up, unless the
+    /// bus is still writing to it what the instance before it left unwritten, which takes as long
+    /// as the client has to take a message at most ([`Recipient::flush`]). Once the bus is paused,
+    /// it takes no more clients: one whose handshake is still under way by then gets disconnected
+    /// at once, as [`Peers::add`] says.
     pub(crate) async fn pause(&self, timeout: Duration) -> Result<()> {
         let runtime = SharedRuntime::current()?;
         let deadline = Instant::now() + timeout;
         {
             let mut routing = self.routing_mut().await;
-            let since = Instant::now();
-            routing.handing_over = Some(since);
+            routing.handing_over = true;
             for peer in routing.peers.values().filter(|peer| !peer.is_bus()) {
-                peer.pause(since);
+                peer.pause();
             }
             for monitor in routing.monitors.values() {
-                monitor.pause(since);
+                monitor.pause();
             }
         }
         loop {
@@ -94,7 +94,8 @@ impl Peers {
     }
 
     /// Wait for the bus to settle: to have answered every call that it got, and to have no chores
-    /// under way, with the peers to have got all of the messages that the bus sent.
+    /// under way, with every message that the bus sent written to its recipient, or kept for the
+    /// next instance to write.
     ///
     /// A hand-over waits for this once the bus is paused, so the bus only has its own work to
     /// finish, as nothing new comes in for it to do, but for what the clients whose connections
@@ -132,12 +133,14 @@ impl Peers {
     /// connection of each client.
     ///
     /// The connections of the clients are handed over all at once, each through the stream of its
-    /// messages, within the time that its client has to take a message, as a client that doesn't
-    /// read can hold its connection up. That of a client that went since the bus settled, as it
-    /// closed its end, is handed over too, with what zbus read of it, for the next instance to pass
-    /// that on and clean up after the client. A client whose connection fails to be handed over,
-    /// as when the bus is disconnecting it, when the connection ended on an error, or when its
-    /// socket fails to be duplicated, as the process has too many file descriptors open, gets
+    /// messages, with what the bus sent the client and the client didn't take, which nothing waits
+    /// for the client to take. One whose hand-over takes longer than the time that its client has
+    /// to take a message all the same is given up on, rather than hold the others up. That of a
+    /// client that went since the bus settled, as it closed its end, is handed over too, with what
+    /// zbus read of it, for the next instance to pass that on and clean up after the client. A
+    /// client whose connection fails to be handed over, as when the bus is disconnecting it, when
+    /// the connection ended on an error, when its hand-over is given up on, or when its socket
+    /// fails to be duplicated, as the process has too many file descriptors open, gets
     /// disconnected: the bus leaves it out, so that the next instance cleans up after it as after a
     /// client that went.
     pub(crate) async fn snapshot(&self) -> Result<(Snapshot, Vec<ClientHandover>)> {
@@ -253,6 +256,10 @@ impl Peers {
     /// manager didn't take their sockets, or let go of them, so the bus cleans up after them as
     /// after any peer that goes, and after those whose connections it fails to serve as well. It
     /// fails, if at all, before it serves any client.
+    ///
+    /// What the instance that handed a client over sent it, and the client didn't take, goes to the
+    /// client first, as the client takes it: a client that doesn't take it within `send_timeout`
+    /// gets disconnected, as when a send to it times out.
     pub(crate) async fn restore(
         self: &Arc<Self>,
         snapshot: Snapshot,
@@ -293,6 +300,8 @@ impl Peers {
             }
         }
         let mut restored_monitors = Vec::new();
+        // Those that have what the instance that handed them over sent them to take still.
+        let mut unwritten = Vec::new();
         for state in monitors {
             let id = usize::try_from(state.id)?;
             let Some(client) = clients.remove(&id) else {
@@ -350,11 +359,21 @@ impl Peers {
                             .add_handed_over(caller_id, caller, serial);
                     }
                 }
+                if peer.conn().unwritten_len() > 0 {
+                    unwritten.push(peer.recipient().clone());
+                }
                 self.insert(&mut routing, peer, stream);
             }
             for (monitor, stream) in restored_monitors {
+                if monitor.conn().unwritten_len() > 0 {
+                    unwritten.push(monitor.recipient().clone());
+                }
                 self.insert_monitor(&mut routing, monitor, stream);
             }
+        }
+        // zbus writes what is left ahead of anything else that the bus sends the client meanwhile.
+        for recipient in unwritten {
+            spawn(async move { recipient.flush().await }).detach();
         }
         // The bus serves its clients from here on, so it goes on whatever comes.
         for (unique_name, records, names_changes) in gone {
@@ -579,6 +598,14 @@ impl Client {
         let stream = self.stream.as_mut()?;
         let timeout = self.recipient.send_timeout()?;
         let error = match runtime.timeout(timeout, stream.hand_over()).await {
+            // A send or a flush to the client that held the hand-over up may have failed, or timed
+            // out, meanwhile, and the hand-over may have got the connection before the closing of
+            // the connection did: dropping the hand-over closes what it holds.
+            Ok(Ok(_)) if self.recipient.disconnecting() => {
+                debug!("Leaving `{name}` out of the hand-over, as the bus is disconnecting it");
+
+                return None;
+            }
             Ok(Ok(handover)) => return Some(handover),
             Ok(Err(e)) => e.to_string(),
             Err(_) => "it took too long".to_owned(),
@@ -632,11 +659,12 @@ mod tests {
         future::poll_fn,
         io::{self, Read, Write},
         net::Shutdown,
+        num::NonZeroUsize,
         os::unix::net::UnixStream,
         task::Poll,
     };
 
-    use futures_util::{future::join, StreamExt};
+    use futures_util::{future::join, FutureExt, StreamExt};
     use ntest::timeout;
     use rand::{
         distr::{Alphanumeric, SampleString},
@@ -890,6 +918,68 @@ mod tests {
             assert!(
                 Charge::new(&user, &user).is_some(),
                 "the client is still charged to its user"
+            );
+        });
+    }
+
+    /// A client that the bus starts disconnecting while the hand-over of its connection waits, as
+    /// when a flush to the client times out as it holds the hand-over up, isn't handed over, even
+    /// where the hand-over gets the connection before the closing of the connection does, as with
+    /// a lock that goes to the first to wait for it.
+    #[test]
+    #[timeout(30000)]
+    fn client_that_the_bus_disconnects_as_its_hand_over_waits_is_left_out() {
+        const CHUNK: usize = 64 * 1024;
+        const CHUNKS: usize = 16;
+
+        zruntime::block_on(async {
+            let bus = Bus::for_address(Some(&address())).await.unwrap();
+            let peers = bus.peers().clone();
+            let (mut receiver, _socket) = connect(&bus, 1).await;
+            let name = receiver.unique_name().unwrap().to_string();
+            // The receiver takes no more of what the bus sends it once a message waits in its
+            // queue.
+            let _messages = MessageStream::from(&receiver);
+            receiver.set_max_queued(NonZeroUsize::MIN);
+            peers.pause(STOP_TIMEOUT).await.unwrap();
+            peers.settle().await.unwrap();
+            let (conn, recipient) = peers
+                .routing()
+                .await
+                .peers
+                .get(name.as_str())
+                .map(|peer| (peer.conn().clone(), peer.recipient().clone()))
+                .unwrap();
+            // The connection keeps what the socket of the receiver doesn't take, and a flush holds
+            // the connection as it waits for the receiver to take that.
+            let chunk = "x".repeat(CHUNK);
+            let chunks: Vec<_> = (0..CHUNKS)
+                .map(|_| {
+                    Message::signal("/org/zbus/Test", "org.zbus.Test", "Chunk")
+                        .build(&chunk)
+                        .unwrap()
+                })
+                .collect();
+            recipient.send(&chunks).await;
+            let mut flushing = Box::pin(conn.flush());
+            assert!(
+                flushing.as_mut().now_or_never().is_none(),
+                "the flush didn't wait for the receiver"
+            );
+            let mut handing_over = Box::pin(peers.snapshot());
+            assert!(
+                handing_over.as_mut().now_or_never().is_none(),
+                "the hand-over didn't wait for the flush"
+            );
+
+            // The bus flags the client before the flush lets go of the connection, as when the
+            // flush times out, and nothing closes the connection before the hand-over gets it.
+            recipient.hand_over();
+            drop(flushing);
+            let (_, clients) = handing_over.await.unwrap();
+            assert!(
+                clients.iter().all(|client| client.id != 1),
+                "the client was handed over, though the bus was disconnecting it"
             );
         });
     }

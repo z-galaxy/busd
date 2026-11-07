@@ -1,7 +1,4 @@
 #[cfg(target_os = "linux")]
-use std::time::Instant;
-
-#[cfg(target_os = "linux")]
 use zbus::MessageStream;
 use zbus::{
     names::{BusName, OwnedUniqueName},
@@ -72,10 +69,11 @@ impl Monitor {
         self.canceled_event.listen()
     }
 
-    /// Pause the monitor, as the bus hands over from `since`, as [`Peer::pause`] pauses a peer.
+    /// Pause the monitor, as the bus hands over, as [`Peer::pause`] pauses a peer.
     #[cfg(target_os = "linux")]
-    pub(crate) fn pause(&self, since: Instant) {
-        self.recipient.hand_over_from(since);
+    pub(crate) fn pause(&self) {
+        let prepared = self.conn.prepare_hand_over();
+        debug_assert!(prepared, "the connection of a client can't be handed over");
         self.canceled_event.notify(usize::MAX);
     }
 

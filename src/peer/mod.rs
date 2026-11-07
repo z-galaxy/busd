@@ -9,6 +9,8 @@ mod pending_calls;
 pub use pending_calls::*;
 
 use crate::trace;
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 use zbus::{
@@ -16,8 +18,6 @@ use zbus::{
     names::{BusName, OwnedUniqueName},
     Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
-#[cfg(target_os = "linux")]
-use {anyhow::Context, std::time::Instant};
 
 #[cfg(target_os = "linux")]
 use crate::user::Users;
@@ -249,8 +249,9 @@ impl Peer {
         let conn = Connection::from(&msg_stream);
         trace!("handed over: {:?}", conn);
         // No handshake looked the credentials of the client up, as for a new client, so they are
-        // looked up now, before anything is sent to the client, which a lookup would wait for.
-        // zbus keeps them. They tell the user of the client too.
+        // looked up now, before anything is sent to the client, which a lookup would wait for,
+        // what the instance that handed the client over left unwritten included. zbus keeps them.
+        // They tell the user of the client too.
         let uid = conn
             .peer_creds()
             .await?
@@ -281,13 +282,14 @@ impl Peer {
         self.id == BUS_ID
     }
 
-    /// Pause the peer, as the bus hands over from `since`: have the task that serves the peer give
-    /// the stream of its messages back, once it is done with those that it took, and give the peer
-    /// as long as it has to take a message, from `since` on, to take all that the bus sends it from
-    /// then on.
+    /// Pause the peer, as the bus hands over: have the task that serves the peer give the stream of
+    /// its messages back, once it is done with those that it took, and have no send to the peer
+    /// wait for it to take what the bus sends it from now on, as what it doesn't take goes on with
+    /// the hand-over of its connection.
     #[cfg(target_os = "linux")]
-    pub(crate) fn pause(&self, since: Instant) {
-        self.recipient.hand_over_from(since);
+    pub(crate) fn pause(&self) {
+        let prepared = self.conn.prepare_hand_over();
+        debug_assert!(prepared, "the connection of a client can't be handed over");
         self.canceled_event.notify(usize::MAX);
     }
 

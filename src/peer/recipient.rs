@@ -7,11 +7,6 @@ use std::{
     },
     time::Duration,
 };
-#[cfg(target_os = "linux")]
-use std::{
-    sync::{self, PoisonError},
-    time::Instant,
-};
 
 use zbus::{names::OwnedUniqueName, Connection, Message};
 use zruntime::{lock::Mutex, SharedRuntime};
@@ -33,6 +28,10 @@ use crate::{debug, warn};
 /// or a signal that it expects, as the bus does, but it rejects a method call that the callee can't
 /// take, with `LimitsExceeded`, and keeps the callee. The bus disconnects the callee then too, as a
 /// send that times out may leave part of a message on the socket.
+///
+/// While the bus hands over to its next instance, it doesn't wait for room: zbus keeps what the
+/// socket doesn't take, which goes on with the hand-over of the connection, and the next instance
+/// writes that to the client first, with [`Recipient::flush`].
 #[derive(Debug, Clone)]
 pub struct Recipient(Kind);
 
@@ -50,8 +49,6 @@ impl Recipient {
             timeout,
             sending: Mutex::new(()),
             disconnecting: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
-            deadline: sync::Mutex::new(None),
         };
 
         Ok(Self(Kind::Client(Arc::new(client))))
@@ -76,17 +73,16 @@ impl Recipient {
         }
     }
 
-    /// Give the client as long as it has to take a message, from `since` on, to take all that the
-    /// bus sends it from then on, as the bus hands over from `since`: a client that doesn't read
-    /// then holds the hand-over up for no longer than that, rather than for that long each time
-    /// that the bus sends it something.
+    /// Write what the connection of the client took to send and didn't write yet, such as what the
+    /// instance of the bus that handed the client over sent it and it didn't take, in turn with the
+    /// sends to the client.
+    ///
+    /// A client that this fails to, or that doesn't take it within its time limit, gets
+    /// disconnected, as when a send to it fails, or times out.
     #[cfg(target_os = "linux")]
-    pub(crate) fn hand_over_from(&self, since: Instant) {
+    pub(crate) async fn flush(&self) {
         if let Kind::Client(client) = &self.0 {
-            *client
-                .deadline
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = since.checked_add(client.timeout);
+            client.flush().await;
         }
     }
 
@@ -186,10 +182,6 @@ struct Client {
     /// client. A send checks this once its turn comes, which is only once the send that failed
     /// has let go of the connection.
     disconnecting: AtomicBool,
-    /// When the client has to have taken what the bus sends it by, at the latest, if the bus hands
-    /// over.
-    #[cfg(target_os = "linux")]
-    deadline: sync::Mutex<Option<Instant>>,
 }
 
 impl Client {
@@ -198,9 +190,8 @@ impl Client {
         if self.disconnecting.load(Ordering::SeqCst) {
             return Vec::new();
         }
-        let timeout = self.timeout();
         let (failure, first) = {
-            let send = pin!(self.runtime.timeout(timeout, self.send_in_turn(msgs)));
+            let send = pin!(self.runtime.timeout(self.timeout, self.send_in_turn(msgs)));
             let failure = match send.await {
                 Ok(Ok(dropped)) => return dropped,
                 Ok(Err(e)) => Failure::Error(e),
@@ -217,15 +208,49 @@ impl Client {
         if !first {
             return Vec::new();
         }
+        self.disconnect(failure, &format!("{} messages", msgs.len()))
+            .await;
+
+        Vec::new()
+    }
+
+    /// Write what the connection has left to write, in turn with the sends, within the time limit
+    /// of the client, and disconnect the client if that fails, or takes longer, as a send does.
+    #[cfg(target_os = "linux")]
+    async fn flush(&self) {
+        if self.disconnecting.load(Ordering::SeqCst) {
+            return;
+        }
+        let unwritten = self.conn.unwritten_len();
+        let (failure, first) = {
+            let flush = pin!(self.runtime.timeout(self.timeout, self.flush_in_turn()));
+            let failure = match flush.await {
+                Ok(Ok(())) => return,
+                Ok(Err(e)) => Failure::Error(e),
+                Err(_) => Failure::Timeout,
+            };
+            // As for a send: see `Client::send`.
+            let first = !self.disconnecting.swap(true, Ordering::SeqCst);
+
+            (failure, first)
+        };
+        // Another send got here first, and disconnects the client.
+        if !first {
+            return;
+        }
+        let what = format!("the {unwritten} bytes that were left to write to it");
+        self.disconnect(failure, &what).await;
+    }
+
+    /// Disconnect the client, as sending it `what` failed, or timed out, as `failure` says.
+    async fn disconnect(&self, failure: Failure, what: &str) {
         match failure {
             Failure::Timeout => warn!(
-                "Disconnecting `{}`, as it didn't take {} messages within {:?}",
-                self.unique_name,
-                msgs.len(),
-                timeout
+                "Disconnecting `{}`, as it didn't take {what} within {:?}",
+                self.unique_name, self.timeout
             ),
             Failure::Error(e) => debug!(
-                "Disconnecting `{}`, as sending messages to it failed: {e}",
+                "Disconnecting `{}`, as sending {what} to it failed: {e}",
                 self.unique_name
             ),
         }
@@ -238,21 +263,6 @@ impl Client {
                 self.unique_name
             );
         }
-
-        Vec::new()
-    }
-
-    /// How long a send that starts now may take: the time limit of the client, or what is left of
-    /// it for the hand-over, if the bus hands over.
-    fn timeout(&self) -> Duration {
-        #[cfg(target_os = "linux")]
-        if let Some(deadline) = *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) {
-            return self
-                .timeout
-                .min(deadline.saturating_duration_since(Instant::now()));
-        }
-
-        self.timeout
     }
 
     /// Send `msgs` once no other send to the client is under way, unless the client is being
@@ -284,6 +294,18 @@ impl Client {
             }
             result => result.map(|()| Vec::new()),
         }
+    }
+
+    /// Write what the connection has left to write once no send to the client is under way, unless
+    /// the client is being disconnected by then.
+    #[cfg(target_os = "linux")]
+    async fn flush_in_turn(&self) -> zbus::Result<()> {
+        let _turn = self.sending.lock().await;
+        if self.disconnecting.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        self.conn.flush().await
     }
 }
 

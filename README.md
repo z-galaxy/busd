@@ -118,12 +118,14 @@ on one of its own, and tells systemd once it's ready, for a service of `Type=not
 With a [file descriptor store], under systemd 254 or later, busd survives its restarts without its
 clients noticing anything but a pause. On `SIGTERM`, rather than disconnect them, it stops taking
 their messages, finishes what it took, such as forwarding those messages and answering the calls to
-it among them, and hands their connections and its state over to systemd: their unique names, the
-well-known names that they own or queue for, their match rules, the calls that wait for their
-replies, and what zbus read of their messages but busd hasn't taken yet, as the start of one that a
-client is in the middle of sending, with the file descriptors that came with it. On a restart,
-systemd hands all of that over to the next instance of busd, which serves the clients on from
-there, on the same connections. On a stop, systemd closes them. A session bus, for example:
+it among them, without waiting for the clients to take what it sends them, and hands their
+connections and its state over to systemd: their unique names, the well-known names that they own or
+queue for, their match rules, the calls that wait for their replies, what zbus read of their
+messages but busd hasn't taken yet, as the start of one that a client is in the middle of sending,
+and what busd sent them that they haven't taken yet, with the file descriptors that came with those.
+On a restart, systemd hands all of that over to the next instance of busd, which serves the clients
+on from there, on the same connections, and writes them what they hadn't taken first. On a stop,
+systemd closes them. A session bus, for example:
 
 ```ini
 # ~/.config/systemd/user/busd.socket
@@ -139,8 +141,9 @@ WantedBy=sockets.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/busd --session
-# One for each client, and for each file descriptor that came with the messages of a client that
-# busd didn't take as it stops, and two more. Those that don't fit get disconnected on a restart.
+# One for each client, and for each file descriptor of the messages that busd didn't take of a
+# client as it stops, or that the client didn't take of busd, and two more. Those that don't fit get
+# disconnected on a restart.
 FileDescriptorStoreMax=4096
 # systemd passes the next instance what was stored under its soft limit of open files, which has to
 # take that and a few more.

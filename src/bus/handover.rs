@@ -26,19 +26,20 @@ impl Bus {
     /// The bus pauses: it stops taking the messages of each client, once it is done with those
     /// that it took. It forwards those, answers the calls to it that it got, and sends what it has
     /// to send on its own, such as the signals of the names that change owners, until nothing is
-    /// on its way through it. The connection of each client then goes to the next instance, with
-    /// the messages that zbus read of the client and that the bus didn't take, what it read of a
-    /// message that the client is in the middle of sending, if any, and the file descriptors that
-    /// came with those, for the next instance to go on from there. What the clients send meanwhile
-    /// waits for the next instance too, as do the clients that connect, in the socket that the bus
+    /// on its way through it, without waiting for its clients to take what it sends them. The
+    /// connection of each client then goes to the next instance, with the messages that zbus read
+    /// of the client and that the bus didn't take, what it read of a message that the client is in
+    /// the middle of sending, if any, what the bus sent the client and the client didn't take, and
+    /// the file descriptors that came with those, for the next instance to go on from there: it
+    /// writes the client what the client didn't take first. What the clients send meanwhile waits
+    /// for the next instance too, as do the clients that connect, in the socket that the bus
     /// listens on. A client that goes meanwhile, by the time that the bus is done with what it
     /// took, has what it sent before it went taken, and the bus cleans up after it, as after any
     /// client that goes, as its connection may have ended on an error, or been closed by the bus,
-    /// as a send to the client failed, neither of which can be handed over. So does a client that
-    /// the bus disconnects meanwhile, as it doesn't take what the bus sends it in time. One that
-    /// goes after that, as it closes its end, is handed over with what it sent, for the next
-    /// instance to pass that on, and clean up after it. The clients still in the middle of their
-    /// handshakes have [`STOP_TIMEOUT`] to finish them, and get disconnected if they don't.
+    /// as a send to the client failed, neither of which can be handed over. One that goes after
+    /// that, as it closes its end, is handed over with what it sent, for the next instance to pass
+    /// that on, and clean up after it. The clients still in the middle of their handshakes have
+    /// [`STOP_TIMEOUT`] to finish them, and get disconnected if they don't.
     ///
     /// The bus lets go of its clients without disconnecting them: their connections end only once
     /// all of their sockets are closed, those of the [`Handover`] included. A client whose
@@ -152,9 +153,9 @@ pub struct ClientHandover {
 /// before the bus lets go of it, which disconnects it.
 ///
 /// The bus doesn't wait for the other clients to be done sending their messages: it stops taking
-/// them once it is done with those that it took, wherever the clients are in sending the next ones,
-/// and the hand-over waits for those that it took to reach their recipients, each of which has as
-/// long as it has to take a message, from when the hand-over starts.
+/// them once it is done with those that it took, wherever the clients are in sending the next ones.
+/// Nor does it wait for its clients to take what it sends them: what a client doesn't take goes on
+/// with the hand-over of its connection.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The peers, monitors and names of a bus, as it hands them over.
