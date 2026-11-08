@@ -67,7 +67,7 @@ use std::{
 
 use busd::bus::Bus;
 #[cfg(target_os = "linux")]
-use busd::systemd::Notifier;
+use busd::{peer::SEND_TIMEOUT, systemd::Notifier};
 use calls::Caller;
 use cpus::{Cpu, Cpus};
 use crew::{AbortOnPanic, Crew, Member, Rounds};
@@ -829,7 +829,7 @@ impl Drop for RestartingBus {
 async fn restart_in_process(bus: Bus) -> Bus {
     let handover = bus.hand_over().await.expect("the bus hands over");
 
-    Bus::take_over(handover, None)
+    Bus::take_over(handover, None, SEND_TIMEOUT)
         .await
         .expect("the next instance takes over")
 }
