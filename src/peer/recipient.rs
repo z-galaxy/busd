@@ -10,6 +10,8 @@ use std::{
 
 use zbus::{names::OwnedUniqueName, Connection, Message};
 use zruntime::{lock::Mutex, SharedRuntime};
+#[cfg(target_os = "linux")]
+use zruntime::{spawn, Shared, Task};
 
 use crate::{debug, warn};
 
@@ -75,15 +77,24 @@ impl Recipient {
 
     /// Write what the connection of the client took to send and didn't write yet, such as what the
     /// instance of the bus that handed the client over sent it and it didn't take, in turn with the
-    /// sends to the client.
+    /// sends to the client, in a task of its own: none if nothing is left to write, nor for the bus
+    /// itself.
     ///
     /// A client that this fails to, or that doesn't take it within its time limit, gets
-    /// disconnected, as when a send to it fails, or times out.
+    /// disconnected, as when a send to it fails, or times out. Dropping the task stops the write:
+    /// what it didn't write is left for the next send to the client to write first, or for the
+    /// hand-over of the connection to hand over.
     #[cfg(target_os = "linux")]
-    pub(crate) async fn flush(&self) {
-        if let Kind::Client(client) = &self.0 {
-            client.flush().await;
+    pub(crate) fn flush(&self) -> Option<Task<(), Shared>> {
+        let Kind::Client(client) = &self.0 else {
+            return None;
+        };
+        if client.conn.unwritten_len() == 0 {
+            return None;
         }
+        let client = client.clone();
+
+        Some(spawn(async move { client.flush().await }))
     }
 
     /// How long the bus gives the client to take each message; none for the bus itself.

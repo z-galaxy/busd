@@ -1,6 +1,8 @@
 mod stream;
 pub use stream::*;
 use zruntime::{Event, EventListener};
+#[cfg(target_os = "linux")]
+use zruntime::{Shared, Task};
 mod monitor;
 pub use monitor::*;
 mod recipient;
@@ -51,6 +53,10 @@ pub struct Peer {
     /// the bus pauses to hand over.
     #[cfg(target_os = "linux")]
     paused: Option<MessageStream>,
+    /// The task that writes the peer what the instance of the bus that handed it over left
+    /// unwritten, while it is under way: see [`Peer::flush`].
+    #[cfg(target_os = "linux")]
+    flushing: Option<Task<(), Shared>>,
 }
 
 impl Peer {
@@ -99,6 +105,8 @@ impl Peer {
             canceled_event: Event::new(),
             #[cfg(target_os = "linux")]
             paused: None,
+            #[cfg(target_os = "linux")]
+            flushing: None,
         };
         let stream = Stream::for_peer(&peer, msg_stream);
         Ok((peer, stream))
@@ -129,6 +137,8 @@ impl Peer {
             canceled_event: Event::new(),
             #[cfg(target_os = "linux")]
             paused: None,
+            #[cfg(target_os = "linux")]
+            flushing: None,
         };
         let stream = Stream::for_peer(&peer, msg_stream);
         Ok((peer, stream))
@@ -271,6 +281,7 @@ impl Peer {
             greeted,
             canceled_event: Event::new(),
             paused: None,
+            flushing: None,
         };
         let stream = Stream::for_peer(&peer, msg_stream);
         Ok((peer, stream))
@@ -283,14 +294,29 @@ impl Peer {
     }
 
     /// Pause the peer, as the bus hands over: have the task that serves the peer give the stream of
-    /// its messages back, once it is done with those that it took, and have no send to the peer
-    /// wait for it to take what the bus sends it from now on, as what it doesn't take goes on with
-    /// the hand-over of its connection.
+    /// its messages back, once it is done with those that it took, and have no send to the peer,
+    /// nor the hand-over of its connection, wait for it to take what the bus sends it from now on,
+    /// as what it doesn't take goes on with the hand-over. That stops the write of what the
+    /// instance of the bus that handed the peer over left unwritten, if it is still under way
+    /// ([`Peer::flush`]).
     #[cfg(target_os = "linux")]
-    pub(crate) fn pause(&self) {
+    pub(crate) fn pause(&mut self) {
         let prepared = self.conn.prepare_hand_over();
         debug_assert!(prepared, "the connection of a client can't be handed over");
+        // The write waits for the peer to take it, for as long as the peer has to take a message,
+        // and holds the turn to write meanwhile, which the sends to the peer and the hand-over of
+        // its connection wait for. Dropping its task lets go of the turn, and leaves what it didn't
+        // write to them.
+        self.flushing = None;
         self.canceled_event.notify(usize::MAX);
+    }
+
+    /// Write the peer what the instance of the bus that handed it over left unwritten, if anything,
+    /// in a task of its own, as [`Recipient::flush`] does, until the bus pauses the peer, or the
+    /// monitor that it becomes, to hand over in turn ([`Peer::pause`]), or lets go of it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn flush(&mut self) {
+        self.flushing = self.recipient.flush();
     }
 
     /// The stream of the messages of the peer, if the task that served the peer gave it back, as

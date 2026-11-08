@@ -35,21 +35,21 @@ impl Peers {
     ///
     /// No send to a client waits for the client to take what the bus sends it from now on: what a
     /// client doesn't take goes on with the hand-over of its connection, for the next instance to
-    /// write to the client first. So a client that doesn't read holds no hand-over up, unless the
-    /// bus is still writing to it what the instance before it left unwritten, which takes as long
-    /// as the client has to take a message at most ([`Recipient::flush`]). Once the bus is paused,
-    /// it takes no more clients: one whose handshake is still under way by then gets disconnected
-    /// at once, as [`Peers::add`] says.
+    /// write to the client first. The bus stops writing a client what the instance before it left
+    /// unwritten, too, if it still is ([`Peer::flush`]), which the sends to the client, and the
+    /// hand-over of its connection, would wait for otherwise. So a client that doesn't read holds
+    /// no hand-over up. Once the bus is paused, it takes no more clients: one whose handshake is
+    /// still under way by then gets disconnected at once, as [`Peers::add`] says.
     pub(crate) async fn pause(&self, timeout: Duration) -> Result<()> {
         let runtime = SharedRuntime::current()?;
         let deadline = Instant::now() + timeout;
         {
             let mut routing = self.routing_mut().await;
             routing.handing_over = true;
-            for peer in routing.peers.values().filter(|peer| !peer.is_bus()) {
+            for peer in routing.peers.values_mut().filter(|peer| !peer.is_bus()) {
                 peer.pause();
             }
-            for monitor in routing.monitors.values() {
+            for monitor in routing.monitors.values_mut() {
                 monitor.pause();
             }
         }
@@ -259,7 +259,8 @@ impl Peers {
     ///
     /// What the instance that handed a client over sent it, and the client didn't take, goes to the
     /// client first, as the client takes it: a client that doesn't take it within `send_timeout`
-    /// gets disconnected, as when a send to it times out.
+    /// gets disconnected, as when a send to it times out. What is left of it once the bus pauses,
+    /// to hand over in turn, goes on with that hand-over.
     pub(crate) async fn restore(
         self: &Arc<Self>,
         snapshot: Snapshot,
@@ -300,8 +301,6 @@ impl Peers {
             }
         }
         let mut restored_monitors = Vec::new();
-        // Those that have what the instance that handed them over sent them to take still.
-        let mut unwritten = Vec::new();
         for state in monitors {
             let id = usize::try_from(state.id)?;
             let Some(client) = clients.remove(&id) else {
@@ -352,28 +351,22 @@ impl Peers {
                         .map(|(peer, _, _)| (peer.id(), peer.caller().clone())),
                 )
                 .collect();
-            for (peer, stream, records) in restored {
+            for (mut peer, stream, records) in restored {
                 for (caller_id, _, serial) in records {
                     if let Some(caller) = callers.get(&caller_id) {
                         peer.pending_calls()
                             .add_handed_over(caller_id, caller, serial);
                     }
                 }
-                if peer.conn().unwritten_len() > 0 {
-                    unwritten.push(peer.recipient().clone());
-                }
+                // zbus writes what is left ahead of anything else that the bus sends the client
+                // meanwhile.
+                peer.flush();
                 self.insert(&mut routing, peer, stream);
             }
-            for (monitor, stream) in restored_monitors {
-                if monitor.conn().unwritten_len() > 0 {
-                    unwritten.push(monitor.recipient().clone());
-                }
+            for (mut monitor, stream) in restored_monitors {
+                monitor.flush();
                 self.insert_monitor(&mut routing, monitor, stream);
             }
-        }
-        // zbus writes what is left ahead of anything else that the bus sends the client meanwhile.
-        for recipient in unwritten {
-            spawn(async move { recipient.flush().await }).detach();
         }
         // The bus serves its clients from here on, so it goes on whatever comes.
         for (unique_name, records, names_changes) in gone {
@@ -598,8 +591,8 @@ impl Client {
         let stream = self.stream.as_mut()?;
         let timeout = self.recipient.send_timeout()?;
         let error = match runtime.timeout(timeout, stream.hand_over()).await {
-            // A send or a flush to the client that held the hand-over up may have failed, or timed
-            // out, meanwhile, and the hand-over may have got the connection before the closing of
+            // A send to the client may have failed, or timed out, as the hand-over waited for its
+            // turn to write, and the hand-over may have got the connection before the closing of
             // the connection did: dropping the hand-over closes what it holds.
             Ok(Ok(_)) if self.recipient.disconnecting() => {
                 debug!("Leaving `{name}` out of the hand-over, as the bus is disconnecting it");
@@ -922,10 +915,10 @@ mod tests {
         });
     }
 
-    /// A client that the bus starts disconnecting while the hand-over of its connection waits, as
-    /// when a flush to the client times out as it holds the hand-over up, isn't handed over, even
-    /// where the hand-over gets the connection before the closing of the connection does, as with
-    /// a lock that goes to the first to wait for it.
+    /// A client that the bus starts disconnecting while the hand-over of its connection waits for
+    /// its turn to write, as when a send to the client that holds the turn fails, isn't handed
+    /// over, even where the hand-over gets the connection before the closing of the connection
+    /// does, as with a lock that goes to the first to wait for it.
     #[test]
     #[timeout(30000)]
     fn client_that_the_bus_disconnects_as_its_hand_over_waits_is_left_out() {
@@ -972,8 +965,8 @@ mod tests {
                 "the hand-over didn't wait for the flush"
             );
 
-            // The bus flags the client before the flush lets go of the connection, as when the
-            // flush times out, and nothing closes the connection before the hand-over gets it.
+            // The bus flags the client before the flush lets go of the connection, as it flags one
+            // that a send fails to, and nothing closes the connection before the hand-over gets it.
             recipient.hand_over();
             drop(flushing);
             let (_, clients) = handing_over.await.unwrap();

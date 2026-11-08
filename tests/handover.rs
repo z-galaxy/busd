@@ -732,6 +732,63 @@ fn stalled_receivers_are_handed_over() {
     });
 }
 
+/// The next instance, which writes a receiver that doesn't take signals what the instance before
+/// it didn't write to it, stops as it pauses to hand over in turn: the receiver holds no hand-over
+/// up, through that write or through the signals that the next instance passes on to it after it,
+/// and is handed over with what neither instance wrote to it. It gets the signals all the same,
+/// once and in order, from the instance after them.
+#[test]
+#[timeout(30000)]
+fn writing_what_was_left_unwritten_holds_no_hand_over_up() {
+    init_tracing();
+
+    zruntime::block_on(async {
+        // A receiver that doesn't take signals for a while is not to be disconnected meanwhile.
+        let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
+        bus.set_send_timeout(LONG_SEND_TIMEOUT);
+        let (bus, address) = serve(bus);
+        let mut receiver = connect(&address).await;
+        let mut signals = listen(&receiver, signal_rule("Tick")).await;
+        // Mind the queue of one signal: see `hand_over_does_not_wait_for_a_slow_receiver`.
+        receiver.set_max_queued(NonZeroUsize::MIN);
+        let sender = connect(&address).await;
+        let runtime = SharedRuntime::current().unwrap();
+
+        // The receiver takes none of the signals, so the bus hands it over with those that it
+        // didn't write to it, and the sender with those that zbus read and the bus didn't take.
+        within(send_ticks(sender.clone(), 0..CHUNKS, CHUNK))
+            .await
+            .unwrap();
+        runtime.sleep(FILL_UP).await;
+        let handover = within(bus.hand_over()).await;
+        let bus = Running::take_over_with(handover, LONG_SEND_TIMEOUT).await;
+        // The next instance writes the receiver what the bus didn't, as far as the receiver takes
+        // it, and passes the other signals on to it after that.
+        runtime.sleep(FILL_UP).await;
+
+        let handover = within(bus.hand_over()).await;
+        let unwritten = handover
+            .clients
+            .iter()
+            .find(|client| client.id == id_of(&receiver))
+            .expect("The receiver wasn't handed over")
+            .connection
+            .unwritten_len();
+        assert!(unwritten > 0, "The bus wrote the receiver all that it sent");
+        let bus = Running::take_over(handover).await;
+
+        let mut ticks = Vec::new();
+        for _ in 0..CHUNKS {
+            ticks.push(next_tick(&mut signals).await.unwrap());
+        }
+        assert_eq!(ticks, (0..CHUNKS).collect::<Vec<_>>());
+        get_id(&sender).await;
+        get_id(&receiver).await;
+
+        bus.finish().await;
+    });
+}
+
 /// A client that goes while the bus hands over, so that its socket is closed by the time the next
 /// instance serves it, is cleaned up by that instance as by any bus: the other clients are told
 /// that it and the name that it owned lost their owner.
