@@ -6,6 +6,7 @@ use std::{
 };
 
 use zbus::names::OwnedUniqueName;
+use zruntime::Event;
 
 use crate::user::{Charge, User};
 
@@ -30,6 +31,9 @@ pub struct PendingCalls {
     calls: Mutex<Calls>,
     /// The user of the peer, which the records are objects of; none for the bus itself.
     user: Option<Arc<User>>,
+    /// Notified as the last record goes, for the records of the bus itself alone: see
+    /// [`PendingCalls::of_bus`].
+    emptied: Option<Event>,
 }
 
 impl PendingCalls {
@@ -38,6 +42,7 @@ impl PendingCalls {
         Self {
             calls: Mutex::default(),
             user: Some(user),
+            emptied: None,
         }
     }
 
@@ -46,10 +51,13 @@ impl PendingCalls {
     /// The bus answers the calls to it itself, as they come in, and only records them for a
     /// hand-over to wait for its answers, so their records are no one's objects, and the bus
     /// refuses none of them for a quota: dbus-broker keeps no records of the calls to it at all.
+    /// Unlike those of a client, the records tell as the last of them goes, which the hand-over
+    /// waits for.
     pub fn of_bus() -> Self {
         Self {
             calls: Mutex::default(),
             user: None,
+            emptied: Some(Event::new()),
         }
     }
 
@@ -84,12 +92,33 @@ impl PendingCalls {
     /// Take the record of the call of the caller whose number is `caller_id`, with `serial`, away,
     /// if there is one, in which case it's `true`.
     pub fn remove(&self, caller_id: usize, serial: NonZeroU32) -> bool {
-        self.calls().remove(&(caller_id, serial)).is_some()
+        let emptied = {
+            let mut calls = self.calls();
+            if calls.remove(&(caller_id, serial)).is_none() {
+                return false;
+            }
+
+            calls.is_empty()
+        };
+        if emptied {
+            self.notify_emptied();
+        }
+
+        true
     }
 
     /// Forget the calls of the caller whose number is `caller_id`, which goes.
     pub fn forget(&self, caller_id: usize) {
-        self.calls().retain(|(id, _), _| *id != caller_id);
+        let emptied = {
+            let mut calls = self.calls();
+            let had_any = !calls.is_empty();
+            calls.retain(|(id, _), _| *id != caller_id);
+
+            had_any && calls.is_empty()
+        };
+        if emptied {
+            self.notify_emptied();
+        }
     }
 
     /// Record the call of `caller`, whose number is `caller_id`, with `serial`, which another
@@ -136,14 +165,51 @@ impl PendingCalls {
 
     /// Take all of the records away: the caller and the serial of each call.
     pub fn take(&self) -> impl Iterator<Item = (OwnedUniqueName, NonZeroU32)> {
-        mem::take(&mut *self.calls())
+        let calls = mem::take(&mut *self.calls());
+        if !calls.is_empty() {
+            self.notify_emptied();
+        }
+
+        calls
             .into_iter()
             .map(|((_, serial), call)| (call.caller.unique_name.clone(), serial))
+    }
+
+    /// Wait for no call to wait, as a hand-over waits for the bus to have answered every call to
+    /// it.
+    ///
+    /// # Panics
+    ///
+    /// If these are the records of a client, which don't tell as their last one goes: only those of
+    /// the bus itself do ([`PendingCalls::of_bus`]).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn answered(&self) {
+        let emptied = self
+            .emptied
+            .as_ref()
+            .expect("the records of a client don't tell as their last one goes");
+        loop {
+            // The listener comes first, so that the last record going right after the check isn't
+            // missed.
+            let listener = emptied.listen();
+            if self.is_empty() {
+                return;
+            }
+            listener.await;
+        }
     }
 
     fn calls(&self) -> MutexGuard<'_, Calls> {
         // Nothing can panic while the lock is held.
         self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Tell those that wait for no call to wait that the last record went, where the records tell
+    /// that. Called clear of the lock, as the wakes are somebody else's code.
+    fn notify_emptied(&self) {
+        if let Some(emptied) = &self.emptied {
+            emptied.notify(usize::MAX);
+        }
     }
 }
 
