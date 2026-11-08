@@ -86,10 +86,17 @@ impl Bus {
     /// replies, from where their bus left them. Those whose connections `handover` lacks went
     /// meanwhile, so the bus cleans up after them as after any client that goes.
     ///
-    /// The settings of the bus, such as [`Bus::set_max_objects_per_user`], are those of a new bus,
-    /// and apply to the clients that it took over too, once set on the returned bus. The objects
-    /// that it took over count, even beyond a maximum that is lower than the previous one.
-    pub async fn take_over(handover: Handover, listener: Option<OwnedFd>) -> Result<Self> {
+    /// The bus gives each client `send_timeout` to take a message, as [`Bus::set_send_timeout`]
+    /// sets it, the clients of `handover` included, from the start: the bus writes each of those
+    /// what the previous instance left unwritten as soon as it serves them, within that time. Its
+    /// other settings, such as [`Bus::set_max_objects_per_user`], are those of a new bus, and apply
+    /// to the clients that it took over too, once set on the returned bus. The objects that it took
+    /// over count, even beyond a maximum that is lower than the previous one.
+    pub async fn take_over(
+        handover: Handover,
+        listener: Option<OwnedFd>,
+        send_timeout: Duration,
+    ) -> Result<Self> {
         let state = handover.state;
         let (listener, bound) = match (listener, handover.listener) {
             (Some(listener), _) => (listener, false),
@@ -101,6 +108,7 @@ impl Bus {
         let guid = state.guid;
         let mut bus = Self::new(listener, address, guid, bound).await?;
         bus.inner.next_id = usize::try_from(state.last_id)?;
+        bus.set_send_timeout(send_timeout);
         let clients: HashMap<_, _> = handover
             .clients
             .into_iter()

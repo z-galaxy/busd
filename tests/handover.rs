@@ -213,7 +213,9 @@ fn users_keep_their_objects() {
 
         // The two clients and the call are all of the objects that the next instance keeps for
         // their user, the user of the tests.
-        let mut next = Bus::take_over(bus.hand_over().await, None).await.unwrap();
+        let mut next = Bus::take_over(bus.hand_over().await, None, SEND_TIMEOUT)
+            .await
+            .unwrap();
         next.set_max_objects_per_user(3);
         let bus = Running::new(next);
         let refused = connection::Builder::address(address.as_str()).build().await;
@@ -609,7 +611,7 @@ fn bus_on_a_given_socket_hands_over() {
 
         let handover = bus.hand_over().await;
         assert!(handover.listener.is_none());
-        let bus = Bus::take_over(handover, Some(activator_copy))
+        let bus = Bus::take_over(handover, Some(activator_copy), SEND_TIMEOUT)
             .await
             .unwrap();
         let (bus, _) = serve(bus);
@@ -631,7 +633,8 @@ fn bus_on_a_given_socket_hands_over() {
 /// Clients that don't take what the bus sends them hold no hand-over up: those that the bus is
 /// passing signals on to as it pauses are handed over with what the bus didn't write to them, as
 /// are the other clients. The next instance, which serves the others on meanwhile, writes them that
-/// first, and disconnects them once they don't take it within the time limit of the bus to send.
+/// first, and disconnects them once they don't take it within the time limit to send that it was
+/// given as it took them over.
 #[test]
 #[timeout(30000)]
 fn stalled_receivers_are_handed_over() {
@@ -684,7 +687,7 @@ fn stalled_receivers_are_handed_over() {
             );
         }
         let started = Instant::now();
-        let bus = Running::take_over(handover).await;
+        let bus = Running::take_over_with(handover, SHORT_SEND_TIMEOUT).await;
 
         // The next instance serves the others meanwhile, and disconnects the receivers once their
         // time is up.
@@ -707,12 +710,12 @@ fn stalled_receivers_are_handed_over() {
             }
         };
         runtime
-            .timeout(SEND_TIMEOUT + WAIT, disconnecting)
+            .timeout(SHORT_SEND_TIMEOUT + WAIT, disconnecting)
             .await
             .expect("The next instance kept the receivers");
         let took = started.elapsed();
         assert!(
-            took >= SEND_TIMEOUT,
+            took >= SHORT_SEND_TIMEOUT,
             "The next instance disconnected the receivers after {took:?}, before their time was up"
         );
         for sender in &senders {
@@ -724,6 +727,63 @@ fn stalled_receivers_are_handed_over() {
             drop(signals);
             within(receiver.closed()).await;
         }
+
+        bus.finish().await;
+    });
+}
+
+/// The next instance, which writes a receiver that doesn't take signals what the instance before
+/// it didn't write to it, stops as it pauses to hand over in turn: the receiver holds no hand-over
+/// up, through that write or through the signals that the next instance passes on to it after it,
+/// and is handed over with what neither instance wrote to it. It gets the signals all the same,
+/// once and in order, from the instance after them.
+#[test]
+#[timeout(30000)]
+fn writing_what_was_left_unwritten_holds_no_hand_over_up() {
+    init_tracing();
+
+    zruntime::block_on(async {
+        // A receiver that doesn't take signals for a while is not to be disconnected meanwhile.
+        let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
+        bus.set_send_timeout(LONG_SEND_TIMEOUT);
+        let (bus, address) = serve(bus);
+        let mut receiver = connect(&address).await;
+        let mut signals = listen(&receiver, signal_rule("Tick")).await;
+        // Mind the queue of one signal: see `hand_over_does_not_wait_for_a_slow_receiver`.
+        receiver.set_max_queued(NonZeroUsize::MIN);
+        let sender = connect(&address).await;
+        let runtime = SharedRuntime::current().unwrap();
+
+        // The receiver takes none of the signals, so the bus hands it over with those that it
+        // didn't write to it, and the sender with those that zbus read and the bus didn't take.
+        within(send_ticks(sender.clone(), 0..CHUNKS, CHUNK))
+            .await
+            .unwrap();
+        runtime.sleep(FILL_UP).await;
+        let handover = within(bus.hand_over()).await;
+        let bus = Running::take_over_with(handover, LONG_SEND_TIMEOUT).await;
+        // The next instance writes the receiver what the bus didn't, as far as the receiver takes
+        // it, and passes the other signals on to it after that.
+        runtime.sleep(FILL_UP).await;
+
+        let handover = within(bus.hand_over()).await;
+        let unwritten = handover
+            .clients
+            .iter()
+            .find(|client| client.id == id_of(&receiver))
+            .expect("The receiver wasn't handed over")
+            .connection
+            .unwritten_len();
+        assert!(unwritten > 0, "The bus wrote the receiver all that it sent");
+        let bus = Running::take_over(handover).await;
+
+        let mut ticks = Vec::new();
+        for _ in 0..CHUNKS {
+            ticks.push(next_tick(&mut signals).await.unwrap());
+        }
+        assert_eq!(ticks, (0..CHUNKS).collect::<Vec<_>>());
+        get_id(&sender).await;
+        get_id(&receiver).await;
 
         bus.finish().await;
     });
@@ -1811,7 +1871,13 @@ impl Running {
 
     /// Run the instance of the bus that takes over from the one that handed `handover` over.
     async fn take_over(handover: Handover) -> Self {
-        Self::new(Bus::take_over(handover, None).await.unwrap())
+        Self::take_over_with(handover, SEND_TIMEOUT).await
+    }
+
+    /// Run the instance of the bus that takes over from the one that handed `handover` over, and
+    /// gives each client `send_timeout` to take a message, those that it takes over included.
+    async fn take_over_with(handover: Handover, send_timeout: Duration) -> Self {
+        Self::new(Bus::take_over(handover, None, send_timeout).await.unwrap())
     }
 
     /// Stop the bus and clean up after it.
@@ -1852,6 +1918,10 @@ const QUIET: Duration = Duration::from_millis(200);
 /// How long the bus is given to send a message in the tests where a client doesn't take it for a
 /// while.
 const LONG_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the bus is given to send a message in the tests where it disconnects a client that
+/// doesn't take it, so that they don't wait long for that.
+const SHORT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long the tests give the bus to fill up a receiver that doesn't take what the bus sends it,
 /// and how long they give a bus that waits for a handshake as it hands over to be done, at least.

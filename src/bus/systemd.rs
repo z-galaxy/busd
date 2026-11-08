@@ -23,6 +23,7 @@ use zruntime::SharedRuntime;
 use super::{handover::State, Bus, ClientHandover, Handover};
 use crate::{
     debug, error, info,
+    peer::SEND_TIMEOUT,
     systemd::{self, Notifier},
     warn,
 };
@@ -175,7 +176,7 @@ impl Bus {
         let clients = handover.clients.len();
         let activated = activation.is_some();
         let fallback = activation.as_ref().map(OwnedFd::try_clone).transpose()?;
-        match Self::take_over(handover, activation).await {
+        match Self::take_over(handover, activation, SEND_TIMEOUT).await {
             Ok(bus) => {
                 info!("Took {clients} clients over from the previous instance of the bus.");
                 if !activated {

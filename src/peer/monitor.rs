@@ -5,6 +5,8 @@ use zbus::{
     Connection,
 };
 use zruntime::{Event, EventListener};
+#[cfg(target_os = "linux")]
+use zruntime::{Shared, Task};
 
 use crate::{match_rules::MatchRules, name_registry::NameRegistry, user::Charge};
 
@@ -27,6 +29,10 @@ pub struct Monitor {
     /// peer that it was, gave it back, as the bus pauses to hand over.
     #[cfg(target_os = "linux")]
     paused: Option<MessageStream>,
+    /// The task that writes the monitor what the instance of the bus that handed it over left
+    /// unwritten, while it is under way, as for a peer: see [`Peer::flush`].
+    #[cfg(target_os = "linux")]
+    flushing: Option<Task<(), Shared>>,
 }
 
 impl Monitor {
@@ -71,10 +77,19 @@ impl Monitor {
 
     /// Pause the monitor, as the bus hands over, as [`Peer::pause`] pauses a peer.
     #[cfg(target_os = "linux")]
-    pub(crate) fn pause(&self) {
+    pub(crate) fn pause(&mut self) {
         let prepared = self.conn.prepare_hand_over();
         debug_assert!(prepared, "the connection of a client can't be handed over");
+        // As for a peer: see `Peer::pause`.
+        self.flushing = None;
         self.canceled_event.notify(usize::MAX);
+    }
+
+    /// Write the monitor what the instance of the bus that handed it over left unwritten, if
+    /// anything, as [`Peer::flush`] writes a peer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn flush(&mut self) {
+        self.flushing = self.recipient.flush();
     }
 
     /// The stream of the messages of the monitor, if the task that served the monitor, or the peer
@@ -95,6 +110,9 @@ impl Monitor {
             canceled_event: Event::new(),
             #[cfg(target_os = "linux")]
             paused: peer.paused.take(),
+            // A write under way goes on, to the same client.
+            #[cfg(target_os = "linux")]
+            flushing: peer.flushing.take(),
         }
     }
 }
