@@ -63,11 +63,12 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    // The next instance of busd, which it hands over to, starts with the same limit.
-    #[cfg(target_os = "linux")]
-    let fd_limit = getrlimit(Resource::Nofile).current;
     // Before the runtime, or anything else, opens file descriptors of its own.
     let raised = raise_fd_limit();
+    // The next instance of busd, which it hands over to, raises its limit as this one does, and
+    // takes what this one hands over under it.
+    #[cfg(target_os = "linux")]
+    let fd_limit = getrlimit(Resource::Nofile).current;
     // systemd passes file descriptors through environment variables, which busd removes as it
     // takes them: that may only happen before any other thread starts.
     #[cfg(target_os = "linux")]

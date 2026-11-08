@@ -49,8 +49,9 @@ use zruntime::SharedRuntime;
 /// A bus that systemd stops hands over to its next instance, which serves its clients on as if
 /// nothing happened.
 ///
-/// The first instance stores its state, the socket it listens on and the sockets of its clients in
-/// the file descriptor store, and exits without removing the file of its socket. The second one,
+/// The first instance stores its state, the socket it listens on and a socket that holds the
+/// sockets of its clients in the file descriptor store, and exits without removing the file of its
+/// socket. The second one,
 /// which is passed them, removes them from the store and tells that it's ready. A client that never
 /// reconnected still owns its name, and a client that connects now gets a number after those of the
 /// others, and sees who owns the name. The second instance hands over in turn, with both clients,
@@ -67,7 +68,7 @@ fn restart() {
     systemd.until_ready();
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
-    systemd.assert_stored(&[client.id], true);
+    assert_eq!(systemd.check_stored(true), 1);
 
     let stored = systemd.names();
     let mut second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
@@ -81,12 +82,12 @@ fn restart() {
 
     // SIGINT would do the same: the bus doesn't tell the two apart.
     hand_over(&mut second, &mut systemd, &socket);
-    systemd.assert_stored(&[client.id, late.id], true);
+    assert_eq!(systemd.check_stored(true), 2);
 }
 
 /// File descriptors that a client sent ahead of the message that they are for, as the specification
-/// allows, which busd read but no message took by the time that it hands over, are stored after
-/// the socket of the client, and the next instance passes them on with that message.
+/// allows, which busd read but no message took by the time that it hands over, are stored with the
+/// socket of the client, and the next instance passes them on with that message.
 #[test]
 #[timeout(60000)]
 fn restart_with_fds_sent_ahead() {
@@ -105,20 +106,9 @@ fn restart_with_fds_sent_ahead() {
 
         (FdClient::connect(&socket.0, &[sent.as_fd()]).unwrap(), kept)
     };
-    // busd numbers its clients in the order that they connect.
-    let sender_id = receiver.id + 1;
     hand_over(&mut first, &mut systemd, &socket);
-    systemd.assert_stored(&[receiver.id, sender_id], true);
-    let names = systemd.names_in_order();
-    let at = names
-        .iter()
-        .position(|name| *name == format!("busd-client-{sender_id}-0"))
-        .unwrap();
-    assert_eq!(
-        names.get(at + 1),
-        Some(&format!("busd-client-{sender_id}-1")),
-        "busd stored {names:?}"
-    );
+    // The sockets of the two clients, and the file descriptor that the sender sent ahead.
+    assert_eq!(systemd.check_stored(true), 3);
 
     let stored = systemd.names();
     let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
@@ -130,9 +120,53 @@ fn restart_with_fds_sent_ahead() {
     ping(&mut messages, &mut kept);
 }
 
+/// File descriptors that a client sent ahead, more of them than a datagram of the queue of the
+/// store takes, go through the store in more datagrams than one, and the next instance passes each
+/// on in its place.
+#[test]
+#[timeout(60000)]
+fn restart_with_more_fds_sent_ahead_than_a_datagram_takes() {
+    let _serial = serialize();
+    let socket = Removed(temp_path());
+    let address = socket.address();
+    let mut systemd = Systemd::bind();
+    // Pairs go first, last, and right after those of the first datagram, and the others are of no
+    // consequence.
+    let null = File::open("/dev/null").unwrap();
+    let paired = [0, SCM_MAX_FD, AHEAD - 1];
+    let (sent, mut kept): (Vec<_>, Vec<_>) =
+        paired.iter().map(|_| UnixStream::pair().unwrap()).unzip();
+    let fds: Vec<_> = (0..AHEAD)
+        .map(|n| match paired.iter().position(|&at| at == n) {
+            Some(pair) => sent[pair].as_fd(),
+            None => null.as_fd(),
+        })
+        .collect();
+
+    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    systemd.until_ready();
+    let receiver = Client::connect(&address, None);
+    let mut sender = FdClient::connect(&socket.0, &fds).unwrap();
+    hand_over(&mut first, &mut systemd, &socket);
+    assert_eq!(systemd.check_stored(true), 2 + AHEAD);
+
+    let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
+    systemd.until_ready();
+    let mut messages = MessageStream::from(&receiver.connection);
+    for n in 0..AHEAD {
+        sender.send_for_fd(&receiver.unique_name).unwrap();
+        match paired.iter().position(|&at| at == n) {
+            Some(pair) => ping(&mut messages, &mut kept[pair]),
+            None => {
+                let _ = received_fd(&mut messages);
+            }
+        }
+    }
+}
+
 /// File descriptors of one open file description, which systemd stores once, as a file descriptor
-/// that a client sent twice ahead of the messages that they are for, are stored once, and the next
-/// instance passes each on all the same.
+/// that a client sent twice ahead of the messages that they are for, are stored each as it is, and
+/// the next instance passes each on.
 #[test]
 #[timeout(60000)]
 fn restart_with_the_same_fd_sent_ahead_twice() {
@@ -152,13 +186,8 @@ fn restart_with_the_same_fd_sent_ahead_twice() {
             kept,
         )
     };
-    // busd numbers its clients in the order that they connect.
-    let sender_id = receiver.id + 1;
     hand_over(&mut first, &mut systemd, &socket);
-    systemd.assert_stored(&[receiver.id, sender_id], true);
-    let names = systemd.names();
-    let duplicate = format!("busd-client-{sender_id}-2-{sender_id}-1");
-    assert!(names.contains(&duplicate), "busd stored {names:?}");
+    assert_eq!(systemd.check_stored(true), 4);
 
     let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
     systemd.until_ready();
@@ -198,15 +227,8 @@ fn restart_with_fds_of_one_file_sent_ahead_without_fd_queries() {
 
         FdClient::connect(&socket.0, &sent.each_ref().map(AsFd::as_fd)).unwrap()
     };
-    // busd numbers its clients in the order that they connect.
-    let sender_id = receiver.id + 1;
     hand_over(&mut first, &mut systemd, &socket);
-    systemd.assert_stored(&[receiver.id, sender_id], true);
-    let names = systemd.names();
-    for n in 1..=offsets.len() {
-        let name = format!("busd-client-{sender_id}-{n}");
-        assert!(names.contains(&name), "busd stored {names:?}");
-    }
+    assert_eq!(systemd.check_stored(true), 2 + offsets.len());
 
     let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
     systemd.until_ready();
@@ -237,7 +259,7 @@ fn restart_under_socket_activation() {
     assert!(systemd.take_removed().is_empty());
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
-    systemd.assert_stored(&[client.id], false);
+    assert_eq!(systemd.check_stored(false), 1);
 
     let stored = systemd.names();
     let passed = systemd.passed(Some(&listener));
@@ -264,7 +286,7 @@ fn failed_take_over() {
     systemd.until_ready();
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
-    systemd.assert_stored(&[client.id], true);
+    assert_eq!(systemd.check_stored(true), 1);
     systemd.spoil_state();
 
     let stored = systemd.names();
@@ -286,9 +308,10 @@ fn failed_take_over() {
     assert_eq!(owner(&late, "org.freedesktop.DBus"), "org.freedesktop.DBus");
 }
 
-/// A bus that hands over as many clients as the next instance may start with: systemd passes the
-/// next instance its file descriptors under the soft limit of the service, so a bus with that limit
-/// low hands over fewer clients than it has, and the others get disconnected, losing their names.
+/// A bus that hands over as many clients as the next instance can take: the next instance takes
+/// their file descriptors out of the store under its hard limit of open file descriptors, so a bus
+/// with that limit low hands over fewer clients than it has, and the others get disconnected,
+/// losing their names.
 #[test]
 #[timeout(60000)]
 fn hand_over_fits_the_fd_limit() {
@@ -296,60 +319,34 @@ fn hand_over_fits_the_fd_limit() {
     let socket = Removed(temp_path());
     let address = socket.address();
     let mut systemd = Systemd::bind();
+    let low = Some(LOW_NOFILE);
 
-    let mut first = Busd::spawn_limited(
-        &systemd,
-        &address,
-        &[],
-        FDSTORE_MAX,
-        Some(Nofile::Soft(LOW_NOFILE)),
-    );
+    let mut first = Busd::spawn_limited(&systemd, &address, &[], FDSTORE_MAX, low);
     systemd.until_ready();
-    let names: Vec<_> = (0..CLIENTS).map(|i| format!("{NAME}{i}")).collect();
-    let clients: Vec<_> = names
-        .iter()
-        .map(|name| Client::connect(&address, Some(name)))
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|i| {
+            let name = format!("{NAME}{i}");
+
+            (Client::connect(&address, Some(&name)), name)
+        })
         .collect();
     hand_over(&mut first, &mut systemd, &socket);
-    let stored = systemd.client_ids();
-    assert_eq!(
-        stored.len(),
-        FITTING_CLIENTS,
-        "busd stored {:?}",
-        systemd.names()
-    );
-    systemd.assert_stored(&stored, true);
+    assert_eq!(systemd.check_stored(true), FITTING_CLIENTS);
 
     let removed = systemd.names();
     let passed = systemd.passed(None);
-    let _second = Busd::spawn_limited(
-        &systemd,
-        &address,
-        &passed,
-        FDSTORE_MAX,
-        Some(Nofile::Soft(LOW_NOFILE)),
-    );
+    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, low);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
-    for (client, name) in clients.iter().zip(&names) {
-        if stored.contains(&client.id) {
-            assert_eq!(owner(client, name), client.unique_name);
-            assert_eq!(owner(&late, name), client.unique_name);
-        } else {
-            assert!(
-                try_owner(client, name).is_err(),
-                "{name} is still connected"
-            );
-            assert!(try_owner(&late, name).is_err(), "{name} is still owned");
-        }
-    }
+    assert_eq!(served(&clients, &late), FITTING_CLIENTS);
 }
 
 /// A bus that has no file descriptor to spare, as it has as many open as its hard limit takes,
-/// still hands over: it keeps some free from the start for the socket it listens on, the state and
-/// the barrier, so it stores the state and the listener, and the clients that it can duplicate.
-/// The next instance, which has no such limit, serves the clients that were stored.
+/// still hands over: it keeps some free from the start for the socket it listens on, the state, the
+/// socket that holds the file descriptors of the clients and the barrier, so it stores the state
+/// and the listener, and the clients that it can duplicate and that fit under that limit. The next
+/// instance, under the same limit, serves the clients that were stored.
 #[test]
 #[timeout(60000)]
 fn hand_over_at_the_hard_fd_limit() {
@@ -358,7 +355,7 @@ fn hand_over_at_the_hard_fd_limit() {
     let address = socket.address();
     let mut systemd = Systemd::bind();
 
-    let hard = Some(Nofile::Hard(HARD_NOFILE));
+    let hard = Some(HARD_NOFILE);
     let mut first = Busd::spawn_limited(&systemd, &address, &[], FDSTORE_MAX, hard);
     systemd.until_ready();
     // Clients connect until busd has hardly a file descriptor left.
@@ -368,26 +365,20 @@ fn hand_over_at_the_hard_fd_limit() {
         clients.push((Client::connect(&address, Some(&name)), name));
     }
     hand_over(&mut first, &mut systemd, &socket);
-    let stored = systemd.client_ids();
-    systemd.assert_stored(&stored, true);
+    let stored = systemd.check_stored(true);
+    assert!(
+        stored > 0,
+        "busd stored none of its {} clients",
+        clients.len()
+    );
 
     let removed = systemd.names();
     let passed = systemd.passed(None);
-    let _second = Busd::spawn(&systemd, &address, &passed, FDSTORE_MAX);
+    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, hard);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
-    for (client, name) in &clients {
-        if stored.contains(&client.id) {
-            assert_eq!(owner(client, name), client.unique_name);
-            assert_eq!(owner(&late, name), client.unique_name);
-        } else {
-            assert!(
-                try_owner(client, name).is_err(),
-                "{name} is still connected"
-            );
-        }
-    }
+    assert_eq!(served(&clients, &late), stored);
 }
 
 /// A next instance that fails to take over under socket activation starts on the socket that
@@ -407,7 +398,7 @@ fn failed_take_over_under_socket_activation() {
     systemd.until_ready();
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
-    systemd.assert_stored(&[client.id], false);
+    assert_eq!(systemd.check_stored(false), 1);
     systemd.spoil_state();
 
     let stored = systemd.names();
@@ -525,6 +516,25 @@ fn try_owner(client: &Client, name: &str) -> zbus::Result<String> {
     }))
 }
 
+/// How many of `clients`, each with the name that it owned, the bus serves on, as they and `late`,
+/// a client that connected since, ask it: each still owns its name, or else is disconnected, and
+/// its name is no one's.
+fn served(clients: &[(Client, String)], late: &Client) -> usize {
+    let mut served = 0;
+    for (client, name) in clients {
+        match try_owner(client, name) {
+            Ok(owner) => {
+                assert_eq!(owner, client.unique_name);
+                assert_eq!(try_owner(late, name).unwrap(), client.unique_name);
+                served += 1;
+            }
+            Err(_) => assert!(try_owner(late, name).is_err(), "{name} is still owned"),
+        }
+    }
+
+    served
+}
+
 /// A client of the bus.
 struct Client {
     connection: Connection,
@@ -589,18 +599,28 @@ impl FdClient {
             .interface("org.freedesktop.DBus")
             .build(&())
             .unwrap();
-        let bytes = hello.data().bytes();
-        let mut space = vec![MaybeUninit::uninit(); cmsg_space!(ScmRights(fds.len()))];
-        let mut control = SendAncillaryBuffer::new(&mut space);
-        assert!(control.push(SendAncillaryMessage::ScmRights(fds)));
-        let sent = sendmsg(
-            &stream,
-            &[IoSlice::new(bytes)],
-            &mut control,
-            SendFlags::empty(),
-        )?;
-        // A stream that no message was written to yet takes a short one whole.
-        assert_eq!(sent, bytes.len());
+        let mut bytes = hello.data().bytes();
+        // A message takes no more than `SCM_MAX_FD` file descriptors, so more go in more of them,
+        // each with a byte of the call, but for the last, which goes with the rest.
+        let mut chunks = fds.chunks(SCM_MAX_FD).peekable();
+        while let Some(fds) = chunks.next() {
+            let part = match chunks.peek() {
+                Some(_) => 1,
+                None => bytes.len(),
+            };
+            let mut space = vec![MaybeUninit::uninit(); cmsg_space!(ScmRights(fds.len()))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            assert!(control.push(SendAncillaryMessage::ScmRights(fds)));
+            let sent = sendmsg(
+                &stream,
+                &[IoSlice::new(&bytes[..part])],
+                &mut control,
+                SendFlags::empty(),
+            )?;
+            // A stream that no message was written to yet takes a short one whole.
+            assert_eq!(sent, part);
+            bytes = &bytes[part..];
+        }
         // The reply comes first: the bus sends nothing before it.
         let mut fixed = [0; 16];
         stream.read_exact(&mut fixed)?;
@@ -674,14 +694,14 @@ impl Busd {
         Self::spawn_limited(systemd, address, passed, store_max, None)
     }
 
-    /// Starts busd as `spawn` does, with the soft limit of its open file descriptors at `nofile`,
-    /// if given, and the hard limit as it is, for busd to raise the soft limit again.
+    /// Starts busd as `spawn` does, with both limits of its open file descriptors at `nofile`, if
+    /// given, so that busd can't raise its soft limit.
     fn spawn_limited(
         systemd: &Systemd,
         address: &str,
         passed: &[(&str, BorrowedFd<'_>)],
         store_max: usize,
-        nofile: Option<Nofile>,
+        nofile: Option<libc::rlim_t>,
     ) -> Self {
         Self::spawn_with(systemd, address, passed, store_max, nofile, None)
     }
@@ -701,7 +721,7 @@ impl Busd {
         address: &str,
         passed: &[(&str, BorrowedFd<'_>)],
         store_max: usize,
-        nofile: Option<Nofile>,
+        nofile: Option<libc::rlim_t>,
         filter: Option<[libc::sock_filter; FILTER_LEN]>,
     ) -> Self {
         let count = RawFd::try_from(passed.len()).unwrap();
@@ -750,9 +770,9 @@ impl Busd {
             .stdin(Stdio::null())
             .stdout(Stdio::null());
         // SAFETY: The closure runs in the child, between `fork` and `exec`, where only
-        // async-signal-safe functions may be called: it calls `getrlimit`, `setrlimit`, `dup2`,
-        // `prctl` and `seccomp`, and `last_os_error` if one fails, which read `errno` and neither
-        // allocate nor take a lock. It owns the numbers of the file descriptors and the filter,
+        // async-signal-safe functions may be called: it calls `setrlimit`, `dup2`, `prctl` and
+        // `seccomp`, and `last_os_error` if one fails, which read `errno` and neither allocate nor
+        // take a lock. It owns the numbers of the file descriptors and the filter,
         // which the program that it hands `seccomp` points to, and borrows nothing. The sources are
         // open in the child, as `copies` holds them until `spawn` returns. They are all `FIRST_FD +
         // count` or above, so none is among the targets, `FIRST_FD` up to that, and no `dup2`
@@ -764,20 +784,10 @@ impl Busd {
         unsafe {
             command.pre_exec(move || {
                 if let Some(nofile) = nofile {
-                    let mut limit = libc::rlimit {
-                        rlim_cur: 0,
-                        rlim_max: 0,
+                    let limit = libc::rlimit {
+                        rlim_cur: nofile,
+                        rlim_max: nofile,
                     };
-                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    match nofile {
-                        Nofile::Soft(soft) => limit.rlim_cur = soft,
-                        Nofile::Hard(hard) => {
-                            limit.rlim_cur = hard;
-                            limit.rlim_max = hard;
-                        }
-                    }
                     if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -967,18 +977,6 @@ impl Systemd {
         self.store.iter().map(|(name, _)| name.clone()).collect()
     }
 
-    /// The numbers of the clients that are stored, sorted.
-    fn client_ids(&self) -> Vec<usize> {
-        let mut ids: Vec<_> = self
-            .store
-            .iter()
-            .filter_map(|(name, _)| client_of_socket(name))
-            .collect();
-        ids.sort_unstable();
-
-        ids
-    }
-
     /// Replace the stored state of the bus with one that no bus can make sense of.
     fn spoil_state(&mut self) {
         let garbage = busd::systemd::memfd("busd-state", b"not the state of a bus").unwrap();
@@ -998,38 +996,54 @@ impl Systemd {
         removed
     }
 
-    /// Check that the store holds what a bus hands over with the clients of the numbers `ids`.
+    /// Check that the store holds what a bus hands over, and give how many file descriptors of the
+    /// connections of its clients that is.
     ///
     /// That is its state first, then the socket it listens on if it bound that itself, so that a
-    /// store too small for all of the sockets takes those that matter most, and then the file
-    /// descriptors of the connections of its clients: the socket of each, followed by those that
-    /// came with the messages that busd didn't take, which this leaves out.
-    fn assert_stored(&self, ids: &[usize], listener: bool) {
+    /// store too small for all of the sockets takes those that matter most, and then the sockets
+    /// that hold the file descriptors of the connections of its clients in their queues: the
+    /// socket of each client, and those that came with the messages that busd didn't take. This
+    /// takes those out of the queues, and puts them back in queues of its own, in place of those
+    /// of busd, for the next instance to take them out of.
+    fn check_stored(&mut self, listener: bool) -> usize {
         let names: Vec<_> = self.store.iter().map(|(name, _)| name.as_str()).collect();
         let head: &[&str] = if listener {
             &["busd-state", "busd-listener"]
         } else {
             &["busd-state"]
         };
-        let Some((stored_head, clients)) = names.split_at_checked(head.len()) else {
+        let Some((stored_head, queues)) = names.split_at_checked(head.len()) else {
             panic!("busd stored {names:?}, which isn't {head:?} and its clients");
         };
         assert_eq!(stored_head, head);
-
-        for name in clients {
-            assert!(
-                name.starts_with("busd-client-"),
+        for name in queues {
+            assert_eq!(
+                *name, "busd-clients",
                 "busd stored `{name}` among its clients"
             );
         }
-        let mut clients: Vec<_> = clients
-            .iter()
-            .filter_map(|name| client_of_socket(name))
-            .collect();
-        clients.sort_unstable();
-        let mut expected = ids.to_vec();
-        expected.sort_unstable();
-        assert_eq!(clients, expected);
+
+        let mut count = 0;
+        for (_, stored) in self.store.iter_mut().skip(head.len()) {
+            let mut queued = Vec::new();
+            busd::systemd::take_queued(stored.as_fd(), |index, fds, complete| {
+                assert!(complete, "the test took some of those at {index} only");
+                queued.push((index, fds));
+            })
+            .unwrap();
+            let queue = busd::systemd::FdQueue::new().unwrap();
+            for (index, fds) in &queued {
+                let fds: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
+                assert!(
+                    queue.push(*index, &fds).unwrap(),
+                    "a queue of the test is full"
+                );
+                count += fds.len();
+            }
+            *stored = queue.into_socket();
+        }
+
+        count
     }
 
     /// Check that busd has sent nothing more than the test took.
@@ -1081,15 +1095,6 @@ impl Systemd {
     }
 }
 
-/// A limit of the open file descriptors of busd.
-#[derive(Clone, Copy)]
-enum Nofile {
-    /// The soft limit, which busd raises to the hard one as it starts.
-    Soft(libc::rlim_t),
-    /// Both limits, so that busd can't raise it.
-    Hard(libc::rlim_t),
-}
-
 /// A file that is removed when dropped, if it's there then.
 struct Removed(PathBuf);
 
@@ -1104,15 +1109,6 @@ impl Drop for Removed {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
-}
-
-/// The number of the client whose socket busd stores under `name`, if it stores one under it: the
-/// first of the file descriptors of the connection of the client.
-fn client_of_socket(name: &str) -> Option<usize> {
-    name.strip_prefix("busd-client-")?
-        .strip_suffix("-0")?
-        .parse()
-        .ok()
 }
 
 /// Whether `a` and `b` are of the same open file description, as systemd tells through
@@ -1184,11 +1180,12 @@ const NAME: &str = "org.zbus.Fdstore";
 const UNIQUE_NAME_PREFIX: &str = ":busd.";
 /// How many file descriptors the service may store: `FileDescriptorStoreMax=` of its unit.
 const FDSTORE_MAX: usize = 16;
-/// A soft limit of open file descriptors that takes the fitting clients and no more: the first
-/// file descriptor that systemd passes, the state and the listener, and the spare ones that busd
-/// keeps free, besides the clients.
+/// A limit of open file descriptors under which the next instance takes the fitting clients and no
+/// more: the first file descriptor that systemd passes, the state, the listener and the socket that
+/// holds the file descriptors of the clients, and the spare ones that busd keeps free, besides the
+/// clients, each of which takes its socket and the file descriptor of its process.
 const LOW_NOFILE: libc::rlim_t =
-    (FIRST_FD as libc::rlim_t) + 2 + 32 + FITTING_CLIENTS as libc::rlim_t;
+    (FIRST_FD as libc::rlim_t) + 3 + 32 + 2 * FITTING_CLIENTS as libc::rlim_t;
 const HARD_NOFILE: libc::rlim_t = 64;
 const FREE_FDS: libc::rlim_t = 2;
 /// How many clients the test hands over, and how many of them fit under `LOW_NOFILE`.
@@ -1204,6 +1201,10 @@ const ACTIVATION: &str = "busd-session.socket";
 const MAX_NOTIFICATION: usize = 4096;
 /// How many file descriptors the test takes with a notification: busd sends one.
 const MAX_FDS: usize = 4;
+/// How many file descriptors fit in a message: `SCM_MAX_FD` of Linux, as unix(7) tells.
+const SCM_MAX_FD: usize = 253;
+/// How many file descriptors a client sends ahead, which more than one datagram takes.
+const AHEAD: usize = SCM_MAX_FD + 50;
 /// What `kcmp(2)` compares of two file descriptors: their open file descriptions.
 const KCMP_FILE: libc::c_long = 0;
 /// How many instructions the filter of [`without_fd_queries`] has.
