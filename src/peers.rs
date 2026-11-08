@@ -58,6 +58,10 @@ pub struct Peers {
     /// Notified once the bus takes no more clients, as it is done pausing: see [`Peers::add`].
     #[cfg(target_os = "linux")]
     sealed: Event,
+    /// Notified as the task that serves a client gives the stream of its messages back, as the bus
+    /// pauses, and as a client goes, which a pause waits for: see [`Peers::pause`].
+    #[cfg(target_os = "linux")]
+    paused_changed: Event,
 }
 
 impl Peers {
@@ -70,6 +74,8 @@ impl Peers {
             chores_changed: Event::new(),
             #[cfg(target_os = "linux")]
             sealed: Event::new(),
+            #[cfg(target_os = "linux")]
+            paused_changed: Event::new(),
         })
     }
 
@@ -403,10 +409,16 @@ impl Peers {
                 for peer in routing.peers.values() {
                     peer.pending_calls().forget(id);
                 }
+                // A pause waits for the monitor no more.
+                #[cfg(target_os = "linux")]
+                self.paused_changed.notify(usize::MAX);
 
                 return Ok(());
             }
         }
+        // A pause waits for the peer no more.
+        #[cfg(target_os = "linux")]
+        self.paused_changed.notify(usize::MAX);
 
         self.clean_up(&unique_name, id, pending_calls.take().collect())
             .await
@@ -444,6 +456,7 @@ impl Peers {
         #[cfg(target_os = "linux")]
         if let Some(peer) = routing.peers.get_mut(unique_name) {
             *peer.paused() = Some(stream);
+            self.paused_changed.notify(usize::MAX);
 
             return None;
         }
@@ -456,6 +469,7 @@ impl Peers {
         #[cfg(target_os = "linux")]
         if routing.handing_over {
             *monitor.paused() = Some(stream);
+            self.paused_changed.notify(usize::MAX);
 
             return None;
         }
@@ -483,6 +497,7 @@ impl Peers {
             #[cfg(target_os = "linux")]
             if let Some(monitor) = self.routing_mut().await.monitors.get_mut(&unique_name) {
                 *monitor.paused() = Some(stream);
+                self.paused_changed.notify(usize::MAX);
             }
 
             return;
@@ -495,6 +510,9 @@ impl Peers {
         }
         // Removing the monitor, and the end of its stream, close its connection.
         self.routing_mut().await.monitors.remove(&unique_name);
+        // A pause waits for the monitor no more.
+        #[cfg(target_os = "linux")]
+        self.paused_changed.notify(usize::MAX);
         debug!("Monitor {} disconnected", unique_name);
     }
 

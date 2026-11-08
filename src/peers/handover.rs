@@ -54,8 +54,22 @@ impl Peers {
             }
         }
         loop {
-            let connecting = Instant::now() < deadline && self.chores().connecting > 0;
-            if !connecting {
+            if Instant::now() < deadline {
+                // The listener comes first, so that a handshake that ends right after the check
+                // isn't missed.
+                let handshake_ended = self.chores_changed.listen();
+                if self.chores().connecting > 0 {
+                    // Until the deadline at most, past which the handshakes still under way hold
+                    // the pause up no more.
+                    let _ = runtime.timeout_at(deadline, handshake_ended).await;
+
+                    continue;
+                }
+            }
+            // The listener comes first, so that a client that pauses, or goes, right after the
+            // check isn't missed.
+            let paused_changed = self.paused_changed.listen();
+            {
                 // Under the lock that adding a client takes, so that none comes in between.
                 let mut routing = self.routing_mut().await;
                 if paused(&mut routing) {
@@ -65,7 +79,7 @@ impl Peers {
                     return Ok(());
                 }
             }
-            runtime.sleep(SETTLE_INTERVAL).await;
+            paused_changed.await;
         }
     }
 
@@ -643,7 +657,7 @@ fn pending_call_records(
         .collect()
 }
 
-/// How long a wait for the bus to pause, or to settle, waits before it checks again.
+/// How long a wait for the bus to settle waits before it checks again.
 const SETTLE_INTERVAL: Duration = Duration::from_millis(1);
 
 #[cfg(test)]
@@ -651,6 +665,7 @@ mod tests {
     use std::{
         future::poll_fn,
         io::{self, Read, Write},
+        mem,
         net::Shutdown,
         num::NonZeroUsize,
         os::unix::net::UnixStream,
@@ -669,6 +684,7 @@ mod tests {
     use super::*;
     use crate::{
         bus::{Bus, STOP_TIMEOUT},
+        match_rules::MatchRules,
         peer::SEND_TIMEOUT,
         user::Charge,
     };
@@ -844,6 +860,55 @@ mod tests {
         });
     }
 
+    /// The bus is done pausing as soon as the tasks that serve its clients gave the streams of
+    /// their messages back, rather than at a later look: a pause takes no longer than its clients
+    /// take to pause.
+    #[test]
+    #[timeout(30000)]
+    fn pause_ends_once_the_clients_paused() {
+        zruntime::block_on(async {
+            let bus = Bus::for_address(Some(&address())).await.unwrap();
+            let peers = bus.peers().clone();
+            let _first = connect(&bus, 1).await;
+            let _second = connect(&bus, 2).await;
+
+            let mut pausing = pin!(peers.pause(STOP_TIMEOUT));
+            // The tasks that serve the clients only give their streams back once they run, after
+            // this yields.
+            assert!(
+                pausing.as_mut().now_or_never().is_none(),
+                "the clients paused before their tasks ran"
+            );
+            until(|| {
+                peers
+                    .routing
+                    .try_write()
+                    .is_some_and(|mut routing| paused(&mut routing))
+            })
+            .await;
+            assert!(
+                matches!(pausing.now_or_never(), Some(Ok(()))),
+                "the bus went on pausing once its clients paused"
+            );
+        });
+    }
+
+    /// A client that goes while the bus pauses, as the task that serves it removes it rather than
+    /// give the stream of its messages back, holds the pause up no longer: the bus is done pausing
+    /// as soon as the client is gone.
+    #[test]
+    #[timeout(30000)]
+    fn peer_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
+        zruntime::block_on(goes_while_the_bus_pauses(false));
+    }
+
+    /// As with `peer_that_goes_while_the_bus_pauses_holds_it_up_no_longer`, for a monitor.
+    #[test]
+    #[timeout(30000)]
+    fn monitor_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
+        zruntime::block_on(goes_while_the_bus_pauses(true));
+    }
+
     /// A client still in the middle of its handshake once the bus is done pausing, as it hands
     /// over, gets disconnected then, rather than once its handshake ends, which may be never: the
     /// bus lets go of its socket, and of the objects charged to its user, at once.
@@ -975,6 +1040,67 @@ mod tests {
                 "the client was handed over, though the bus was disconnecting it"
             );
         });
+    }
+
+    /// Have a client of a bus, a monitor if `monitor`, go while the bus pauses, once the pause took
+    /// the lock of the routing ahead of the task that serves the client, which waits for the lock
+    /// to remove the client, and check that the bus is done pausing as soon as the task removed it.
+    async fn goes_while_the_bus_pauses(monitor: bool) {
+        let bus = Bus::for_address(Some(&address())).await.unwrap();
+        let peers = bus.peers().clone();
+        let (client, socket) = connect(&bus, 1).await;
+        let name = client.unique_name().unwrap().clone();
+        if monitor {
+            assert!(peers.make_monitor(&name, MatchRules::default()).await);
+        }
+        // The bus is done with what it sent as the client connected, and became a monitor, and,
+        // once the runtime ran what was ready, the task that serves the client waits for the client
+        // to send something.
+        peers.chores_done().await;
+        let mut yielded = false;
+        until(|| mem::replace(&mut yielded, true)).await;
+
+        {
+            // The task that serves the client, which goes, waits for this to remove the client.
+            let _reading = peers.routing.try_read().unwrap();
+            socket.shutdown(Shutdown::Both).unwrap();
+            // A writer that waits for the lock, the task, keeps new readers out.
+            until(|| peers.routing.try_read().is_none()).await;
+        }
+        // The pause takes the lock, which is free, ahead of the task, which only runs again once
+        // this yields: the pause doesn't find the client gone.
+        let mut pausing = pin!(peers.pause(STOP_TIMEOUT));
+        assert!(
+            pausing.as_mut().now_or_never().is_none(),
+            "the bus was done pausing before the client went"
+        );
+        until(|| {
+            peers.routing.try_write().is_some_and(|routing| {
+                !routing.peers.contains_key(&name) && !routing.monitors.contains_key(&name)
+            })
+        })
+        .await;
+        assert!(
+            matches!(pausing.now_or_never(), Some(Ok(()))),
+            "the bus went on pausing once the client went"
+        );
+    }
+
+    /// Wait until `ready`, which is checked again each time that the runtime has run the tasks that
+    /// are ready to run.
+    async fn until<F>(mut ready: F)
+    where
+        F: FnMut() -> bool,
+    {
+        poll_fn(|cx| {
+            if ready() {
+                return Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+
+            Poll::Pending
+        })
+        .await
     }
 
     /// Let go of the clients of `bus` without disconnecting them, as it hands over, and of `bus`
