@@ -22,7 +22,7 @@ use crate::{
     bus::handover::{ClientHandover, MonitorState, NameState, PeerState, Snapshot},
     debug, fdo,
     name_registry::{NameOwner, NameRegistry},
-    peer::{Caller, HandedOver, Monitor, Peer, Recipient, Stream},
+    peer::{Caller, HandedOver, Monitor, Peer, PendingCalls, Recipient, Stream},
     warn,
 };
 
@@ -117,13 +117,13 @@ impl Peers {
     /// went, and those that the bus disconnected, as they didn't take what it sent them in time, or
     /// as a send to them failed, as one to a client that went does.
     pub(crate) async fn settle(self: &Arc<Self>) -> Result<()> {
-        let runtime = SharedRuntime::current()?;
+        let bus_calls = self.bus_calls().await?;
         loop {
             let started = self.chores_done().await;
             // The calls of the interfaces that zbus adds to the bus, such as
             // `org.freedesktop.DBus.Properties`, are answered by tasks of their own.
-            if !self.bus_calls_answered().await {
-                runtime.sleep(SETTLE_INTERVAL).await;
+            if !bus_calls.is_empty() {
+                bus_calls.answered().await;
 
                 continue;
             }
@@ -137,7 +137,7 @@ impl Peers {
             };
             // A chore that started while the barrier was on its way may have sent messages after
             // it.
-            if settled && self.bus_calls_answered().await {
+            if settled && bus_calls.is_empty() {
                 return Ok(());
             }
         }
@@ -433,13 +433,14 @@ impl Peers {
         }
     }
 
-    /// Whether the bus answered each call to it that waits for its reply.
-    async fn bus_calls_answered(&self) -> bool {
+    /// The records of the calls to the bus that wait for its replies.
+    async fn bus_calls(&self) -> Result<Arc<PendingCalls>> {
         self.routing()
             .await
             .peers
             .get(fdo::BUS_NAME)
-            .is_none_or(|bus| bus.pending_calls().is_empty())
+            .map(|bus| bus.pending_calls().clone())
+            .context("The bus isn't up")
     }
 
     /// Wait for the bus to have answered every call that it got so far, and for its peers to have
@@ -656,9 +657,6 @@ fn pending_call_records(
         })
         .collect()
 }
-
-/// How long a wait for the bus to settle waits before it checks again.
-const SETTLE_INTERVAL: Duration = Duration::from_millis(1);
 
 #[cfg(test)]
 mod tests {
