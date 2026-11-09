@@ -19,7 +19,7 @@ use zruntime::{spawn, SharedRuntime};
 
 use super::{Peers, Routing, Served};
 use crate::{
-    bus::handover::{ClientHandover, MonitorState, NameState, PeerState, Snapshot, Stored},
+    bus::handover::{ClientHandover, MonitorState, NameState, PeerState, Snapshot},
     debug, fdo,
     name_registry::{NameOwner, NameRegistry},
     peer::{Caller, HandedOver, Monitor, Peer, PendingCalls, Recipient, Stream},
@@ -167,7 +167,6 @@ impl Peers {
                 let state = PeerState {
                     id: peer.id() as u64,
                     greeted: peer.greeted(),
-                    stored: Stored::default(),
                     match_rules: peer.match_rules().clone(),
                     pending_calls: peer
                         .pending_calls()
@@ -186,7 +185,6 @@ impl Peers {
             for monitor in routing.monitors.values_mut() {
                 let state = MonitorState {
                     id: monitor.id() as u64,
-                    stored: Stored::default(),
                     match_rules: monitor.match_rules().clone(),
                 };
                 clients.push(Client {

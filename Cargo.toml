@@ -83,25 +83,24 @@ zruntime = { version = "0.2.2", features = [
 fastrand = "2.2.0"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
-# `net` is for the sockets of the bus, and the notification socket of systemd, and `fs`, `mm`, `pipe`
-# and `event` are for the rest of the systemd module: its memfds, which it maps into memory, and its
-# barriers. `std` makes rustix share the types of std with its callers (`OwnedFd`, `io::Error`).
-rustix = { version = "1.1.2", default-features = false, features = [
-    "event",
-    "fs",
-    "mm",
-    "net",
-    "pipe",
-    "process",
-    "std",
-] }
+# `net` is for the sockets of the bus, and `process` for its limit of open file descriptors. `std`
+# makes rustix share the types of std with its callers (`OwnedFd`, `io::Error`).
+rustix = { version = "1.1.2", default-features = false, features = ["net", "process", "std"] }
 foldhash = "0.2.0"
 # Draws the diagrams of the docs, which are in mermaid, in the HTML that `cargo doc` builds.
 simple-mermaid = "0.2.0"
 
+# Restarts through the file descriptor store of systemd, with the clients connected throughout. From
+# git until its first release, with the same reference as zbus has, so that the hand-overs of zbus
+# are items of its hand-overs.
+[target.'cfg(target_os = "linux")'.dependencies.zoter]
+git = "https://github.com/z-galaxy/zoter"
+branch = "main"
+default-features = false
+
 [features]
 default = ["tracing-subscriber"]
-tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing"]
+tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing", "zoter/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
 
 [dev-dependencies]
@@ -132,6 +131,13 @@ serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtr
 # which rustix has no call for.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2.191"
+
+# The tests and the benchmark restart busd through the fake service manager of zoter.
+[target.'cfg(target_os = "linux")'.dev-dependencies.zoter]
+git = "https://github.com/z-galaxy/zoter"
+branch = "main"
+default-features = false
+features = ["testing"]
 
 [profile.release]
 lto = "fat"

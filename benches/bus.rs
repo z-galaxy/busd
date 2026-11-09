@@ -72,7 +72,7 @@ use std::{
 
 use busd::bus::Bus;
 #[cfg(target_os = "linux")]
-use busd::{peer::SEND_TIMEOUT, systemd::Notifier};
+use busd::{bus::STORE_KEY, peer::SEND_TIMEOUT};
 use calls::Caller;
 use cpus::{Cpu, Cpus};
 use crew::{AbortOnPanic, Crew, Member, Rounds};
@@ -88,6 +88,8 @@ use rustix::{
 };
 use shared::SharedConnection;
 use zbus::{connection, names::BusName};
+#[cfg(target_os = "linux")]
+use zoter::{Notifier, Passed, Store};
 use zruntime::{mpmc, SharedRuntime};
 
 #[path = "common/calls.rs"]
@@ -190,10 +192,6 @@ fn connections(c: &mut Criterion) {
 /// Benchmarks the bus handing its clients over to its next instance: the ids of `handover/`.
 #[cfg(target_os = "linux")]
 fn handovers(c: &mut Criterion) {
-    // The bus hands over through the store only if the store takes enough file descriptors, which
-    // systemd tells it in the environment. Nothing else runs in this process by now, which could
-    // read the environment meanwhile.
-    std::env::set_var("FDSTORE", FD_STORE_MAX.to_string());
     raise_open_files_limit();
     let mut group = c.benchmark_group("handover");
     restarts(
@@ -760,12 +758,15 @@ impl RestartingBus {
                 Restart::FdStore => Some(FakeSystemd::start(systemd_cpu, &path)),
             };
             zruntime::block_on(async move {
+                // The store that the bus hands over through, which a bus is given as it starts.
+                let mut store = systemd.as_ref().map(FakeSystemd::store);
                 let bus = match &systemd {
                     None => Bus::for_address(Some(&bus_address)).await,
                     // As busd starts under systemd: on the listening socket of the socket
                     // activation.
                     Some(systemd) => {
-                        Bus::for_systemd(systemd.passed(Vec::new()), None, Some(&bus_address)).await
+                        let passed = Passed::new(systemd.passed(Vec::new()));
+                        Bus::for_systemd(passed, store.as_mut(), Some(&bus_address)).await
                     }
                 };
                 let mut bus = bus.expect("a bus");
@@ -791,7 +792,14 @@ impl RestartingBus {
                     for _ in 0..times {
                         bus = match &systemd {
                             None => restart_in_process(bus).await,
-                            Some(systemd) => restart_through(systemd, bus, &bus_address).await,
+                            Some(systemd) => {
+                                let handing = store.take().expect("a bus that systemd runs");
+                                let (next, next_store) =
+                                    restart_through(systemd, bus, handing, &bus_address).await;
+                                store = Some(next_store);
+
+                                next
+                            }
                         };
                     }
                     took.send(started.elapsed())
@@ -850,18 +858,26 @@ async fn restart_in_process(bus: Bus) -> Bus {
         .expect("the next instance takes over")
 }
 
-/// The next instance of `bus`, which takes its clients over through the store of `systemd`, at
-/// `address`, as busd does at the address that it is told.
+/// The next instance of `bus`, which hands its clients over through `store`, the store of
+/// `systemd`, and the store of the next instance, which takes them over at `address`, as busd does
+/// at the address that it is told.
 #[cfg(target_os = "linux")]
-async fn restart_through(systemd: &FakeSystemd, bus: Bus, address: &str) -> Bus {
-    bus.hand_over_to_systemd(&systemd.notifier, None)
+async fn restart_through(
+    systemd: &FakeSystemd,
+    bus: Bus,
+    store: Store,
+    address: &str,
+) -> (Bus, Store) {
+    bus.hand_over_to_systemd(store)
         .await
         .expect("the bus hands over");
-    let passed = systemd.passed(systemd.stored());
-
-    Bus::for_systemd(passed, None, Some(address))
+    let passed = Passed::new(systemd.passed(systemd.stored()));
+    let mut store = systemd.store();
+    let bus = Bus::for_systemd(passed, Some(&mut store), Some(address))
         .await
-        .expect("the next instance starts")
+        .expect("the next instance starts");
+
+    (bus, store)
 }
 
 /// A fake systemd, on a thread of its own, that keeps what a bus stores in the file descriptor
@@ -925,6 +941,17 @@ impl FakeSystemd {
             activation_path: activation_path.to_owned(),
             thread: Some(thread),
         }
+    }
+
+    /// The store that an instance of the bus hands over through, which takes `FD_STORE_MAX` file
+    /// descriptors.
+    fn store(&self) -> Store {
+        let notifier = self
+            .notifier
+            .try_clone()
+            .expect("a notifier of the fake systemd");
+
+        Store::new(notifier, STORE_KEY, Some(FD_STORE_MAX)).expect("a store of the fake systemd")
     }
 
     /// What the bus stored as it handed over.

@@ -1,7 +1,5 @@
 extern crate busd;
 
-#[cfg(target_os = "linux")]
-use std::os::fd::OwnedFd;
 use std::{
     fs::File,
     io::Write,
@@ -65,19 +63,15 @@ struct Args {
 fn main() -> Result<()> {
     // Before the runtime, or anything else, opens file descriptors of its own.
     let raised = raise_fd_limit();
-    // The next instance of busd, which it hands over to, raises its limit as this one does, and
-    // takes what this one hands over under it.
-    #[cfg(target_os = "linux")]
-    let fd_limit = getrlimit(Resource::Nofile).current;
     // systemd passes file descriptors through environment variables, which busd removes as it
-    // takes them: that may only happen before any other thread starts.
+    // takes them.
+    // SAFETY: No other thread runs yet, so none reads or writes the environment meanwhile, and
+    // nothing took the file descriptors that systemd passed.
     #[cfg(target_os = "linux")]
-    let passed = busd::systemd::take_listen_fds()?;
+    let passed = unsafe { zoter::Passed::from_env() }?;
 
     zruntime::block_on(run(
         raised,
-        #[cfg(target_os = "linux")]
-        fd_limit,
         #[cfg(target_os = "linux")]
         passed,
     ))
@@ -85,8 +79,7 @@ fn main() -> Result<()> {
 
 async fn run(
     raised: rustix::io::Result<()>,
-    #[cfg(target_os = "linux")] fd_limit: Option<u64>,
-    #[cfg(target_os = "linux")] passed: Vec<(String, OwnedFd)>,
+    #[cfg(target_os = "linux")] passed: zoter::Passed,
 ) -> Result<()> {
     busd::tracing_subscriber::init();
     if let Err(e) = raised {
@@ -110,8 +103,11 @@ async fn run(
         [Signal::Interrupt, Signal::Terminate],
     )?;
 
+    // The store of systemd, which keeps what the bus hands over to its next instance. The next
+    // instance raises its limit of open file descriptors as this one did, and takes what this one
+    // hands over under it, as the store takes this one to have it from now on.
     #[cfg(target_os = "linux")]
-    let notifier = busd::systemd::Notifier::from_env().unwrap_or_else(|e| {
+    let mut store = zoter::Store::from_env(bus::STORE_KEY).unwrap_or_else(|e| {
         warn!("Ignoring `$NOTIFY_SOCKET`: {e}");
 
         None
@@ -119,7 +115,7 @@ async fn run(
     // Under systemd, the bus takes over from its previous instance, or listens on the socket of the
     // socket activation, if systemd passes either.
     #[cfg(target_os = "linux")]
-    let mut bus = bus::Bus::for_systemd(passed, notifier.as_ref(), address.as_deref()).await?;
+    let mut bus = bus::Bus::for_systemd(passed, store.as_mut(), address.as_deref()).await?;
     #[cfg(not(target_os = "linux"))]
     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
 
@@ -136,8 +132,8 @@ async fn run(
 
     // Under systemd, a service of `Type=notify` tells systemd once it's ready.
     #[cfg(target_os = "linux")]
-    if let Some(notifier) = &notifier {
-        if let Err(e) = notifier.notify("READY=1") {
+    if let Some(store) = &store {
+        if let Err(e) = store.notifier().notify("READY=1") {
             warn!("Failed to tell systemd that the bus is ready: {e}");
         }
     }
@@ -163,8 +159,8 @@ async fn run(
     // its next instance rather than disconnect them. On a restart, systemd starts the next instance
     // with them, and on a stop, it closes them.
     #[cfg(target_os = "linux")]
-    if let Some(notifier) = &notifier {
-        return bus.hand_over_to_systemd(notifier, fd_limit).await;
+    if let Some(store) = store {
+        return bus.hand_over_to_systemd(store).await;
     }
 
     if let Err(e) = bus.cleanup().await {

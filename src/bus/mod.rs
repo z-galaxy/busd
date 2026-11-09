@@ -28,6 +28,8 @@ pub(crate) mod handover;
 pub use handover::{ClientHandover, Handover, STOP_TIMEOUT};
 #[cfg(target_os = "linux")]
 mod systemd;
+#[cfg(target_os = "linux")]
+pub use systemd::STORE_KEY;
 
 use crate::{
     fdo::{self, DBus, Monitoring, Stats},
@@ -48,10 +50,6 @@ pub struct Bus {
     /// Whether the bus bound the socket that it listens on itself, rather than take it from
     /// whoever passed it, such as systemd's socket activation, which then owns the socket's file.
     bound: bool,
-    /// The file descriptors that a bus that systemd runs keeps to give up for those that handing
-    /// over to its next instance opens, if it keeps any: see [`Bus::for_systemd`].
-    #[cfg(target_os = "linux")]
-    reserve: Option<systemd::Reserve>,
 }
 
 // All (cheaply) cloneable fields of `Bus` go here.
@@ -202,8 +200,6 @@ impl Bus {
                 _self_conn: service_conn,
             },
             bound,
-            #[cfg(target_os = "linux")]
-            reserve: None,
         })
     }
 

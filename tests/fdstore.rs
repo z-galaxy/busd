@@ -11,17 +11,17 @@ use std::{
     env::temp_dir,
     fs::{self, File},
     future::IntoFuture,
-    io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
+    io::{self, IoSlice, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+        fd::{AsFd, BorrowedFd, OwnedFd, RawFd},
         unix::{
-            net::{UnixDatagram, UnixListener, UnixStream},
+            net::{UnixListener, UnixStream},
             process::CommandExt,
         },
     },
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant},
@@ -35,17 +35,14 @@ use rand::{
 };
 use rustix::{
     cmsg_space,
-    io::{fcntl_dupfd_cloexec, Errno},
-    net::{
-        recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
-        SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
-    },
-    process::{getpid, getuid, kill_process, Pid, Signal},
+    net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags},
+    process::{getuid, kill_process, Pid, Signal},
 };
 use zbus::{
     connection, fdo::DBusProxy, message, names::BusName, wire::Fd, Connection, Message,
     MessageStream,
 };
+use zoter::testing::Manager;
 use zruntime::SharedRuntime;
 
 /// A bus that systemd stops hands over to its next instance, which serves its clients on as if
@@ -67,7 +64,7 @@ fn restart() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     assert!(systemd.take_removed().is_empty());
     let client = Client::connect(&address, Some(NAME));
@@ -79,7 +76,7 @@ fn restart() {
     let waiting = thread::spawn(move || Client::over(waiting));
 
     let stored = systemd.names();
-    let mut second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
     assert_eq!(owner(&client, NAME), client.unique_name);
@@ -106,7 +103,7 @@ fn restart_with_fds_sent_ahead() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     // What goes into one end of the pair comes out of the other, which tells that the end that the
@@ -122,7 +119,7 @@ fn restart_with_fds_sent_ahead() {
     assert_eq!(systemd.check_stored(), 3);
 
     let stored = systemd.names();
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
     // The stream takes what the connection reads from now on: the signal among it.
@@ -154,14 +151,14 @@ fn restart_with_more_fds_sent_ahead_than_a_datagram_takes() {
         })
         .collect();
 
-    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     let mut sender = FdClient::connect(&socket.0, &fds).unwrap();
     hand_over(&mut first, &mut systemd, &socket);
     assert_eq!(systemd.check_stored(), 2 + AHEAD);
 
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let mut messages = MessageStream::from(&receiver.connection);
     for n in 0..AHEAD {
@@ -186,7 +183,7 @@ fn restart_with_the_same_fd_sent_ahead_twice() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     let (mut sender, mut kept) = {
@@ -200,7 +197,7 @@ fn restart_with_the_same_fd_sent_ahead_twice() {
     hand_over(&mut first, &mut systemd, &socket);
     assert_eq!(systemd.check_stored(), 4);
 
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let mut messages = MessageStream::from(&receiver.connection);
     for _ in 0..2 {
@@ -231,7 +228,7 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     };
     let offsets = [1, 4];
 
-    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     let mut sender = {
@@ -242,7 +239,7 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     hand_over(&mut first, &mut systemd, &socket);
     assert_eq!(systemd.check_stored(), 2 + offsets.len());
 
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let mut messages = MessageStream::from(&receiver.connection);
     for offset in offsets {
@@ -265,7 +262,7 @@ fn hand_over_fits_the_fd_limit() {
     let mut systemd = Systemd::activating(&socket.0);
     let low = Some(LOW_NOFILE);
 
-    let mut first = Busd::spawn_limited(&systemd, &address, &systemd.passed(), FDSTORE_MAX, low);
+    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, low);
     systemd.until_ready();
     let clients: Vec<_> = (0..CLIENTS)
         .map(|i| {
@@ -278,8 +275,7 @@ fn hand_over_fits_the_fd_limit() {
     assert_eq!(systemd.check_stored(), FITTING_CLIENTS);
 
     let removed = systemd.names();
-    let passed = systemd.passed();
-    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, low);
+    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, low);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
@@ -300,7 +296,7 @@ fn hand_over_at_the_hard_fd_limit() {
     let mut systemd = Systemd::activating(&socket.0);
 
     let hard = Some(HARD_NOFILE);
-    let mut first = Busd::spawn_limited(&systemd, &address, &systemd.passed(), FDSTORE_MAX, hard);
+    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, hard);
     systemd.until_ready();
     // Clients connect until busd has hardly a file descriptor left.
     let mut clients = Vec::new();
@@ -317,8 +313,7 @@ fn hand_over_at_the_hard_fd_limit() {
     );
 
     let removed = systemd.names();
-    let passed = systemd.passed();
-    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, hard);
+    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, hard);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
@@ -337,7 +332,7 @@ fn failed_take_over() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
@@ -345,7 +340,7 @@ fn failed_take_over() {
     systemd.spoil_state();
 
     let stored = systemd.names();
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
     assert!(socket.0.exists());
@@ -375,7 +370,7 @@ fn no_take_over_without_socket_activation() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
@@ -383,7 +378,7 @@ fn no_take_over_without_socket_activation() {
     systemd.deactivate();
 
     let stored = systemd.names();
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
+    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
 
@@ -410,7 +405,7 @@ fn no_hand_over_with_a_small_store() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let mut busd = Busd::spawn(&systemd, &address, &systemd.passed(), 1);
+    let mut busd = Busd::spawn(&mut systemd, &address, 1);
     systemd.until_ready();
     let _client = Client::connect(&address, Some(NAME));
 
@@ -432,7 +427,7 @@ fn no_hand_over_without_socket_activation() {
     let address = socket.address();
     let mut systemd = Systemd::bind();
 
-    let mut busd = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    let mut busd = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let _client = Client::connect(&address, Some(NAME));
 
@@ -692,84 +687,35 @@ struct Busd {
 
 impl Busd {
     /// Starts busd as systemd starts a service, on the socket at `address`, with a file descriptor
-    /// store of `store_max` file descriptors, and `passed` as its file descriptors from 3 on.
-    fn spawn(
-        systemd: &Systemd,
-        address: &str,
-        passed: &[(&str, BorrowedFd<'_>)],
-        store_max: usize,
-    ) -> Self {
-        Self::spawn_limited(systemd, address, passed, store_max, None)
+    /// store of `store_max` file descriptors, and the sockets of socket activation and what is in
+    /// the store of `systemd` as its file descriptors from 3 on.
+    fn spawn(systemd: &mut Systemd, address: &str, store_max: usize) -> Self {
+        Self::spawn_limited(systemd, address, store_max, None)
     }
 
     /// Starts busd as `spawn` does, with both limits of its open file descriptors at `nofile`, if
     /// given, so that busd can't raise its soft limit.
     fn spawn_limited(
-        systemd: &Systemd,
+        systemd: &mut Systemd,
         address: &str,
-        passed: &[(&str, BorrowedFd<'_>)],
         store_max: usize,
         nofile: Option<libc::rlim_t>,
     ) -> Self {
-        let count = RawFd::try_from(passed.len()).unwrap();
-        // The file descriptors may be among those they are to be passed as, so that passing one
-        // would close another before it's passed. Copies out of that way, which close on exec, are
-        // what is passed instead, and the caller keeps its own. The copies close as this returns,
-        // once busd has its own.
-        let copies: Vec<OwnedFd> = passed
-            .iter()
-            .map(|(_, fd)| fcntl_dupfd_cloexec(fd, FIRST_FD + count).unwrap())
-            .collect();
-        let sources: Vec<RawFd> = copies.iter().map(AsRawFd::as_raw_fd).collect();
-
-        let mut command = if passed.is_empty() {
-            Command::new(BUSD)
-        } else {
-            // The shell runs busd as itself, so that `$LISTEN_PID` is the PID of busd, which the
-            // process can't know before it starts: systemd sets it for the process it execs.
-            let mut command = Command::new("sh");
-            command.args(["-c", r#"LISTEN_PID=$$ exec "$0" "$@""#, BUSD]);
-
-            command
-        };
-        // What the tests are run with must not tell busd of file descriptors, or of anything
-        // else of systemd's.
-        for var in [
-            "LISTEN_PID",
-            "LISTEN_PIDFDID",
-            "LISTEN_FDS",
-            "LISTEN_FDNAMES",
-        ] {
-            command.env_remove(var);
-        }
-        if !passed.is_empty() {
-            let names: Vec<_> = passed.iter().map(|(name, _)| *name).collect();
-            command
-                .env("LISTEN_FDS", count.to_string())
-                .env("LISTEN_FDNAMES", names.join(":"));
-        }
+        systemd.manager.set_store_max(store_max);
+        let mut command = systemd.manager.command(BUSD).unwrap();
         // The bus reads the session configuration of the tests, rather than the one of the
         // system.
         command
             .args(["--config", CONFIG, "--address", address])
-            .env("NOTIFY_SOCKET", systemd.path())
-            .env("FDSTORE", store_max.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null());
-        // SAFETY: The closure runs in the child, between `fork` and `exec`, where only
-        // async-signal-safe functions may be called: it calls `setrlimit` and `dup2`, and
-        // `last_os_error` if one fails, which reads `errno` and neither allocates nor takes a lock.
-        // It owns the numbers of the file descriptors, and borrows nothing. The sources are open in
-        // the child, as `copies` holds them until `spawn` returns. They are all `FIRST_FD +
-        // count` or above, so none is among the targets, `FIRST_FD` up to that, and no `dup2`
-        // closes a source that another has yet to copy. A target that is open is closed, but only
-        // in the child, whose copy nothing uses but for `std`'s pipe for reporting a failed `exec`:
-        // if that were one, the test would fail for want of a busd that is ready, rather than for
-        // the error. `dup2` clears the close-on-exec flag of the target, which keeps it open across
-        // `exec`. The copies stay close-on-exec, so they close then.
-        unsafe {
-            command.pre_exec(move || {
-                if let Some(nofile) = nofile {
+        if let Some(nofile) = nofile {
+            // SAFETY: The closure runs in the child, between `fork` and `exec`, where only
+            // async-signal-safe functions may be called: it calls `setrlimit`, and `last_os_error`
+            // if that fails, which reads `errno` and neither allocates nor takes a lock. It borrows
+            // nothing. busd inherits the limits of the shell that execs it.
+            unsafe {
+                command.pre_exec(move || {
                     let limit = libc::rlimit {
                         rlim_cur: nofile,
                         rlim_max: nofile,
@@ -777,15 +723,10 @@ impl Busd {
                     if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                }
-                for (target, source) in (FIRST_FD..).zip(&sources) {
-                    if libc::dup2(*source, target) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
 
-                Ok(())
-            });
+                    Ok(())
+                });
+            }
         }
         let child = command.spawn().unwrap();
 
@@ -828,156 +769,76 @@ impl Drop for Busd {
     }
 }
 
-/// The service manager, as busd sees it.
+/// The service manager, as busd sees it: the fake one of zoter, which keeps the store as systemd
+/// does, on a thread of its own, and starts busd as systemd does.
 struct Systemd {
-    /// The notification socket, `$NOTIFY_SOCKET`.
-    socket: UnixDatagram,
-    path: Removed,
-    /// The listening socket of the socket activation, if any, which systemd keeps open while busd
-    /// comes and goes, with its file in place.
-    activation: Option<UnixListener>,
-    /// The file descriptor store of the service: the stored FDs that busd didn't remove, with the
-    /// names it stored them under.
-    store: Vec<(String, OwnedFd)>,
-    /// The names that busd removed from the store since the test last asked.
-    removed: Vec<String>,
+    manager: Manager,
 }
 
 impl Systemd {
     /// A notification socket that no one has sent anything to.
     fn bind() -> Self {
-        let path = Removed(temp_path());
-        let socket = UnixDatagram::bind(&path.0).unwrap();
-        // A bus that doesn't send what the test waits for fails the test, which then kills it,
-        // rather than hang the test until it times out, which would leave the bus running.
-        socket.set_read_timeout(Some(WAIT)).unwrap();
-
         Self {
-            socket,
-            path,
-            activation: None,
-            store: Vec::new(),
-            removed: Vec::new(),
+            manager: Manager::new().unwrap(),
         }
     }
 
     /// A notification socket, as [`Systemd::bind`] binds, and a listening socket of socket
-    /// activation, bound at `path`.
+    /// activation, bound at `path`, which systemd keeps open while busd comes and goes, with its
+    /// file in place.
     fn activating(path: &Path) -> Self {
+        let mut systemd = Self::bind();
         let activation = UnixListener::bind(path).unwrap();
+        systemd.manager.add_socket(ACTIVATION, activation.into());
 
-        Self {
-            activation: Some(activation),
-            ..Self::bind()
-        }
+        systemd
     }
 
     /// Close the listening socket of the socket activation, as systemd does once its socket unit
     /// goes, and leave its file behind.
     fn deactivate(&mut self) {
-        self.activation = None;
+        self.manager.take_sockets();
     }
 
-    /// The path of the notification socket.
-    fn path(&self) -> &Path {
-        &self.path.0
-    }
-
-    /// The passed FDs, to pass to busd as it starts: the listening socket of the socket
-    /// activation, if any, and the stored FDs, with their names.
-    fn passed(&self) -> Vec<(&str, BorrowedFd<'_>)> {
-        let activation = self
-            .activation
-            .as_ref()
-            .map(|listener| (ACTIVATION, listener.as_fd()));
-        let stored = self
-            .store
-            .iter()
-            .map(|(name, fd)| (name.as_str(), fd.as_fd()));
-
-        activation.into_iter().chain(stored).collect()
-    }
-
-    /// Deal with what busd sends, until it tells that it's ready.
+    /// Wait until busd tells that it's ready.
     ///
-    /// Nothing stays stored while busd runs: whatever it took from the store, it removed.
+    /// Nothing stays stored while busd runs: whatever it took from the store, it removed, which it
+    /// tells systemd of before that it's ready.
     fn until_ready(&mut self) {
-        while self.process() != "READY=1" {}
+        self.manager.wait_for("READY=1", WAIT).unwrap();
 
         let left = self.names();
         assert!(left.is_empty(), "busd left {left:?} in the store");
     }
 
-    /// Deal with what busd sends as it hands over, until its barrier.
+    /// Wait for the barrier that busd ends its hand-over with, which systemd deals with once it
+    /// dealt with what busd stored before it.
     fn until_barrier(&mut self) {
-        while self.process() != "BARRIER=1" {}
-    }
-
-    /// Deal with the next notification, as systemd does, and give its text.
-    ///
-    /// It keeps the stored FDs, and closes those that busd removes. It closes the pipe that comes
-    /// with a barrier, which lets busd go on, as it gets to the message only once it has dealt with
-    /// the earlier ones.
-    fn process(&mut self) -> String {
-        let (state, fds) = self.recv();
-        if state == "READY=1" {
-            assert!(fds.is_empty(), "busd sent file descriptors with {state:?}");
-        } else if state == "BARRIER=1" {
-            assert_eq!(fds.len(), 1, "the barrier comes with a pipe to wait for");
-        } else if let Some(name) = state.strip_prefix("FDSTORE=1\nFDPOLL=0\nFDNAME=") {
-            // The store doesn't watch the file descriptors for hang-ups, which would drop what a
-            // client sent before it hung up.
-            let Ok([fd]) = <[OwnedFd; 1]>::try_from(fds) else {
-                panic!("busd sent a number of file descriptors other than 1 to store as `{name}`");
-            };
-            // The store keeps one file descriptor of each open file description, under the name
-            // that the first came with, and closes the others without a word.
-            if !self.store.iter().any(|(_, stored)| same_file(stored, &fd)) {
-                self.store.push((name.to_owned(), fd));
-            }
-        } else if let Some(name) = state.strip_prefix("FDSTOREREMOVE=1\nFDNAME=") {
-            assert!(fds.is_empty(), "busd sent file descriptors with {state:?}");
-            let stored = self.store.len();
-            self.store.retain(|(stored, _)| stored != name);
-            assert!(
-                self.store.len() < stored,
-                "busd removed `{name}`, which isn't stored"
-            );
-            self.removed.push(name.to_owned());
-        } else {
-            panic!("busd sent {state:?}, which systemd doesn't take");
-        }
-
-        state
+        self.manager.wait_for("BARRIER=1", WAIT).unwrap();
     }
 
     /// The names of what is stored, sorted.
     fn names(&self) -> Vec<String> {
-        let mut names = self.names_in_order();
+        let mut names = self.manager.stored_names();
         names.sort_unstable();
 
         names
     }
 
-    /// The names of what is stored, in the order that it was stored.
-    fn names_in_order(&self) -> Vec<String> {
-        self.store.iter().map(|(name, _)| name.clone()).collect()
-    }
-
-    /// Replace the stored state of the bus with one that no bus can make sense of.
+    /// Replace the stored hand-over of the bus with one that no bus can make sense of.
     fn spoil_state(&mut self) {
-        let garbage = busd::systemd::memfd("busd-state", b"not the state of a bus").unwrap();
-        let (_, state) = self
-            .store
+        let mut stored = self.manager.stored().unwrap();
+        let (_, state) = stored
             .iter_mut()
-            .find(|(name, _)| name == "busd-state")
+            .find(|(name, _)| name == "busd/state")
             .unwrap();
-        *state = garbage;
+        *state = File::open("/dev/null").unwrap().into();
+        self.manager.replace_store(stored);
     }
 
     /// The names that busd removed from the store since this was last called, sorted.
     fn take_removed(&mut self) -> Vec<String> {
-        let mut removed = std::mem::take(&mut self.removed);
+        let mut removed = self.manager.take_removed();
         removed.sort_unstable();
 
         removed
@@ -985,92 +846,29 @@ impl Systemd {
 
     /// Check that the store holds what a bus hands over, and give how many connection FDs that is.
     ///
-    /// That is its state memfd first, so that a store too small for all of the stored FDs takes the
+    /// That is its memfd first, so that a store too small for all of the stored FDs takes the
     /// one that matters most, and then the queue sockets, which hold the connection FDs: the client
-    /// socket of each client, and its client-sent FDs. This takes those out of the queue sockets,
-    /// and puts them back in queue sockets of its own, in place of those of busd, for the next
-    /// instance to take them out of.
+    /// socket of each client, and its client-sent FDs.
     fn check_stored(&mut self) -> usize {
-        let names: Vec<_> = self.store.iter().map(|(name, _)| name.as_str()).collect();
-        let Some((&"busd-state", queues)) = names.split_first() else {
-            panic!("busd stored {names:?}, which isn't its state and its clients");
+        let names = self.manager.stored_names();
+        let Some((state, queues)) = names.split_first() else {
+            panic!("busd stored nothing");
         };
+        assert_eq!(state, "busd/state", "busd stored {names:?}");
         for name in queues {
-            assert_eq!(
-                *name, "busd-clients",
-                "busd stored `{name}` among its clients"
-            );
+            assert_eq!(name, "busd/fds", "busd stored `{name}` among its clients");
         }
 
-        let mut count = 0;
-        for (_, stored) in self.store.iter_mut().skip(1) {
-            let mut queued = Vec::new();
-            busd::systemd::take_queued(stored.as_fd(), |index, fds, complete| {
-                assert!(complete, "the test took some of those at {index} only");
-                queued.push((index, fds));
-            })
-            .unwrap();
-            let queue = busd::systemd::FdQueue::new().unwrap();
-            for (index, fds) in &queued {
-                let fds: Vec<_> = fds.iter().map(AsFd::as_fd).collect();
-                assert!(
-                    queue.push(*index, &fds).unwrap(),
-                    "a queue of the test is full"
-                );
-                count += fds.len();
-            }
-            *stored = queue.into_socket();
-        }
-
-        count
+        self.manager.stored_fds("busd").unwrap()
     }
 
-    /// Check that busd has sent nothing more than the test took.
+    /// Check that busd has sent nothing more than the test waited for.
     ///
-    /// For a busd that has exited, as what it sent is in the socket by then.
+    /// For a busd that has exited, as what it sent is in the socket by then, which the manager
+    /// deals with before the barrier of the test.
     fn assert_silent(&self) {
-        let result = self.try_recv(RecvFlags::DONTWAIT);
-        assert!(
-            matches!(result, Err(Errno::AGAIN)),
-            "busd sent something more: {result:?}"
-        );
-    }
-
-    /// The next notification, with the file descriptors that come with it.
-    fn recv(&self) -> (String, Vec<OwnedFd>) {
-        self.try_recv(RecvFlags::empty())
-            .unwrap_or_else(|e| panic!("busd sent no notification in time: {e}"))
-    }
-
-    fn try_recv(&self, flags: RecvFlags) -> rustix::io::Result<(String, Vec<OwnedFd>)> {
-        let mut state = [0; MAX_NOTIFICATION];
-        let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_FDS))];
-        let mut control = RecvAncillaryBuffer::new(&mut space);
-        let received = recvmsg(
-            &self.socket,
-            &mut [IoSliceMut::new(&mut state)],
-            &mut control,
-            // The file descriptors are the test's to pass on, not to leak into what it starts.
-            flags | RecvFlags::CMSG_CLOEXEC,
-        )?;
-        let truncated = ReturnFlags::TRUNC | ReturnFlags::CTRUNC;
-        assert!(
-            !received.flags.intersects(truncated),
-            "a notification of busd is too large for the test"
-        );
-        // Every file descriptor is taken, so that none stays open in the kernel, with busd waiting
-        // for it to close.
-        let fds = control
-            .drain()
-            .filter_map(|message| match message {
-                RecvAncillaryMessage::ScmRights(fds) => Some(fds),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        let state = str::from_utf8(&state[..received.bytes]).unwrap();
-
-        Ok((state.to_owned(), fds))
+        self.manager.notifier().unwrap().barrier(WAIT).unwrap();
+        assert_eq!(self.manager.take_notifications(), ["BARRIER=1"]);
     }
 }
 
@@ -1090,25 +888,6 @@ impl Drop for Removed {
     }
 }
 
-/// Whether `a` and `b` are of the same open file description, as systemd tells through
-/// `kcmp(2)`, if the kernel lets the test call that.
-fn same_file(a: &OwnedFd, b: &OwnedFd) -> bool {
-    let pid = libc::c_long::from(Pid::as_raw(Some(getpid())));
-    // SAFETY: The call reads and writes no memory, and takes each of its arguments as a long.
-    let order = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            pid,
-            pid,
-            KCMP_FILE,
-            libc::c_long::from(a.as_raw_fd()),
-            libc::c_long::from(b.as_raw_fd()),
-        )
-    };
-
-    order == 0
-}
-
 /// A path in the temporary directory that no one else uses.
 fn temp_path() -> PathBuf {
     temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10))
@@ -1123,11 +902,14 @@ const UNIQUE_NAME_PREFIX: &str = ":busd.";
 /// How many file descriptors the service may store: `FileDescriptorStoreMax=` of its unit.
 const FDSTORE_MAX: usize = 16;
 /// A limit of open FDs under which the next instance takes the fitting clients and no more: the
-/// first of the passed FDs, the state memfd, the listening socket and the queue socket, and the
-/// spare FDs that busd keeps free, besides the clients, each of which takes its client socket and
-/// its process FD.
-const LOW_NOFILE: libc::rlim_t =
-    (FIRST_FD as libc::rlim_t) + 3 + 32 + 2 * FITTING_CLIENTS as libc::rlim_t;
+/// first of the passed FDs, the listening socket, the memfd and the queue sockets, as many as the
+/// store takes, and the spare FDs that busd keeps free, besides the clients, each of which takes
+/// its client socket and its process FD.
+const LOW_NOFILE: libc::rlim_t = (FIRST_FD as libc::rlim_t)
+    + 1
+    + FDSTORE_MAX as libc::rlim_t
+    + 32
+    + 2 * FITTING_CLIENTS as libc::rlim_t;
 const HARD_NOFILE: libc::rlim_t = 64;
 const FREE_FDS: libc::rlim_t = 2;
 /// How many clients the test hands over, and how many of them fit under `LOW_NOFILE`.
@@ -1139,13 +921,7 @@ const FIRST_FD: RawFd = 3;
 const WAIT: Duration = Duration::from_secs(10);
 /// The name of the unit of socket activation, which starts like the names of the stored FDs.
 const ACTIVATION: &str = "busd-session.socket";
-/// How large a notification the test takes, which is that of systemd.
-const MAX_NOTIFICATION: usize = 4096;
-/// How many file descriptors the test takes with a notification: busd sends one.
-const MAX_FDS: usize = 4;
 /// How many file descriptors fit in a message: `SCM_MAX_FD` of Linux, as unix(7) tells.
 const SCM_MAX_FD: usize = 253;
 /// How many client-sent FDs a client sends ahead, which more than one datagram takes.
 const AHEAD: usize = SCM_MAX_FD + 50;
-/// What `kcmp(2)` compares of two file descriptors: their open file descriptions.
-const KCMP_FILE: libc::c_long = 0;

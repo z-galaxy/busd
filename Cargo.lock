@@ -90,6 +90,7 @@ dependencies = [
  "tracing-subscriber",
  "xdg-home",
  "zbus",
+ "zoter",
  "zruntime",
 ]
 
@@ -1559,7 +1560,7 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.2.1"
-source = "git+https://github.com/z-galaxy/zbus?branch=main#0cf013c597add8881bf02b7711f4e36dc7ce531e"
+source = "git+https://github.com/z-galaxy/zbus?branch=main#ef68f773afcc11998363ad05a843d61db645d08d"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -1582,13 +1583,14 @@ dependencies = [
  "zbus_macros",
  "zbus_utils",
  "zcheapstr",
+ "zoter",
  "zruntime",
 ]
 
 [[package]]
 name = "zbus_macros"
 version = "6.2.1"
-source = "git+https://github.com/z-galaxy/zbus?branch=main#0cf013c597add8881bf02b7711f4e36dc7ce531e"
+source = "git+https://github.com/z-galaxy/zbus?branch=main#ef68f773afcc11998363ad05a843d61db645d08d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1599,7 +1601,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.1.0"
-source = "git+https://github.com/z-galaxy/zbus?branch=main#0cf013c597add8881bf02b7711f4e36dc7ce531e"
+source = "git+https://github.com/z-galaxy/zbus?branch=main#ef68f773afcc11998363ad05a843d61db645d08d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1642,6 +1644,16 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zoter"
+version = "0.1.0"
+source = "git+https://github.com/z-galaxy/zoter?branch=main#87ba92f236c861e065e660adf0b130138b6da455"
+dependencies = [
+ "libc",
+ "rustix",
+ "tracing",
+]
 
 [[package]]
 name = "zruntime"
