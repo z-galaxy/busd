@@ -28,7 +28,7 @@ use std::{
     mem::MaybeUninit,
     ops::Deref,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, fs::FileExt},
     },
     process, ptr, slice,
@@ -49,7 +49,6 @@ use rustix::{
         SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
     },
     pipe::{pipe_with, PipeFlags},
-    process::{getpid, Pid},
 };
 
 /// The file descriptors that systemd passed to this process, with their names.
@@ -176,9 +175,8 @@ impl Notifier {
     /// `FileDescriptorStoreMax=` of the unit
     /// ([`fd_store_max`]) at a time, and closes those that don't fit, as well as those that it has
     /// already: it stores an open file description once, under the name that the first of its file
-    /// descriptors came with ([`same_file`] tells those apart as the manager does, where the kernel
-    /// tells). This only fails if the message can't be sent, as the manager says nothing of what it
-    /// did with it.
+    /// descriptors came with, where an [`FdQueue`] takes each as it is. This only fails if the
+    /// message can't be sent, as the manager says nothing of what it did with it.
     /// [`barrier`] tells that it has dealt with it.
     ///
     /// A name is no longer than 255 characters, all of them printable ASCII ones but `:`, as
@@ -537,66 +535,6 @@ where
     }
 }
 
-/// Whether `a` and `b` are of the same open file description: whether one is a duplicate of the
-/// other, as [`OwnedFd::try_clone`] makes, and as passing a file descriptor to another process
-/// does.
-///
-/// The fdstore keeps one file descriptor of each open file description, and drops the others
-/// without a word ([`Notifier::store`]). This asks the kernel, as systemd does: from Linux 6.10 on
-/// (`F_DUPFD_QUERY`), or else through `kcmp(2)`. Without either, as when a filter of system calls
-/// denies `kcmp(2)`, it fails with an error of kind [`ErrorKind::Unsupported`], rather than guess
-/// as systemd does then: systemd takes two file descriptors of one file with the same flags for
-/// the same, unless the file is a device, while they may be of open file descriptions of their
-/// own, with offsets of their own, which a duplicate of one in place of the other would share.
-pub fn same_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> io::Result<bool> {
-    let (raw_a, raw_b) = (a.as_raw_fd(), b.as_raw_fd());
-    if raw_a == raw_b {
-        return Ok(true);
-    }
-    // SAFETY: The command reads and writes no memory, and both file descriptors are open, as
-    // they are borrowed.
-    match unsafe { libc::fcntl(raw_a, F_DUPFD_QUERY, raw_b) } {
-        -1 => {
-            let e = io::Error::last_os_error();
-            // A kernel before 6.10 doesn't know the command.
-            if e.raw_os_error() != Some(libc::EINVAL) {
-                return Err(e);
-            }
-        }
-        same => return Ok(same > 0),
-    }
-    let pid = libc::c_long::from(Pid::as_raw(Some(getpid())));
-    // SAFETY: The call reads and writes no memory, and takes each of its arguments as a long.
-    let order = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            pid,
-            pid,
-            KCMP_FILE,
-            libc::c_long::from(raw_a),
-            libc::c_long::from(raw_b),
-        )
-    };
-    match order {
-        -1 => {
-            let e = io::Error::last_os_error();
-            if !e
-                .raw_os_error()
-                .is_some_and(|errno| KCMP_UNAVAILABLE.contains(&errno))
-            {
-                return Err(e);
-            }
-        }
-        order => return Ok(order == 0),
-    }
-
-    Err(io::Error::new(
-        ErrorKind::Unsupported,
-        "the kernel tells neither through `F_DUPFD_QUERY` nor through `kcmp(2)` whether two file \
-         descriptors are of the same open file description",
-    ))
-}
-
 /// How many file descriptors fit in a message: `SCM_MAX_FD` of Linux, as unix(7) tells.
 pub const MAX_FDS: usize = 253;
 
@@ -909,18 +847,6 @@ const INDEX_LEN: usize = size_of::<u64>();
 
 /// How much room [`read_memfd`] makes for the next read, at least.
 const READ_CHUNK: usize = 8192;
-
-/// The command of `fcntl(2)` that tells whether two file descriptors are of the same open file
-/// description, from Linux 6.10 on, `F_LINUX_SPECIFIC_BASE + 3`, which libc has no name for yet.
-const F_DUPFD_QUERY: libc::c_int = 1024 + 3;
-
-/// What `kcmp(2)` compares of two file descriptors: their open file descriptions.
-const KCMP_FILE: libc::c_long = 0;
-
-/// The errors of `kcmp(2)` that tell that it can't be called, as systemd takes them: the kernel
-/// lacks it, or a filter of system calls denies it.
-const KCMP_UNAVAILABLE: [libc::c_int; 4] =
-    [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM, libc::EACCES];
 
 #[cfg(test)]
 mod tests {
@@ -1405,22 +1331,6 @@ mod tests {
         let bytes = read_memfd(file.as_fd()).unwrap();
         assert!(bytes.len() > READ_CHUNK);
         assert_eq!(bytes, std::fs::read(path).unwrap());
-    }
-
-    #[test]
-    fn same_file_tells_duplicates() {
-        let null = File::open("/dev/null").unwrap();
-        let duplicate = null.try_clone().unwrap();
-        assert!(same_file(null.as_fd(), duplicate.as_fd()).unwrap());
-        assert!(same_file(null.as_fd(), null.as_fd()).unwrap());
-
-        // Another open file description of the same file, and the two ends of a pipe, which are
-        // of the same file too.
-        let other = File::open("/dev/null").unwrap();
-        assert!(!same_file(null.as_fd(), other.as_fd()).unwrap());
-        let (read, write) = pipe();
-        assert!(!same_file(read.as_fd(), write.as_fd()).unwrap());
-        assert!(!same_file(null.as_fd(), read.as_fd()).unwrap());
     }
 
     /// What goes into a queue comes out of it as it went, in order, with the index that it went

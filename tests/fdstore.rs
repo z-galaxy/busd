@@ -263,12 +263,13 @@ fn restart_with_the_same_fd_sent_ahead_twice() {
 }
 
 /// File descriptors of one file, with the same flags, but of open file descriptions of their own,
-/// as two opens of the file make, are each stored as they are, where the kernel doesn't tell busd
-/// whether they are of the same open file description, rather than one taken for a duplicate of
-/// the other: the next instance passes each on as it was, with an offset of its own.
+/// as two opens of the file make, are each stored as they are, rather than one taken for a
+/// duplicate of the other, as systemd may take them where the kernel doesn't tell it whether they
+/// are of the same open file description: the next instance passes each on as it was, with an
+/// offset of its own.
 #[test]
 #[timeout(60000)]
-fn restart_with_fds_of_one_file_sent_ahead_without_fd_queries() {
+fn restart_with_fds_of_one_file_sent_ahead() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
@@ -283,7 +284,7 @@ fn restart_with_fds_of_one_file_sent_ahead_without_fd_queries() {
     };
     let offsets = [1, 4];
 
-    let mut first = Busd::spawn_without_fd_queries(&systemd, &address, FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     let mut sender = {
@@ -817,27 +818,6 @@ impl Busd {
         store_max: usize,
         nofile: Option<libc::rlim_t>,
     ) -> Self {
-        Self::spawn_with(systemd, address, passed, store_max, nofile, None)
-    }
-
-    /// Starts busd as `spawn` does, with nothing passed, on a kernel that doesn't tell whether two
-    /// file descriptors are of the same open file description, as one before Linux 6.10, which
-    /// lacks `F_DUPFD_QUERY`, whose filter of system calls denies `kcmp(2)`.
-    fn spawn_without_fd_queries(systemd: &Systemd, address: &str, store_max: usize) -> Self {
-        let filter = Some(without_fd_queries());
-
-        Self::spawn_with(systemd, address, &[], store_max, None, filter)
-    }
-
-    /// Starts busd as `spawn_limited` does, under the filter of system calls `filter`, if given.
-    fn spawn_with(
-        systemd: &Systemd,
-        address: &str,
-        passed: &[(&str, BorrowedFd<'_>)],
-        store_max: usize,
-        nofile: Option<libc::rlim_t>,
-        filter: Option<[libc::sock_filter; FILTER_LEN]>,
-    ) -> Self {
         let count = RawFd::try_from(passed.len()).unwrap();
         // The file descriptors may be among those they are to be passed as, so that passing one
         // would close another before it's passed. Copies out of that way, which close on exec, are
@@ -884,11 +864,10 @@ impl Busd {
             .stdin(Stdio::null())
             .stdout(Stdio::null());
         // SAFETY: The closure runs in the child, between `fork` and `exec`, where only
-        // async-signal-safe functions may be called: it calls `setrlimit`, `dup2`, `prctl` and
-        // `seccomp`, and `last_os_error` if one fails, which read `errno` and neither allocate nor
-        // take a lock. It owns the numbers of the file descriptors and the filter,
-        // which the program that it hands `seccomp` points to, and borrows nothing. The sources are
-        // open in the child, as `copies` holds them until `spawn` returns. They are all `FIRST_FD +
+        // async-signal-safe functions may be called: it calls `setrlimit` and `dup2`, and
+        // `last_os_error` if one fails, which reads `errno` and neither allocates nor takes a lock.
+        // It owns the numbers of the file descriptors, and borrows nothing. The sources are open in
+        // the child, as `copies` holds them until `spawn` returns. They are all `FIRST_FD +
         // count` or above, so none is among the targets, `FIRST_FD` up to that, and no `dup2`
         // closes a source that another has yet to copy. A target that is open is closed, but only
         // in the child, whose copy nothing uses but for `std`'s pipe for reporting a failed `exec`:
@@ -910,26 +889,6 @@ impl Busd {
                     if libc::dup2(*source, target) < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                }
-                let Some(filter) = &filter else {
-                    return Ok(());
-                };
-                // Only a process that can't gain privileges may set a filter up without them.
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let program = libc::sock_fprog {
-                    len: FILTER_LEN as libc::c_ushort,
-                    filter: filter.as_ptr().cast_mut(),
-                };
-                let filtered = libc::syscall(
-                    libc::SYS_seccomp,
-                    libc::SECCOMP_SET_MODE_FILTER,
-                    0,
-                    &program,
-                );
-                if filtered < 0 {
-                    return Err(io::Error::last_os_error());
                 }
 
                 Ok(())
@@ -1253,43 +1212,6 @@ fn same_file(a: &OwnedFd, b: &OwnedFd) -> bool {
     order == 0
 }
 
-/// A filter of system calls, in the classic BPF of `seccomp(2)`, that has those that tell whether
-/// two file descriptors are of the same open file description fail, as on a kernel that lacks
-/// them: `fcntl(2)` with `F_DUPFD_QUERY` with `EINVAL`, and `kcmp(2)` with `ENOSYS`.
-fn without_fd_queries() -> [libc::sock_filter; FILTER_LEN] {
-    let load = |offset| libc::sock_filter {
-        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-        jt: 0,
-        jf: 0,
-        k: offset,
-    };
-    // Skips the `skip` instructions after it unless what was loaded is `value`.
-    let unless = |value, skip| libc::sock_filter {
-        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-        jt: 0,
-        jf: skip,
-        k: value,
-    };
-    let ret = |action| libc::sock_filter {
-        code: (libc::BPF_RET | libc::BPF_K) as u16,
-        jt: 0,
-        jf: 0,
-        k: action,
-    };
-    let fail = |errno: libc::c_int| ret(libc::SECCOMP_RET_ERRNO | errno as u32);
-
-    [
-        load(SECCOMP_NR),
-        unless(libc::SYS_kcmp as u32, 1),
-        fail(libc::ENOSYS),
-        unless(libc::SYS_fcntl as u32, 3),
-        load(SECCOMP_ARG1),
-        unless(F_DUPFD_QUERY, 1),
-        fail(libc::EINVAL),
-        ret(libc::SECCOMP_RET_ALLOW),
-    ]
-}
-
 /// A path in the temporary directory that no one else uses.
 fn temp_path() -> PathBuf {
     temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10))
@@ -1336,17 +1258,3 @@ const SCM_MAX_FD: usize = 253;
 const AHEAD: usize = SCM_MAX_FD + 50;
 /// What `kcmp(2)` compares of two file descriptors: their open file descriptions.
 const KCMP_FILE: libc::c_long = 0;
-/// How many instructions the filter of [`without_fd_queries`] has.
-const FILTER_LEN: usize = 8;
-/// Where the number of the system call is in what a filter of `seccomp(2)` is given of it, `struct
-/// seccomp_data`.
-const SECCOMP_NR: u32 = 0;
-/// Where the low half of the second argument of the system call is in there, which is the command
-/// of `fcntl(2)`.
-#[cfg(target_endian = "little")]
-const SECCOMP_ARG1: u32 = 24;
-#[cfg(target_endian = "big")]
-const SECCOMP_ARG1: u32 = 28;
-/// The command of `fcntl(2)` that tells whether two file descriptors are of the same open file
-/// description, from Linux 6.10 on, `F_LINUX_SPECIFIC_BASE + 3`.
-const F_DUPFD_QUERY: u32 = 1024 + 3;
