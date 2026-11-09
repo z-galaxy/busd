@@ -7,7 +7,8 @@
 //! [`Notifier::notify`]. A service stores a file descriptor with [`Notifier::store`], and the
 //! manager keeps it open until the service is stopped, however often the service restarts
 //! meanwhile. That is how a service can restart without dropping its clients: the manager holds on
-//! to their connections.
+//! to their connections. A store of a few file descriptors takes tens of thousands of them for
+//! each, in the queues of the sockets of [`FdQueue`]s.
 //!
 //! These are the protocols of [`sd_listen_fds(3)`], [`sd_notify(3)`] and the [file descriptor
 //! store], with nothing of the bus in them: what to store, and when, is for the caller to decide.
@@ -23,11 +24,11 @@ use std::{
     env::{self, VarError},
     ffi::OsStr,
     fs::File,
-    io::{self, ErrorKind, IoSlice},
+    io::{self, ErrorKind, IoSlice, IoSliceMut},
     mem::MaybeUninit,
     ops::Deref,
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, fs::FileExt},
     },
     process, ptr, slice,
@@ -43,11 +44,11 @@ use rustix::{
     io::{fcntl_setfd, pread, retry_on_intr, Errno, FdFlags},
     mm::{madvise, mmap, munmap, Advice, MapFlags, ProtFlags},
     net::{
-        sendmsg_addr, socket_with, AddressFamily, SendAncillaryBuffer, SendAncillaryMessage,
-        SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+        recvmsg, sendmsg, sendmsg_addr, socket_with, socketpair, AddressFamily,
+        RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+        SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
     },
     pipe::{pipe_with, PipeFlags},
-    process::{getpid, Pid},
 };
 
 /// The file descriptors that systemd passed to this process, with their names.
@@ -174,9 +175,8 @@ impl Notifier {
     /// `FileDescriptorStoreMax=` of the unit
     /// ([`fd_store_max`]) at a time, and closes those that don't fit, as well as those that it has
     /// already: it stores an open file description once, under the name that the first of its file
-    /// descriptors came with ([`same_file`] tells those apart as the manager does, where the kernel
-    /// tells). This only fails if the message can't be sent, as the manager says nothing of what it
-    /// did with it.
+    /// descriptors came with, where an [`FdQueue`] takes each as it is. This only fails if the
+    /// message can't be sent, as the manager says nothing of what it did with it.
     /// [`barrier`] tells that it has dealt with it.
     ///
     /// A name is no longer than 255 characters, all of them printable ASCII ones but `:`, as
@@ -390,65 +390,153 @@ impl Deref for MemfdView {
     }
 }
 
-/// Whether `a` and `b` are of the same open file description: whether one is a duplicate of the
-/// other, as [`OwnedFd::try_clone`] makes, and as passing a file descriptor to another process
-/// does.
+/// A unix socket that holds file descriptors in its queue, and so takes any number of them through
+/// the fdstore as one: [`push`](Self::push) them into it, [`Notifier::store`] the socket that
+/// [`into_socket`](Self::into_socket) gives, and [`take_queued`] takes them out of it in the next
+/// instance of the service.
 ///
-/// The fdstore keeps one file descriptor of each open file description, and drops the others
-/// without a word ([`Notifier::store`]). This asks the kernel, as systemd does: from Linux 6.10 on
-/// (`F_DUPFD_QUERY`), or else through `kcmp(2)`. Without either, as when a filter of system calls
-/// denies `kcmp(2)`, it fails with an error of kind [`ErrorKind::Unsupported`], rather than guess
-/// as systemd does then: systemd takes two file descriptors of one file with the same flags for
-/// the same, unless the file is a device, while they may be of open file descriptions of their
-/// own, with offsets of their own, which a duplicate of one in place of the other would share.
-pub fn same_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> io::Result<bool> {
-    let (raw_a, raw_b) = (a.as_raw_fd(), b.as_raw_fd());
-    if raw_a == raw_b {
-        return Ok(true);
-    }
-    // SAFETY: The command reads and writes no memory, and both file descriptors are open, as
-    // they are borrowed.
-    match unsafe { libc::fcntl(raw_a, F_DUPFD_QUERY, raw_b) } {
-        -1 => {
-            let e = io::Error::last_os_error();
-            // A kernel before 6.10 doesn't know the command.
-            if e.raw_os_error() != Some(libc::EINVAL) {
-                return Err(e);
-            }
-        }
-        same => return Ok(same > 0),
-    }
-    let pid = libc::c_long::from(Pid::as_raw(Some(getpid())));
-    // SAFETY: The call reads and writes no memory, and takes each of its arguments as a long.
-    let order = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            pid,
-            pid,
-            KCMP_FILE,
-            libc::c_long::from(raw_a),
-            libc::c_long::from(raw_b),
-        )
-    };
-    match order {
-        -1 => {
-            let e = io::Error::last_os_error();
-            if !e
-                .raw_os_error()
-                .is_some_and(|errno| KCMP_UNAVAILABLE.contains(&errno))
-            {
-                return Err(e);
-            }
-        }
-        order => return Ok(order == 0),
+/// The manager passes the next instance the name of each file descriptor that it passes in one
+/// environment variable, `$LISTEN_FDNAMES`, of which Linux takes 128 KiB at most
+/// (`MAX_ARG_STRLEN`): it fails to start the next instance with more, as it does with more file
+/// descriptors than the soft limit of open files of the service takes, and it keeps no more than
+/// `FileDescriptorStoreMax=` of them. A file descriptor that comes with a datagram over a unix
+/// socket stays in the queue of the socket until someone receives the datagram, whoever holds the
+/// socket meanwhile, so the store keeps those of the queue with the socket, as one.
+///
+/// The queue takes as many datagrams as the send buffer of the socket has room for: a few hundred
+/// of [`MAX_FDS`] file descriptors each, with the size that Linux gives it by default.
+#[derive(Debug)]
+pub struct FdQueue {
+    /// The end that the file descriptors are pushed into.
+    sending: OwnedFd,
+    /// The end whose queue holds them.
+    queue: OwnedFd,
+}
+
+impl FdQueue {
+    /// An empty queue.
+    pub fn new() -> io::Result<Self> {
+        // A socket of sequenced packets keeps the datagrams apart, and in order, and tells that the
+        // queue ended once the end that they were pushed into is closed.
+        let (sending, queue) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )?;
+
+        Ok(Self { sending, queue })
     }
 
-    Err(io::Error::new(
-        ErrorKind::Unsupported,
-        "the kernel tells neither through `F_DUPFD_QUERY` nor through `kcmp(2)` whether two file \
-         descriptors are of the same open file description",
-    ))
+    /// Push `fds`, [`MAX_FDS`] of them at most, as those from `index` on, if the queue has room for
+    /// them, which this tells: [`take_queued`] gives them back with `index`.
+    ///
+    /// The queue takes duplicates of them, each as it is, one of the same open file description
+    /// as another among them, which the store keeps once ([`Notifier::store`]), included. Those
+    /// that nobody took out by then close with the last file descriptor of the socket that
+    /// [`into_socket`](Self::into_socket) gives, as when the manager removes it from the store.
+    /// This fails with `E2BIG` for more than [`MAX_FDS`] file descriptors, and pushes none of them
+    /// then.
+    pub fn push(&self, index: u64, fds: &[BorrowedFd<'_>]) -> io::Result<bool> {
+        if fds.len() > MAX_FDS {
+            return Err(Errno::TOOBIG.into());
+        }
+
+        let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_FDS))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        if !fds.is_empty() {
+            let fits = control.push(SendAncillaryMessage::ScmRights(fds));
+            debug_assert!(
+                fits,
+                "the space is for as many file descriptors as a datagram takes"
+            );
+        }
+        let index = index.to_le_bytes();
+        let pushed = retry_on_intr(|| {
+            sendmsg(
+                &self.sending,
+                &[IoSlice::new(&index)],
+                &mut control,
+                SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+            )
+        });
+        match pushed {
+            Ok(_) => Ok(true),
+            Err(Errno::AGAIN) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The socket whose queue holds what was pushed, for the store to keep, and to pass on to the
+    /// next instance.
+    ///
+    /// The end that the file descriptors were pushed into closes, so that nothing more comes, which
+    /// tells [`take_queued`] where the queue ends.
+    pub fn into_socket(self) -> OwnedFd {
+        self.queue
+    }
 }
+
+/// Take the file descriptors out of the queue of `socket`, which [`FdQueue::into_socket`] gave, as
+/// the next instance of the service does with the socket that it was passed.
+///
+/// `each` gets those of each datagram, in the order that they were pushed in, with the index that
+/// they were pushed as, and whether all of them came: the kernel closes those that the process
+/// can't have, as when it has as many open as its limit of open files takes, or a security module
+/// denies it one, and gives those before them alone. They are close-on-exec.
+///
+/// It ends where the queue does, and fails on a datagram that no [`FdQueue`] pushed: its file
+/// descriptors close then, and those after it stay in the queue, to close with the socket.
+pub fn take_queued<F>(socket: BorrowedFd<'_>, mut each: F) -> io::Result<()>
+where
+    F: FnMut(u64, Vec<OwnedFd>, bool),
+{
+    loop {
+        let mut index = [0; INDEX_LEN];
+        let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_FDS))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let received = retry_on_intr(|| {
+            recvmsg(
+                socket,
+                &mut [IoSliceMut::new(&mut index)],
+                &mut control,
+                RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
+            )
+        });
+        let received = match received {
+            Ok(received) => received,
+            // The end that the file descriptors were pushed into is open still, somewhere, and
+            // nothing more is queued.
+            Err(Errno::AGAIN) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // Past the last datagram, as the end that they were pushed into is closed: every datagram
+        // that a queue pushed has an index.
+        if received.bytes == 0 {
+            return Ok(());
+        }
+        if received.bytes != INDEX_LEN || received.flags.contains(ReturnFlags::TRUNC) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "a datagram that no queue of file descriptors pushed",
+            ));
+        }
+        let fds = control
+            .drain()
+            .filter_map(|message| match message {
+                RecvAncillaryMessage::ScmRights(fds) => Some(fds),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let complete = !received.flags.contains(ReturnFlags::CTRUNC);
+
+        each(u64::from_le_bytes(index), fds, complete);
+    }
+}
+
+/// How many file descriptors fit in a message: `SCM_MAX_FD` of Linux, as unix(7) tells.
+pub const MAX_FDS: usize = 253;
 
 /// How a memfd is viewed: see [`view_memfd`].
 #[derive(Debug)]
@@ -749,33 +837,21 @@ const START: RawFd = 3;
 /// The name of a file descriptor that systemd sent no names for.
 const UNKNOWN: &str = "unknown";
 
-/// How many file descriptors fit in a message: `SCM_MAX_FD` of Linux, as unix(7) tells.
-const MAX_FDS: usize = 253;
-
 /// The longest name that systemd takes for a stored file descriptor.
 const MAX_NAME_LEN: usize = 255;
 
+/// How long the index is that an [`FdQueue`] pushes with each datagram, ahead of its file
+/// descriptors: a `u64`, little-endian.
+const INDEX_LEN: usize = size_of::<u64>();
+
 /// How much room [`read_memfd`] makes for the next read, at least.
 const READ_CHUNK: usize = 8192;
-
-/// The command of `fcntl(2)` that tells whether two file descriptors are of the same open file
-/// description, from Linux 6.10 on, `F_LINUX_SPECIFIC_BASE + 3`, which libc has no name for yet.
-const F_DUPFD_QUERY: libc::c_int = 1024 + 3;
-
-/// What `kcmp(2)` compares of two file descriptors: their open file descriptions.
-const KCMP_FILE: libc::c_long = 0;
-
-/// The errors of `kcmp(2)` that tell that it can't be called, as systemd takes them: the kernel
-/// lacks it, or a filter of system calls denies it.
-const KCMP_UNAVAILABLE: [libc::c_int; 4] =
-    [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM, libc::EACCES];
 
 #[cfg(test)]
 mod tests {
     use std::{
         env::temp_dir,
         fs::remove_file,
-        io::IoSliceMut,
         os::fd::AsRawFd,
         path::{Path, PathBuf},
         process::Command,
@@ -791,10 +867,10 @@ mod tests {
         fs::ftruncate,
         io::{fcntl_getfd, pwrite, read, write},
         net::{
-            bind, recvmsg,
-            sockopt::{set_socket_timeout, Timeout},
-            RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+            bind, send,
+            sockopt::{set_socket_send_buffer_size, set_socket_timeout, Timeout},
         },
+        process::{getrlimit, setrlimit, Resource},
     };
 
     use super::*;
@@ -1256,20 +1332,168 @@ mod tests {
         assert_eq!(bytes, std::fs::read(path).unwrap());
     }
 
+    /// What goes into a queue comes out of it as it went, in order, with the index that it went
+    /// as, the same file descriptor twice included, and close-on-exec.
     #[test]
-    fn same_file_tells_duplicates() {
-        let null = File::open("/dev/null").unwrap();
-        let duplicate = null.try_clone().unwrap();
-        assert!(same_file(null.as_fd(), duplicate.as_fd()).unwrap());
-        assert!(same_file(null.as_fd(), null.as_fd()).unwrap());
+    fn fd_queue_round_trip() {
+        let (read_a, write_a) = pipe();
+        let (read_b, write_b) = pipe();
+        let queue = FdQueue::new().unwrap();
 
-        // Another open file description of the same file, and the two ends of a pipe, which are
-        // of the same file too.
-        let other = File::open("/dev/null").unwrap();
-        assert!(!same_file(null.as_fd(), other.as_fd()).unwrap());
-        let (read, write) = pipe();
-        assert!(!same_file(read.as_fd(), write.as_fd()).unwrap());
-        assert!(!same_file(null.as_fd(), read.as_fd()).unwrap());
+        assert!(queue.push(7, &[write_a.as_fd(), write_b.as_fd()]).unwrap());
+        assert!(queue.push(9, &[]).unwrap());
+        // Which the store would keep once.
+        assert!(queue.push(10, &[write_a.as_fd(), write_a.as_fd()]).unwrap());
+        let socket = queue.into_socket();
+
+        let mut taken = Vec::new();
+        take_queued(socket.as_fd(), |index, fds, complete| {
+            assert!(complete, "not all of those at {index} came");
+            taken.push((index, fds));
+        })
+        .unwrap();
+        let [(7, first), (9, none), (10, second)] = &taken[..] else {
+            panic!("{taken:?} came");
+        };
+        assert!(none.is_empty());
+        // These are the pipes that went, in the order that they went.
+        let pairs = [
+            (&first[..], [(&read_a, b'a'), (&read_b, b'b')]),
+            (&second[..], [(&read_a, b'c'), (&read_a, b'd')]),
+        ];
+        for (fds, reads) in pairs {
+            assert_eq!(fds.len(), reads.len());
+            for (fd, (read, byte)) in fds.iter().zip(reads) {
+                write(fd, &[byte]).unwrap();
+                assert_eq!(read_byte(read), byte);
+                assert!(fcntl_getfd(fd).unwrap().contains(FdFlags::CLOEXEC));
+            }
+        }
+        // Nothing more comes.
+        take_queued(socket.as_fd(), |index, _, _| panic!("{index} came twice")).unwrap();
+    }
+
+    /// A queue takes as many datagrams as the send buffer of its socket has room for, and then
+    /// tells that it is full, rather than take more, while those that it took come out all the
+    /// same.
+    #[test]
+    fn fd_queue_fills_up() {
+        let queue = FdQueue::new().unwrap();
+        // The kernel gives it the smallest buffer that it gives any, of a few kilobytes.
+        set_socket_send_buffer_size(&queue.sending, 1).unwrap();
+        let (_read, write) = pipe();
+
+        let mut pushed = 0;
+        while queue.push(pushed, &[write.as_fd()]).unwrap() {
+            pushed += 1;
+            assert!(
+                pushed < 1000,
+                "the queue took more than its buffer has room for"
+            );
+        }
+        assert!(pushed > 0);
+        assert!(!queue.push(pushed, &[write.as_fd(); MAX_FDS]).unwrap());
+        let socket = queue.into_socket();
+
+        let mut indexes = Vec::new();
+        take_queued(socket.as_fd(), |index, fds, complete| {
+            assert!(complete && fds.len() == 1, "{index}: {fds:?}");
+            indexes.push(index);
+        })
+        .unwrap();
+        assert!(indexes.into_iter().eq(0..pushed));
+    }
+
+    /// A queue takes no more file descriptors with a datagram than fit in a message, and none of
+    /// them then.
+    #[test]
+    fn fd_queue_takes_max_fds_at_most() {
+        let queue = FdQueue::new().unwrap();
+        let (_read, write) = pipe();
+
+        let error = queue.push(0, &[write.as_fd(); MAX_FDS + 1]).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(Errno::TOOBIG.raw_os_error()));
+        assert!(queue.push(1, &[write.as_fd(); MAX_FDS]).unwrap());
+        let socket = queue.into_socket();
+
+        let mut taken = Vec::new();
+        take_queued(socket.as_fd(), |index, fds, _| {
+            taken.push((index, fds.len()))
+        })
+        .unwrap();
+        assert_eq!(taken, [(1, MAX_FDS)]);
+    }
+
+    /// The queue ends where nothing more is queued, even while the end that the file descriptors
+    /// were pushed into is open still.
+    #[test]
+    fn fd_queue_open_still() {
+        let queue = FdQueue::new().unwrap();
+        let (_read, write) = pipe();
+        assert!(queue.push(3, &[write.as_fd()]).unwrap());
+
+        let mut taken = Vec::new();
+        take_queued(queue.queue.as_fd(), |index, fds, _| {
+            taken.push((index, fds.len()))
+        })
+        .unwrap();
+        assert_eq!(taken, [(3, 1)]);
+    }
+
+    /// Taking file descriptors out of a socket that no queue filled fails on a datagram without an
+    /// index, rather than give its file descriptors with one that means nothing.
+    #[test]
+    fn take_queued_refuses_other_datagrams() {
+        for datagram in [&b"an index and more"[..], b"short"] {
+            let (sending, socket) = socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                send(&sending, datagram, SendFlags::empty()).unwrap(),
+                datagram.len()
+            );
+
+            let error = take_queued(socket.as_fd(), |index, _, _| panic!("{index} came"));
+            assert_eq!(
+                error.unwrap_err().kind(),
+                ErrorKind::InvalidData,
+                "{datagram:?}"
+            );
+        }
+    }
+
+    /// The file descriptors of a datagram that the process can't have close, and the queue tells
+    /// that not all of them came, while it gives those that did.
+    #[test]
+    fn take_queued_without_room_for_all() {
+        let test = "take_queued_without_room_for_all";
+        if !in_own_process(test, "BUSD_TEST_LOW_NOFILE=1") {
+            return;
+        }
+
+        let queue = FdQueue::new().unwrap();
+        let (_read, write) = pipe();
+        assert!(queue.push(0, &[write.as_fd(); 8]).unwrap());
+        let socket = queue.into_socket();
+        // Room for 2 file descriptors more than are open, or 3 once the directory closes.
+        let open = std::fs::read_dir("/proc/self/fd").unwrap().count() as u64;
+        let mut limit = getrlimit(Resource::Nofile);
+        limit.current = Some(open + 2);
+        setrlimit(Resource::Nofile, limit).unwrap();
+
+        let mut taken = Vec::new();
+        take_queued(socket.as_fd(), |index, fds, complete| {
+            taken.push((index, fds.len(), complete))
+        })
+        .unwrap();
+        let [(0, came, false)] = taken[..] else {
+            panic!("{taken:?} came");
+        };
+        assert!(0 < came && came < 8, "{came} came");
     }
 
     #[test]

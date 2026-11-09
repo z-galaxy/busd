@@ -187,30 +187,30 @@ pub(crate) struct State {
 }
 
 impl State {
-    /// Where the record of the hand-over of the connection of each client is, as
-    /// [`PeerState::record`] says, with the number of the client: those of the peers, then those of
-    /// the monitors.
-    pub(crate) fn records(&self) -> impl Iterator<Item = (u64, (u64, u64))> + '_ {
-        let peers = self.peers.iter().map(|peer| (peer.id, peer.record));
+    /// Where the bus stored what it hands over of the connection of each client, as
+    /// [`PeerState::stored`] says, with the number of the client: those of the peers, then those
+    /// of the monitors.
+    pub(crate) fn stored(&self) -> impl Iterator<Item = (u64, Stored)> + '_ {
+        let peers = self.peers.iter().map(|peer| (peer.id, peer.stored));
         let monitors = self
             .monitors
             .iter()
-            .map(|monitor| (monitor.id, monitor.record));
+            .map(|monitor| (monitor.id, monitor.stored));
 
         peers.chain(monitors)
     }
 
-    /// Where the record of the hand-over of the connection of each client is, as
-    /// [`State::records`] gives them, to set.
-    pub(crate) fn records_mut(&mut self) -> impl Iterator<Item = (u64, &mut (u64, u64))> {
+    /// Where the bus stored what it hands over of the connection of each client, as
+    /// [`State::stored`] gives it, to set.
+    pub(crate) fn stored_mut(&mut self) -> impl Iterator<Item = (u64, &mut Stored)> {
         let peers = self
             .peers
             .iter_mut()
-            .map(|peer| (peer.id, &mut peer.record));
+            .map(|peer| (peer.id, &mut peer.stored));
         let monitors = self
             .monitors
             .iter_mut()
-            .map(|monitor| (monitor.id, &mut monitor.record));
+            .map(|monitor| (monitor.id, &mut monitor.stored));
 
         peers.chain(monitors)
     }
@@ -255,12 +255,10 @@ pub(crate) struct PeerState {
     pub(crate) id: u64,
     /// Whether the peer called `Hello`.
     pub(crate) greeted: bool,
-    /// Where the record of the hand-over of the connection of the peer is, as zbus saves it
-    /// ([`connection::Handover::save`]), in the memfd that the bus stores the state in, for a next
-    /// instance in another process: its offset from the start of the memfd, and its length. That
-    /// instance gets the file descriptors of the connection apart. It is (0, 0) otherwise, as for
-    /// a peer that the bus left out of the hand-over.
-    pub(crate) record: (u64, u64),
+    /// Where the bus stored what it hands over of the connection of the peer, for a next instance
+    /// in another process. It is the default otherwise, as for a peer that the bus left out of the
+    /// hand-over.
+    pub(crate) stored: Stored,
     pub(crate) match_rules: MatchRules,
     /// The calls to the peer that wait for its reply: the number of the caller, its unique name,
     /// and the serial of the call.
@@ -272,10 +270,24 @@ pub(crate) struct PeerState {
 pub(crate) struct MonitorState {
     /// The number of the peer that became the monitor.
     pub(crate) id: u64,
-    /// Where the record of the hand-over of the connection of the monitor is, as for a peer: see
-    /// [`PeerState::record`].
-    pub(crate) record: (u64, u64),
+    /// Where the bus stored what it hands over of the connection of the monitor, as for a peer:
+    /// see [`PeerState::stored`].
+    pub(crate) stored: Stored,
     pub(crate) match_rules: MatchRules,
+}
+
+/// Where a bus that hands over to its next instance in another process stores what it hands over
+/// of the connection of a client, besides what the state holds, as [`super::systemd`] describes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Type)]
+pub(crate) struct Stored {
+    /// The record of the hand-over of the connection, as zbus saves it
+    /// ([`connection::Handover::save`]), in the state memfd: its offset from the start of the
+    /// memfd, and its length.
+    pub(crate) record: (u64, u64),
+    /// The connection FDs of the client, in the order that [`connection::Handover::fds`] gives
+    /// them, among those of all the clients, which the bus queues for its next instance in the
+    /// order of the hand-over: the index of the first, and how many.
+    pub(crate) fds: (u64, u64),
 }
 
 /// A well-known name, as the bus hands it over: its owner first, then those that queue for it, in
@@ -308,13 +320,16 @@ mod tests {
             peers: vec![PeerState {
                 id: 1,
                 greeted: true,
-                record: (64, 104),
+                stored: Stored {
+                    record: (64, 104),
+                    fds: (0, 1),
+                },
                 match_rules,
                 pending_calls: vec![(2, name(2), 7)],
             }],
             monitors: vec![MonitorState {
                 id: 3,
-                record: (0, 0),
+                stored: Stored::default(),
                 match_rules: MatchRules::default(),
             }],
             names: vec![NameState {
@@ -327,10 +342,13 @@ mod tests {
         let decoded = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
         assert_eq!(state.encoded_len().unwrap(), encoded.len());
-        // The records take as many bytes wherever they are.
+        // The records and the file descriptors take as many bytes wherever they are.
         let mut moved = decoded;
-        for (_, record) in moved.records_mut() {
-            *record = (u64::MAX, u64::MAX);
+        for (_, stored) in moved.stored_mut() {
+            *stored = Stored {
+                record: (u64::MAX, u64::MAX),
+                fds: (u64::MAX, u64::MAX),
+            };
         }
         assert_eq!(moved.encode().unwrap().len(), encoded.len());
 

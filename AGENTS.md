@@ -51,6 +51,11 @@ The crate is both a library (`src/lib.rs`) and a thin CLI binary (`src/bin/busd.
 argument parsing via clap). Key modules:
 
 - **`bus/`** — the broker core: accepts peer connections and routes messages between them.
+- **`systemd.rs`, `bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket
+  activation, readiness notifications, and restarts through systemd's file descriptor store,
+  which hand the clients over to the next instance. The module docs of `bus/systemd.rs`
+  describe the hand-over, with a diagram of a restart (`bus/systemd/restart.mmd`, in
+  mermaid), and name the many kinds of FDs that it takes.
 - **`peer/`, `peers.rs`** — per-connection peer state and the set of connected peers,
   including monitor (eavesdropping) support.
 - **`name_registry.rs`** — ownership of well-known bus names.

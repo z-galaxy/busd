@@ -204,7 +204,7 @@ fn handovers(c: &mut Criterion) {
 /// How many file descriptors the store of the fake systemd takes, as `FileDescriptorStoreMax=`
 /// does for busd's service in the README.
 #[cfg(target_os = "linux")]
-const FD_STORE_MAX: usize = 4096;
+const FD_STORE_MAX: usize = 16;
 
 /// Benchmarks the bus restarting, as `how` says, with `clients` clients that keep their
 /// connections throughout, idle: one restart a round.
