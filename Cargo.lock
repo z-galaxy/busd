@@ -85,6 +85,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "simple-mermaid",
  "tracing",
  "tracing-subscriber",
  "xdg-home",
@@ -952,6 +953,12 @@ checksum = "9203b8055f63a2a00e2f593bb0510367fe707d7ff1e5c872de2f537b339e5410"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "simple-mermaid"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589144a964b4b30fe3a83b4bb1a09e2475aac194ec832a046a23e75bddf9eb29"
 
 [[package]]
 name = "slab"

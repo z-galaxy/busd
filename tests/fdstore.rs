@@ -1,8 +1,9 @@
 //! The busd binary, restarted the way that systemd restarts a service with a file descriptor store.
 //!
 //! The test is the service manager: it owns the notification socket that `$NOTIFY_SOCKET` names,
-//! keeps the file descriptors that busd stores in the manager, and passes them to the next instance
-//! of busd as `$LISTEN_FDS` does.
+//! keeps the stored FDs, those that busd stores in the manager, and passes them to the next
+//! instance of busd, among the passed FDs, as `$LISTEN_FDS` does. The FDs of a hand-over go by the
+//! names that the docs of `src/bus/systemd.rs` give them.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -49,13 +50,13 @@ use zruntime::SharedRuntime;
 /// A bus that systemd stops hands over to its next instance, which serves its clients on as if
 /// nothing happened.
 ///
-/// The first instance stores its state, the socket it listens on and a socket that holds the
-/// sockets of its clients in the file descriptor store, and exits without removing the file of its
-/// socket. The second one,
-/// which is passed them, removes them from the store and tells that it's ready. A client that never
-/// reconnected still owns its name, and a client that connects now gets a number after those of the
-/// others, and sees who owns the name. The second instance hands over in turn, with both clients,
-/// as an instance that took over hands over as well as one that didn't.
+/// The first instance stores the state memfd, its listening socket and a queue socket, which holds
+/// the connection FDs of its clients, in the store, and exits without removing the file of its
+/// listening socket. The second one, which is passed them, removes them from the store and tells
+/// that it's ready. A client that never reconnected still owns its name, and a client that connects
+/// now gets a number after those of the others, and sees who owns the name. The second instance
+/// hands over in turn, with both clients, as an instance that took over hands over as well as one
+/// that didn't.
 #[test]
 #[timeout(60000)]
 fn restart() {
@@ -107,7 +108,8 @@ fn restart_with_fds_sent_ahead() {
         (FdClient::connect(&socket.0, &[sent.as_fd()]).unwrap(), kept)
     };
     hand_over(&mut first, &mut systemd, &socket);
-    // The sockets of the two clients, and the file descriptor that the sender sent ahead.
+    // The connection FDs: the client sockets of the two clients, and the client-sent FD of the
+    // sender.
     assert_eq!(systemd.check_stored(true), 3);
 
     let stored = systemd.names();
@@ -164,9 +166,9 @@ fn restart_with_more_fds_sent_ahead_than_a_datagram_takes() {
     }
 }
 
-/// File descriptors of one open file description, which systemd stores once, as a file descriptor
-/// that a client sent twice ahead of the messages that they are for, are stored each as it is, and
-/// the next instance passes each on.
+/// Client-sent FDs of one open file description, which systemd stores once, as an FD that a client
+/// sent twice ahead of the messages that they are for, are stored each as it is, and the next
+/// instance passes each on.
 #[test]
 #[timeout(60000)]
 fn restart_with_the_same_fd_sent_ahead_twice() {
@@ -241,9 +243,9 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     }
 }
 
-/// A bus that socket activation started hands over its clients, but not the socket it listens on,
-/// which the activation owns: the unit may have any name, even one that starts like those of busd's
-/// own file descriptors, and the next instance is passed the socket along with what was stored.
+/// A bus that socket activation started hands over its clients, but not its listening socket,
+/// which the activation owns: the unit may have any name, even one that starts like those of the
+/// stored FDs, and the next instance is passed the listening socket along with the stored FDs.
 #[test]
 #[timeout(60000)]
 fn restart_under_socket_activation() {
@@ -310,9 +312,9 @@ fn failed_take_over() {
 }
 
 /// A bus that hands over as many clients as the next instance can take: the next instance takes
-/// their file descriptors out of the store under its hard limit of open file descriptors, so a bus
-/// with that limit low hands over fewer clients than it has, and the others get disconnected,
-/// losing their names.
+/// their connection FDs out of the queue sockets, and opens their process FDs, under its hard limit
+/// of open FDs, so a bus with that limit low hands over fewer clients than it has, and the others
+/// get disconnected, losing their names.
 #[test]
 #[timeout(60000)]
 fn hand_over_fits_the_fd_limit() {
@@ -343,11 +345,12 @@ fn hand_over_fits_the_fd_limit() {
     assert_eq!(served(&clients, &late), FITTING_CLIENTS);
 }
 
-/// A bus that has no file descriptor to spare, as it has as many open as its hard limit takes,
-/// still hands over: it keeps some free from the start for the socket it listens on, the state, the
-/// socket that holds the file descriptors of the clients and the barrier, so it stores the state
-/// and the listener, and the clients that it can duplicate and that fit under that limit. The next
-/// instance, under the same limit, serves the clients that were stored.
+/// A bus that has no FD to spare, as it has as many open as its hard limit takes, still hands
+/// over: it keeps some free from the start for the duplicate of its listening socket, the state
+/// memfd, the queue socket and the pipe of the barrier, so it stores the state memfd and its
+/// listening socket, and the connection FDs of the clients whose client sockets it could duplicate
+/// and that fit under that limit. The next instance, under the same limit, serves the clients that
+/// were stored.
 #[test]
 #[timeout(60000)]
 fn hand_over_at_the_hard_fd_limit() {
@@ -421,9 +424,9 @@ fn failed_take_over_under_socket_activation() {
     assert_eq!(owner(&late, "org.freedesktop.DBus"), "org.freedesktop.DBus");
 }
 
-/// A file descriptor store that takes one file descriptor is too small to hand over with: the bus
-/// stops as it does without systemd. It stores nothing, exits successfully and removes the file of
-/// its socket.
+/// A file descriptor store that takes one stored FD is too small to hand over with: the bus stops
+/// as it does without systemd. It stores nothing, exits successfully and removes the file of its
+/// listening socket.
 #[test]
 #[timeout(60000)]
 fn no_hand_over_with_a_small_store() {
@@ -826,7 +829,7 @@ struct Systemd {
     /// The notification socket, `$NOTIFY_SOCKET`.
     socket: UnixDatagram,
     path: Removed,
-    /// The file descriptor store of the service: what busd stored, and didn't remove, with the
+    /// The file descriptor store of the service: the stored FDs that busd didn't remove, with the
     /// names it stored them under.
     store: Vec<(String, OwnedFd)>,
     /// The names that busd removed from the store since the test last asked.
@@ -855,8 +858,8 @@ impl Systemd {
         &self.path.0
     }
 
-    /// The file descriptors to pass to busd as it starts: the socket of the socket activation, if
-    /// any, and what is stored, with their names.
+    /// The passed FDs, to pass to busd as it starts: the listening socket of the socket
+    /// activation, if any, and the stored FDs, with their names.
     fn passed<'a>(
         &'a self,
         activation: Option<&'a UnixListener>,
@@ -887,9 +890,9 @@ impl Systemd {
 
     /// Deal with the next notification, as systemd does, and give its text.
     ///
-    /// It keeps the file descriptors that busd stores, and closes those that busd removes. It
-    /// closes the one that comes with a barrier, which lets busd go on, as it gets to the message
-    /// only once it has dealt with the earlier ones.
+    /// It keeps the stored FDs, and closes those that busd removes. It closes the pipe that comes
+    /// with a barrier, which lets busd go on, as it gets to the message only once it has dealt with
+    /// the earlier ones.
     fn process(&mut self) -> String {
         let (state, fds) = self.recv();
         if state == "READY=1" {
@@ -955,15 +958,13 @@ impl Systemd {
         removed
     }
 
-    /// Check that the store holds what a bus hands over, and give how many file descriptors of the
-    /// connections of its clients that is.
+    /// Check that the store holds what a bus hands over, and give how many connection FDs that is.
     ///
-    /// That is its state first, then the socket it listens on if it bound that itself, so that a
-    /// store too small for all of the sockets takes those that matter most, and then the sockets
-    /// that hold the file descriptors of the connections of its clients in their queues: the
-    /// socket of each client, and those that came with the messages that busd didn't take. This
-    /// takes those out of the queues, and puts them back in queues of its own, in place of those
-    /// of busd, for the next instance to take them out of.
+    /// That is its state memfd first, then its listening socket if it bound that itself, so that a
+    /// store too small for all of the stored FDs takes those that matter most, and then the queue
+    /// sockets, which hold the connection FDs: the client socket of each client, and its
+    /// client-sent FDs. This takes those out of the queue sockets, and puts them back in queue
+    /// sockets of its own, in place of those of busd, for the next instance to take them out of.
     fn check_stored(&mut self, listener: bool) -> usize {
         let names: Vec<_> = self.store.iter().map(|(name, _)| name.as_str()).collect();
         let head: &[&str] = if listener {
@@ -1102,10 +1103,10 @@ const NAME: &str = "org.zbus.Fdstore";
 const UNIQUE_NAME_PREFIX: &str = ":busd.";
 /// How many file descriptors the service may store: `FileDescriptorStoreMax=` of its unit.
 const FDSTORE_MAX: usize = 16;
-/// A limit of open file descriptors under which the next instance takes the fitting clients and no
-/// more: the first file descriptor that systemd passes, the state, the listener and the socket that
-/// holds the file descriptors of the clients, and the spare ones that busd keeps free, besides the
-/// clients, each of which takes its socket and the file descriptor of its process.
+/// A limit of open FDs under which the next instance takes the fitting clients and no more: the
+/// first of the passed FDs, the state memfd, the listening socket and the queue socket, and the
+/// spare FDs that busd keeps free, besides the clients, each of which takes its client socket and
+/// its process FD.
 const LOW_NOFILE: libc::rlim_t =
     (FIRST_FD as libc::rlim_t) + 3 + 32 + 2 * FITTING_CLIENTS as libc::rlim_t;
 const HARD_NOFILE: libc::rlim_t = 64;
@@ -1113,11 +1114,11 @@ const FREE_FDS: libc::rlim_t = 2;
 /// How many clients the test hands over, and how many of them fit under `LOW_NOFILE`.
 const CLIENTS: usize = 4;
 const FITTING_CLIENTS: usize = 2;
-/// The first file descriptor that systemd passes, `SD_LISTEN_FDS_START`.
+/// The first of the passed FDs, `SD_LISTEN_FDS_START`.
 const FIRST_FD: RawFd = 3;
 /// How long the test waits for what should come soon, rather than hang if it never does.
 const WAIT: Duration = Duration::from_secs(10);
-/// The name of the unit of socket activation, which starts like the names of busd's own.
+/// The name of the unit of socket activation, which starts like the names of the stored FDs.
 const ACTIVATION: &str = "busd-session.socket";
 /// How large a notification the test takes, which is that of systemd.
 const MAX_NOTIFICATION: usize = 4096;
@@ -1125,7 +1126,7 @@ const MAX_NOTIFICATION: usize = 4096;
 const MAX_FDS: usize = 4;
 /// How many file descriptors fit in a message: `SCM_MAX_FD` of Linux, as unix(7) tells.
 const SCM_MAX_FD: usize = 253;
-/// How many file descriptors a client sends ahead, which more than one datagram takes.
+/// How many client-sent FDs a client sends ahead, which more than one datagram takes.
 const AHEAD: usize = SCM_MAX_FD + 50;
 /// What `kcmp(2)` compares of two file descriptors: their open file descriptions.
 const KCMP_FILE: libc::c_long = 0;

@@ -96,6 +96,8 @@ rustix = { version = "1.1.2", default-features = false, features = [
     "std",
 ] }
 foldhash = "0.2.0"
+# Draws the diagrams of the docs, which are in mermaid, in the HTML that `cargo doc` builds.
+simple-mermaid = "0.2.0"
 
 [features]
 default = ["tracing-subscriber"]

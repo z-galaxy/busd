@@ -277,16 +277,16 @@ pub(crate) struct MonitorState {
 }
 
 /// Where a bus that hands over to its next instance in another process stores what it hands over
-/// of the connection of a client, besides what the state holds.
+/// of the connection of a client, besides what the state holds, as [`super::systemd`] describes.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Type)]
 pub(crate) struct Stored {
     /// The record of the hand-over of the connection, as zbus saves it
-    /// ([`connection::Handover::save`]), in the memfd that the bus stores the state in: its offset
-    /// from the start of the memfd, and its length.
+    /// ([`connection::Handover::save`]), in the state memfd: its offset from the start of the
+    /// memfd, and its length.
     pub(crate) record: (u64, u64),
-    /// The file descriptors of the connection, in the order that [`connection::Handover::fds`]
-    /// gives them, among those that the bus queues for its next instance in the order of the
-    /// hand-over: the index of the first, and how many.
+    /// The connection FDs of the client, in the order that [`connection::Handover::fds`] gives
+    /// them, among those of all the clients, which the bus queues for its next instance in the
+    /// order of the hand-over: the index of the first, and how many.
     pub(crate) fds: (u64, u64),
 }
 

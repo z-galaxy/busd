@@ -7,8 +7,8 @@
 //! [`Notifier::notify`]. A service stores a file descriptor with [`Notifier::store`], and the
 //! manager keeps it open until the service is stopped, however often the service restarts
 //! meanwhile. That is how a service can restart without dropping its clients: the manager holds on
-//! to their connections. A store of a few file descriptors takes any number of them, in the queues
-//! of the sockets of [`FdQueue`]s.
+//! to their connections. A store of a few file descriptors takes tens of thousands of them for
+//! each, in the queues of the sockets of [`FdQueue`]s.
 //!
 //! These are the protocols of [`sd_listen_fds(3)`], [`sd_notify(3)`] and the [file descriptor
 //! store], with nothing of the bus in them: what to store, and when, is for the caller to decide.

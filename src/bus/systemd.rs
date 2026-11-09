@@ -1,5 +1,90 @@
 //! A bus that systemd runs: on the socket of its socket activation, and handed over to its next
 //! instance through its file descriptor store.
+//!
+//! # A restart through the store
+//!
+//! An instance of busd that stops hands its state and the connections of its clients over to the
+//! next instance through the file descriptor store that systemd keeps for the service across its
+//! restarts, the store. The clients notice nothing but a pause: the next instance serves them on
+//! the same connections, with the same names, match rules and calls that wait for replies, and
+//! passes on what was on its way through the bus.
+//!
+//! A hand-over takes file descriptors (FDs) of many kinds, which these docs name so:
+//!
+//! - The **listening socket** is the socket that the bus accepts its clients on. That of socket
+//!   activation is systemd's, and one that the bus binds itself is its own.
+//! - The **client socket** of a client is the end of its connection that the bus has.
+//! - The **client-sent FDs** of a client are those that it sent with its messages, or ahead of
+//!   them, which the bus read and didn't take yet.
+//! - The **outgoing FDs** of a client are those of the messages that the bus is sending it and
+//!   didn't write to it yet.
+//! - The **connection FDs** of a client are its client socket, its client-sent FDs and its outgoing
+//!   FDs, in that order, as [`connection::Handover::fds`] gives them. Those of all the clients
+//!   follow each other, in the order of the hand-over, each with its index among them, from 0 on.
+//! - The **state memfd** holds the state of the bus, and the record that zbus saves of each
+//!   connection.
+//! - A **queue socket** holds connection FDs in its queue, in datagrams ([`FdQueue`]).
+//! - The **stored FDs** are those that the bus puts in the store: the state memfd, its own
+//!   listening socket, if it has one, and the queue sockets.
+//! - The **passed FDs** are those that systemd passes the next instance as it starts it: the
+//!   listening socket of the socket activation, if any, and the stored FDs, with their names in
+//!   `$LISTEN_FDNAMES`.
+//! - The **process FD** of a client is the pidfd of its process, which the next instance opens to
+//!   look the credentials of the client up.
+//!
+//! On `SIGTERM`, the bus pauses its clients, finishes what it took, and hands their connections
+//! over ([`Bus::hand_over`]). It stores the state memfd, its own listening socket, if any, and the
+//! queue sockets, which hold the connection FDs, and it exits once systemd dealt with all of
+//! them ([`Bus::hand_over_to_systemd`]). systemd starts the next instance with the passed FDs,
+//! which it takes over from ([`Bus::for_systemd`]):
+#![doc = simple_mermaid::mermaid!("systemd/restart.mmd")]
+//!
+//! The store keeps each stored FD under a name of busd's own, which tells the next instance what
+//! it is, as systemd passes them in an order of its own:
+//!
+//! | Name            | Stored FD                                 | What it holds               |
+//! |-----------------|-------------------------------------------|-----------------------------|
+//! | `busd-state`    | The state memfd                           | The state, then the records |
+//! | `busd-listener` | The listening socket, if the bus bound it | The clients in its backlog  |
+//! | `busd-clients`  | Each queue socket                         | Connection FDs              |
+//!
+//! The state tells, for each client, where the record of its connection is in the state memfd,
+//! with its offset and its length, and where its connection FDs are, with the index of the first
+//! and how many. With clients 1, 2 and 4, say, the first of which has a client-sent FD and an
+//! outgoing FD:
+//!
+//! | Connection FD | What it is     | Of client | In the state (first, how many) |
+//! |---------------|----------------|-----------|--------------------------------|
+//! | 0             | Client socket  | 1         | 0, 3                           |
+//! | 1             | Client-sent FD | 1         |                                |
+//! | 2             | Outgoing FD    | 1         |                                |
+//! | 3             | Client socket  | 2         | 3, 1                           |
+//! | 4             | Client socket  | 4         | 4, 1                           |
+//!
+//! A queue socket holds the connection FDs in datagrams of up to 253, each with the index of its
+//! first connection FD, so that it doesn't matter either which queue socket holds which: the first
+//! datagram has the index 0 and connection FDs 0 to 252, the next one 253 and connection FDs 253
+//! to 505, and so on, and the next queue socket, if any, goes on where the previous one ends. Each
+//! takes some 70000 connection FDs, with the default size of its send buffer, so a store of 16
+//! takes almost a million.
+//!
+//! The next instance takes them out once it raised its soft limit of open FDs to the hard one, so
+//! the connection FDs and the process FDs of the clients have to fit under that, which [`fit`] sees
+//! to: the clients that don't fit get disconnected as the bus goes. A client-sent FD that is of the
+//! same open file description as another, as one that a client sent twice, goes as it is, unlike
+//! in the store, which keeps one FD of each.
+//!
+//! # Socket activation
+//!
+//! Socket activation decides whose the listening socket is. With it, the listening socket is
+//! systemd's: systemd passes it to every instance, among the passed FDs, under the name of its
+//! socket unit, and keeps it open while no instance runs, with the clients that connect meanwhile
+//! in its backlog. The bus doesn't store it then, and listens on it whatever its address says.
+//! Without socket activation, the bus binds a listening socket of its own, and stores it, so that
+//! the socket outlives the instance, with its backlog, and the next instance listens on it, where
+//! the previous one did. The bus can't tell a stop from a restart, so it leaves the file of its
+//! own listening socket behind on a stop, which the instance that starts afresh replaces. Either
+//! way, the connection FDs go in queue sockets.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -29,25 +114,25 @@ use crate::{
 };
 
 impl Bus {
-    /// Create a bus that systemd runs, out of the file descriptors that systemd passed as it
-    /// started the process, `fds`, with their names, as [`systemd::take_listen_fds`] gives them,
-    /// and the service manager that `notifier` reaches, if any.
+    /// Create a bus that systemd runs, out of the passed FDs, `fds`, with their names, as
+    /// [`systemd::take_listen_fds`] gives them, and the service manager that `notifier` reaches,
+    /// if any.
     ///
-    /// The bus is the next instance of the one that handed over through the file descriptor store,
-    /// as [`Bus::hand_over_to_systemd`] does, if one did, on the socket of the socket activation,
-    /// if any. Taking over may fail, as when the previous instance encoded its state otherwise: the
-    /// clients that were handed over get disconnected then, and the bus starts as if nothing was
-    /// handed over. Without a hand-over, the bus listens on the socket of the socket activation, if
-    /// systemd passed one, or else at `address`, as [`Bus::for_address`] does. busd listens on one
-    /// socket, so this fails if systemd passed more than one socket of socket activation. All that
-    /// was stored is removed from the store first, so that whatever comes of it, the instances that
-    /// come after don't find it again.
+    /// The bus is the next instance of the one that handed over through the store, as
+    /// [`Bus::hand_over_to_systemd`] does, if one did, on the listening socket of the socket
+    /// activation, if any. Taking over may fail, as when the previous instance encoded its state
+    /// otherwise: the clients that were handed over get disconnected then, and the bus starts as if
+    /// nothing was handed over. Without a hand-over, the bus listens on the listening socket of the
+    /// socket activation, if systemd passed one, or else at `address`, as [`Bus::for_address`]
+    /// does. busd listens on one socket, so this fails if systemd passed more than one listening
+    /// socket of socket activation. All the stored FDs are removed from the store first, so that
+    /// whatever comes of it, the instances that come after don't find them again.
     ///
     /// The next instance listens where the previous one did, whatever `address` says: it warns if
-    /// they differ, unless it listens on the socket of the socket activation, which it does
-    /// whatever `address` says. With a service manager to hand over to, the bus keeps a few file
-    /// descriptors open from the start, before it serves anyone, to give up for those that handing
-    /// over opens, however many file descriptors its clients take by then.
+    /// they differ, unless it listens on the listening socket of the socket activation, which it
+    /// does whatever `address` says. With a service manager to hand over to, the bus keeps a few
+    /// FDs open from the start, before it serves anyone, to give up for those that handing over
+    /// opens, however many client sockets and client-sent FDs its clients take by then.
     pub async fn for_systemd(
         mut fds: Vec<(String, OwnedFd)>,
         notifier: Option<&Notifier>,
@@ -61,7 +146,7 @@ impl Bus {
         };
         let activation = Self::take_activation(&mut fds)?;
         if let Some(notifier) = notifier {
-            // A name may come with more than one file descriptor.
+            // More than one stored FD may come under a name, as the queue sockets do.
             let names: BTreeSet<_> = fds.iter().map(|(name, _)| name).collect();
             for name in names {
                 if let Err(e) = notifier.remove(name) {
@@ -75,27 +160,25 @@ impl Bus {
         Ok(bus)
     }
 
-    /// Hand the bus over to its next instance, through the file descriptor store of systemd, which
-    /// `notifier` reaches, if systemd keeps one that takes the state of the bus and one more file
-    /// descriptor, as `$FDSTORE` tells: the socket that the bus listens on, unless socket
-    /// activation passed it, or a socket that holds the file descriptors of the clients. Otherwise,
-    /// the bus says why it doesn't hand over, and cleans up as [`Bus::cleanup`] does, only logging
-    /// a failure to, as busd does without systemd.
+    /// Hand the bus over to its next instance, through the store of systemd, which `notifier`
+    /// reaches, if systemd keeps one that takes the state memfd and one more stored FD, as
+    /// `$FDSTORE` tells: the listening socket of the bus, unless socket activation passed it, or a
+    /// queue socket. Otherwise, the bus says why it doesn't hand over, and cleans up as
+    /// [`Bus::cleanup`] does, only logging a failure to, as busd does without systemd.
     ///
     /// The bus hands over as [`Bus::hand_over`] does, and stores what it hands over, for
-    /// [`Bus::for_systemd`] to take over from on the restart: its state, with the records of the
-    /// connections of the clients that fit, then the socket that it listens on, and then the file
-    /// descriptors of the connections of those clients, in the order of the hand-over, in the
-    /// queues of sockets ([`FdQueue`]), as many sockets as that takes. So the store takes them,
-    /// however many there are, each as it is, as when a client sent the same file descriptor twice,
-    /// rather than once for each open file description. The next instance takes them out of the
-    /// sockets once it raised its soft limit of open file descriptors to the hard one, as busd does
-    /// as it starts, so they have to fit under `fd_limit`, the soft limit of busd, which it raised
-    /// to the hard one as it started, `None` for no limit, unless the limit of the unit changed
-    /// meanwhile, with the file descriptor of the process of each client, which the next instance
-    /// opens to look the credentials of the client up. The clients that don't fit get disconnected
-    /// as the bus goes, with a warning. It fails if the bus takes longer than 30 s to hand over, or
-    /// if storing fails, which disconnects the clients as the bus goes.
+    /// [`Bus::for_systemd`] to take over from on the restart: the state memfd, with the records of
+    /// the connections of the clients that fit, then its listening socket, if it is its own, and
+    /// then the connection FDs of those clients, in the order of the hand-over, in queue sockets
+    /// ([`FdQueue`]), as many as that takes. So the store takes the connection FDs, however many
+    /// there are, each as it is, as two client-sent FDs of one open file description, which the
+    /// store would keep once. The next instance takes them out of the queue sockets once it raised
+    /// its soft limit of open FDs to the hard one, as busd does as it starts, so they have to fit
+    /// under `fd_limit`, the soft limit that busd raised its own to as it started, `None` for no
+    /// limit, unless the limit of the unit changed meanwhile, with the process FD of each client.
+    /// The clients that don't fit get disconnected as the bus goes, with a warning. It fails if the
+    /// bus takes longer than 30 s to hand over, or if storing fails, which disconnects the clients
+    /// as the bus goes.
     pub async fn hand_over_to_systemd(
         self,
         notifier: &Notifier,
@@ -115,8 +198,8 @@ impl Bus {
         handover.store(notifier, max)
     }
 
-    /// How many file descriptors the file descriptor store of systemd takes, `$FDSTORE`, if that's
-    /// enough to hand over: the state of the bus, and one more. It says why it isn't otherwise.
+    /// How many stored FDs the store of systemd takes, `$FDSTORE`, if that's enough to hand over:
+    /// the state memfd, and one more. It says why it isn't otherwise.
     fn fd_store_max() -> Option<usize> {
         match systemd::fd_store_max() {
             Some(max) if max >= MIN_STORE => Some(max),
@@ -140,10 +223,10 @@ impl Bus {
         }
     }
 
-    /// Take the socket of the socket activation, if systemd passed one, out of the file descriptors
-    /// that systemd passed, `fds`, with their names, which leaves those that busd stored.
+    /// Take the listening socket of the socket activation, if systemd passed one, out of the passed
+    /// FDs, `fds`, with their names, which leaves the stored FDs.
     ///
-    /// Those that busd stored have names of busd's own, as [`is_busds`] tells. The others are the
+    /// The stored FDs have names of busd's own, as [`is_busds`] tells. The others are listening
     /// sockets of socket activation, which have the names of their units by default, such as
     /// `busd.socket`. busd listens on one, so this fails if there is more than one.
     fn take_activation(fds: &mut Vec<(String, OwnedFd)>) -> Result<Option<OwnedFd>> {
@@ -156,13 +239,14 @@ impl Bus {
         Ok(activation)
     }
 
-    /// The next instance of the bus that handed over what busd stored, `stored`, with the names
-    /// that it stored each under, on `activation`, the socket of the socket activation, if any.
+    /// The next instance of the bus that handed over the stored FDs, `stored`, with the names that
+    /// it stored each under, on `activation`, the listening socket of the socket activation, if
+    /// any.
     ///
     /// Without a hand-over to take over, or if taking over fails, it is a bus on `activation`, or
     /// else at `address`, as [`Bus::on_listener_or_at`] creates. Without `activation`, that bus
-    /// binds a socket in place of the one that a previous instance listened on, if it stored one,
-    /// once the service manager that `notifier` reaches let go of it.
+    /// binds a listening socket in place of the one that a previous instance listened on, if it
+    /// stored one, once the service manager that `notifier` reaches let go of it.
     async fn out_of_stored(
         stored: Vec<(String, OwnedFd)>,
         activation: Option<OwnedFd>,
@@ -199,10 +283,10 @@ impl Bus {
 
     /// A bus on `listener`, if given one, as [`Bus::for_listener`] creates, or else at `address`,
     /// as [`Bus::for_address`] does, once the service manager that `replacing` reaches, if any, let
-    /// go of the socket that a previous instance of the bus listened on and stored.
+    /// go of the listening socket that a previous instance of the bus bound and stored.
     ///
-    /// The socket goes once systemd closes its copy too, as it gets to its removal, which the bus
-    /// waits for, so that it finds the socket stale, and binds one in its place.
+    /// That listening socket goes once systemd closes its copy too, as it gets to its removal,
+    /// which the bus waits for, so that it finds the socket stale, and binds one in its place.
     async fn on_listener_or_at(
         listener: Option<OwnedFd>,
         replacing: Option<&Notifier>,
@@ -247,11 +331,11 @@ impl Bus {
         }
     }
 
-    /// Hand the bus over, as [`Bus::hand_over`] does, within [`HAND_OVER_TIMEOUT`], with the file
-    /// descriptors that it reserved given up for those that handing over opens: one for the
-    /// duplicate of the socket that the bus listens on, which the bus makes ahead of those of its
-    /// clients, and the others for the state, the sockets that hold the file descriptors of the
-    /// clients, and the barrier, which storing opens in turn, once the bus is handed over.
+    /// Hand the bus over, as [`Bus::hand_over`] does, within [`HAND_OVER_TIMEOUT`], with the FDs
+    /// that it reserved ([`Reserve`]) given up for those that handing over opens: one for the
+    /// duplicate of its listening socket, which the bus makes ahead of those of the client
+    /// sockets, and the others for the state memfd, the queue sockets and the pipe of the barrier,
+    /// which storing opens in turn, once the bus is handed over.
     async fn hand_over_within_reserve(mut self) -> Result<Handover> {
         // The first is given up right away, and the others as this returns.
         let (_, _storing) = self
@@ -268,16 +352,16 @@ impl Bus {
 }
 
 impl Handover {
-    /// What the previous instance of the bus handed over, out of what it stored, `stored`, with the
-    /// names that it stored each under, if it stored its state, and the state can be decoded.
+    /// What the previous instance of the bus handed over, out of the stored FDs, `stored`, with the
+    /// names that it stored each under, if it stored its state memfd, and the state can be decoded.
     ///
     /// Each client of the state gets its connection back from the record of its connection, where
-    /// the state says it is in the memfd of the state, read in place, and from the file
-    /// descriptors of the connection, where the state says they are among those that the queues of
-    /// the stored sockets hold, as [`take_queued`] takes them out. One whose connection can't be
-    /// restored, as when a file descriptor of it is missing, is gone: the next instance cleans up
-    /// after it as after any client that goes. Without the state, or if it can't be decoded, all of
-    /// the file descriptors close, which disconnects the clients.
+    /// the state says it is in the state memfd, read in place, and from its connection FDs, where
+    /// the state says they are among those that the queue sockets hold, as [`take_queued`] takes
+    /// them out. One whose connection can't be restored, as when one of its connection FDs is
+    /// missing, is gone: the next instance cleans up after it as after any client that goes.
+    /// Without the state memfd, or if its state can't be decoded, all of the stored FDs close, and
+    /// the connection FDs in the queue sockets with them, which disconnects the clients.
     fn from_stored(stored: Vec<(String, OwnedFd)>) -> Option<Self> {
         let StoredFds {
             state,
@@ -309,8 +393,8 @@ impl Handover {
         let mut clients = Vec::new();
         let mut missing = 0;
         for (id, Stored { record, fds }) in state.stored() {
-            // The bus left a client that has no file descriptors out of the hand-over, as each one
-            // that it hands over has a socket.
+            // The bus left a client that has no connection FDs out of the hand-over, as each one
+            // that it hands over has a client socket.
             if fds.1 == 0 {
                 continue;
             }
@@ -363,10 +447,10 @@ impl Handover {
         });
     }
 
-    /// Store the hand-over in the file descriptor store of systemd, which `notifier` reaches, and
-    /// which takes `max` file descriptors: the state, the socket that the bus listened on, if it
-    /// did, and the sockets that hold the file descriptors of the connections of the clients, under
-    /// [`STATE`], [`LISTENER`] and [`CLIENTS`]. Then wait for systemd to have dealt with them.
+    /// Store the hand-over in the store of systemd, which `notifier` reaches, and which takes `max`
+    /// stored FDs: the state memfd, the listening socket of the bus, if it is its own, and the
+    /// queue sockets, which hold the connection FDs, under [`STATE`], [`LISTENER`] and
+    /// [`CLIENTS`]. Then wait for systemd to have dealt with them.
     fn store(mut self, notifier: &Notifier, max: usize) -> Result<()> {
         self.store_state(notifier)?;
         let listener = usize::from(self.listener.is_some());
@@ -383,15 +467,15 @@ impl Handover {
     }
 
     /// Store the state of the bus, with where the record of the connection of each client that it
-    /// hands over is, and where the file descriptors of the connection are, and the records, in
-    /// one memfd that closes as this returns: the sockets that hold the file descriptors of the
-    /// clients take its place among the open file descriptors.
+    /// hands over is, and where its connection FDs are, and the records, in the state memfd, which
+    /// closes as this returns: the queue sockets take its place among the FDs that the bus has
+    /// open.
     ///
-    /// The memfd holds the state, then the records, in the order of the clients in the state, each
-    /// where the state says, at an offset that is a multiple of 8. zbus saves each record in its
-    /// place in the memfd, which is mapped into memory, so that the bytes of the connections are
-    /// copied once, and the next instance restores the connections from there. The file
-    /// descriptors of the connections are queued in the order of the hand-over, as
+    /// The state memfd holds the state, then the records, in the order of the clients in the
+    /// state, each where the state says, at an offset that is a multiple of 8. zbus saves each
+    /// record in its place in the memfd, which is mapped into memory, so that the bytes of the
+    /// connections are copied once, and the next instance restores the connections from there.
+    /// The connection FDs are queued in the order of the hand-over, as
     /// [`Handover::store_clients`] queues them: those of each client after those of the clients
     /// before it.
     fn store_state(&mut self, notifier: &Notifier) -> Result<()> {
@@ -439,12 +523,11 @@ impl Handover {
         Ok(())
     }
 
-    /// Store the file descriptors of the connections of the clients, in the order of the
-    /// hand-over, in the queues of sockets ([`FdQueue`]), under [`CLIENTS`], as many sockets as
-    /// that takes, and as the store has `room` for, and tell how many file descriptors that
-    /// stores. The clients that don't fit whole, as when the store has no room for another socket,
-    /// are left out, with a warning: the next instance cleans up after them, as after clients that
-    /// went.
+    /// Store the connection FDs, in the order of the hand-over, in queue sockets ([`FdQueue`]),
+    /// under [`CLIENTS`], as many queue sockets as that takes, and as the store has `room` for, and
+    /// tell how many connection FDs that stores. The clients whose connection FDs don't fit whole,
+    /// as when the store has no room for another queue socket, are left out, with a warning: the
+    /// next instance cleans up after them, as after clients that went.
     fn store_clients(&self, notifier: &Notifier, room: usize) -> Result<usize> {
         let fds: Vec<_> = self
             .clients
@@ -479,21 +562,19 @@ impl Handover {
     }
 }
 
-/// The file descriptors that busd stored, by what it stored each as, which the name that it stored
-/// each under tells.
+/// The stored FDs, by what each is, which the name that busd stored it under tells.
 #[derive(Debug, Default)]
 struct StoredFds {
-    /// The memfd that holds the state of the bus, under [`STATE`].
+    /// The state memfd, under [`STATE`].
     state: Option<OwnedFd>,
-    /// The socket that the bus listened on, under [`LISTENER`].
+    /// The listening socket that the bus bound itself, under [`LISTENER`].
     listener: Option<OwnedFd>,
-    /// The sockets that hold the file descriptors of the connections of the clients in their
-    /// queues, under [`CLIENTS`].
+    /// The queue sockets, which hold the connection FDs, under [`CLIENTS`].
     queues: Vec<OwnedFd>,
 }
 
 impl StoredFds {
-    /// The file descriptors that busd stored, `stored`, with the names that it stored each under.
+    /// The stored FDs, `stored`, with the names that busd stored each under.
     ///
     /// Those under names that busd doesn't store any under close, as ones that a version of busd
     /// that named them otherwise stored.
@@ -512,11 +593,10 @@ impl StoredFds {
     }
 }
 
-/// Queue the file descriptors of `chunks`, in order, each chunk as one datagram, in the queues of
-/// sockets ([`FdQueue`]), as many as that takes, `room` at most, and hand each one that took any
-/// datagram to `store`, once it took all that it takes. Tell how many file descriptors that queued,
-/// and why not all of them, if not: queueing failed, or else, the queues of `room` sockets took no
-/// more.
+/// Queue the connection FDs of `chunks`, in order, each chunk as one datagram, in queue sockets
+/// ([`FdQueue`]), as many as that takes, `room` at most, and hand each one that took any datagram
+/// to `store`, once it took all that it takes. Tell how many connection FDs that queued, and why
+/// not all of them, if not: queueing failed, or else, `room` queue sockets took no more.
 fn queue<'c, 'f, C, S>(chunks: C, room: usize, mut store: S) -> Result<(usize, Option<io::Error>)>
 where
     'f: 'c,
@@ -560,9 +640,9 @@ where
     Ok((queued, None))
 }
 
-/// The file descriptors of the connections of the clients, out of the queues of the sockets that
-/// hold them, `queues`, as [`systemd::take_queued`] takes them, by the index that each was queued
-/// as, whatever the order of the sockets. Those that the process can't have close, as do those of a
+/// The connection FDs, out of the queue sockets that hold them, `queues`, as
+/// [`systemd::take_queued`] takes them, by the index that each was queued as, whatever the order
+/// of the queue sockets. Those that the process can't have open close, as do those of a queue
 /// socket that fails to give them, with a warning: the clients that they are of go without them.
 fn take_queued(queues: Vec<OwnedFd>) -> HashMap<u64, OwnedFd> {
     let mut fds = HashMap::new();
@@ -588,7 +668,7 @@ fn take_queued(queues: Vec<OwnedFd>) -> HashMap<u64, OwnedFd> {
     fds
 }
 
-/// Take `count` file descriptors out of `fds`, from the index `first` on, if they are all there.
+/// Take `count` connection FDs out of `fds`, from the index `first` on, if they are all there.
 ///
 /// Those that are there go either way, so that those of a client that lacks one close with it.
 fn take_fds(fds: &mut HashMap<u64, OwnedFd>, (first, count): (u64, u64)) -> Option<Vec<OwnedFd>> {
@@ -611,19 +691,17 @@ fn bytes_at(bytes: &[u8], (offset, len): (u64, u64)) -> Option<&[u8]> {
     bytes.get(offset..end)
 }
 
-/// Keep the `clients` that fit, in order: in the file descriptor store, which takes `max` file
-/// descriptors, if it has room for a socket that holds those of the clients, after the state and
-/// the socket that the bus listens on, if it stores one, as `listener` tells, and among the file
-/// descriptors that the next instance can have open, as many as `fd_limit` takes, if anything
-/// limits them, with room to spare. busd warns if any don't.
+/// Keep the `clients` that fit, in order: in the store, which takes `max` stored FDs, if it has
+/// room for a queue socket after the state memfd and the listening socket of the bus, if it stores
+/// that, as `listener` tells, and among the FDs that the next instance can have open, as many as
+/// `fd_limit` takes, if anything limits them, with room to spare. busd warns if any don't.
 ///
-/// Each client takes the file descriptors of its connection, as many as `fds` tells: its socket and
-/// those that came with the messages that the bus didn't take, and in the next instance the file
-/// descriptor of its process too, which the next instance opens to look the credentials of the
-/// client up. A socket of the store holds tens of thousands of file descriptors, and the store
-/// takes them in as many sockets as it has room for, which storing sees to. One client that
-/// doesn't fit is left out whole, as the next instance couldn't serve it without all of them, while
-/// those after it, of fewer file descriptors, may still fit.
+/// Each client takes its connection FDs, as many as `fds` tells: its client socket, its client-sent
+/// FDs and its outgoing FDs, and in the next instance its process FD too. A queue socket holds
+/// tens of thousands of connection FDs, and the store takes them in as many queue sockets as it
+/// has room for, which storing sees to. One client that doesn't fit is left out whole, as the next
+/// instance couldn't serve it without all of its connection FDs, while those after it, of fewer,
+/// may still fit.
 fn fit<C, F>(clients: &mut Vec<C>, listener: bool, max: usize, fd_limit: Option<u64>, fds: F)
 where
     F: Fn(&C) -> usize,
@@ -634,9 +712,8 @@ where
     match (in_store, limit) {
         (false, _) => clients.clear(),
         (true, Some(limit)) => {
-            // The next instance has the state, the socket to listen on, from the store or from the
-            // socket activation, and the sockets of the file descriptors of the clients open as it
-            // takes those out.
+            // The next instance has the state memfd, the listening socket, from the store or from
+            // the socket activation, and a queue socket open as it takes the connection FDs out.
             let mut room = limit.saturating_sub(FIRST_PASSED_FD + 3 + SPARE_FDS);
             clients.retain(|client| {
                 let Some(left) = room.checked_sub(fds(client) + 1) else {
@@ -662,22 +739,22 @@ where
     }
 }
 
-/// File descriptors that a bus that systemd runs keeps open from when it starts, to give up for
-/// those that handing over opens, as [`Bus::hand_over_within_reserve`] does: however many clients
-/// the bus serves by then, and however many file descriptors that takes, it has those to spare.
+/// FDs that a bus that systemd runs keeps open from when it starts, to give up for those that
+/// handing over opens, as [`Bus::hand_over_within_reserve`] does: however many clients the bus
+/// serves by then, and however many client sockets and client-sent FDs that takes, it has those
+/// to spare.
 #[derive(Debug)]
 pub(super) struct Reserve {
-    /// For the duplicate of the socket that the bus listens on, before it duplicates those of its
-    /// clients.
+    /// For the duplicate of the listening socket, before the bus duplicates the client sockets.
     listener: OwnedFd,
     /// For what storing opens once the bus is handed over, in turn, each closed before the next
-    /// opens: the state, the two ends of each socket that holds file descriptors of the clients,
-    /// and the two ends of the pipe of the barrier.
+    /// opens: the state memfd, the two ends of each pair whose one end is a queue socket, and the
+    /// two ends of the pipe of the barrier.
     storing: [OwnedFd; 3],
 }
 
 impl Reserve {
-    /// Four file descriptors to spare: the ends of two pipes.
+    /// Four FDs to spare: the ends of two pipes.
     fn new() -> Result<Self> {
         let (listener, storing) = pipe_with(PipeFlags::CLOEXEC)?;
         let (more, still_more) = pipe_with(PipeFlags::CLOEXEC)?;
@@ -689,18 +766,17 @@ impl Reserve {
     }
 }
 
-/// Whether `name` is one that busd stores file descriptors under, though maybe not as this version
-/// of busd does, as for one that a version of busd that named them otherwise stored.
+/// Whether `name` is one that busd stores FDs under, though maybe not as this version of busd does,
+/// as for one that a version of busd that named them otherwise stored.
 fn is_busds(name: &str) -> bool {
     name == STATE || name == LISTENER || name.starts_with(CLIENT_PREFIX)
 }
 
-/// The name that the state of the bus is stored under.
+/// The name that the state memfd is stored under.
 const STATE: &str = "busd-state";
-/// The name that the socket that the bus listens on is stored under.
+/// The name that the listening socket of the bus is stored under, if it is its own.
 const LISTENER: &str = "busd-listener";
-/// The name that the sockets that hold the file descriptors of the connections of the clients are
-/// stored under, however many of them there are.
+/// The name that the queue sockets are stored under, however many of them there are.
 const CLIENTS: &str = "busd-clients";
 /// What the names that busd stores what it hands over of its clients under start with: [`CLIENTS`]
 /// does, as do those that other versions of busd may store it under.
@@ -717,15 +793,15 @@ const HAND_OVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long busd waits for the service manager to deal with what busd sent it, before it goes on
 /// anyway.
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
-/// The fewest file descriptors that a store has to take for busd to hand over: the state of the bus
-/// and one more.
+/// The fewest stored FDs that the store has to take for busd to hand over: the state memfd, and its
+/// own listening socket or a queue socket.
 const MIN_STORE: usize = 2;
-/// The first file descriptor that systemd passes, `SD_LISTEN_FDS_START`.
+/// The first of the passed FDs, `SD_LISTEN_FDS_START`, after the standard input, output and error.
 const FIRST_PASSED_FD: usize = 3;
-/// How many file descriptors the next instance has to spare, under its limit of open file
-/// descriptors, besides those of its clients and those that systemd passes it: for those that it
-/// opens of its own as it starts and takes over, and for more sockets of the file descriptors of
-/// the clients than one, if it takes them in more.
+/// How many FDs the next instance has to spare, under its limit of open FDs, besides the connection
+/// FDs and the process FDs of its clients, the state memfd, its listening socket and a queue
+/// socket: for the FDs that it opens of its own as it starts and takes over, and for the queue
+/// sockets after the first, if the connection FDs come in more than one.
 const SPARE_FDS: usize = 32;
 
 #[cfg(test)]
@@ -736,9 +812,9 @@ mod tests {
 
     use super::*;
 
-    /// busd tells the names that it stores file descriptors under from those of the sockets of
-    /// socket activation, which have the names of their units, even those of the names that
-    /// another version of busd may store them under.
+    /// busd tells the names of the stored FDs from those of the listening sockets of socket
+    /// activation, which have the names of their units, even the names that another version of
+    /// busd may store them under.
     #[test]
     fn busds_names() {
         for name in [
@@ -755,9 +831,10 @@ mod tests {
         }
     }
 
-    /// A name of a client that busd doesn't know, as one that a version of busd that named them
-    /// otherwise stored, is among those that busd stored, to be removed from the store, rather
-    /// than taken for the socket of socket activation, and what was stored under it closes.
+    /// A name of busd's that this version stores nothing under, as one that another version of
+    /// busd stored connection FDs under, stays among the stored FDs, to be removed from the store,
+    /// rather than taken for the listening socket of socket activation, and the stored FDs under it
+    /// close.
     #[test]
     fn unknown_client_names_are_removed() {
         let names = [STATE, LISTENER, CLIENTS, "busd-client-3", "busd-client-4-0"];
@@ -774,20 +851,22 @@ mod tests {
         assert_eq!(fds.queues.len(), 1);
     }
 
-    /// The file descriptors of the clients go on in the next queue once one is full, and come back
-    /// by the index that each was queued as, whatever the order of the queues, each as it went, a
-    /// duplicate of another one included.
+    /// The connection FDs go on in the next queue socket once one is full, and come back by the
+    /// index that each was queued as, whatever the order of the queue sockets, each as it went, one
+    /// of the same open file description as another one included.
     #[test]
     fn queued_fds_come_back_by_their_index() {
         let pipes: Vec<_> = (0..3)
             .map(|_| pipe_with(PipeFlags::CLOEXEC).unwrap())
             .collect();
-        // The last is a duplicate of the first, which the store would keep once.
+        // The last is of the same open file description as the first, which the store would keep
+        // once.
         let mut fds: Vec<_> = pipes.iter().map(|(_, write)| write.as_fd()).collect();
         fds.push(fds[0]);
         let stored = RefCell::new(Vec::new());
 
-        // Datagrams without file descriptors fill the first queue, between two that have some.
+        // Datagrams without connection FDs fill the first queue socket, between two that have
+        // some.
         let (first, last) = fds.split_at(2);
         let (mut first, mut last) = (Some(first), Some(last));
         let chunks = iter::from_fn(|| match stored.borrow().is_empty() {
@@ -806,12 +885,12 @@ mod tests {
         assert_eq!(
             stored.len(),
             2,
-            "the file descriptors went in other than two queues"
+            "the connection FDs went in other than two queue sockets"
         );
 
         stored.reverse();
         let mut taken = take_queued(stored);
-        // What goes into each comes out of the pipe that it was queued of.
+        // What goes into each connection FD comes out of the pipe that it was queued of.
         for (index, pipe) in [(0, 0), (1, 1), (2, 2), (3, 0)] {
             let fd = taken.remove(&index).unwrap();
             let byte = [index as u8];
@@ -823,7 +902,7 @@ mod tests {
         assert!(taken.is_empty(), "{taken:?}");
     }
 
-    /// The file descriptors go in no more queues than the store has room for: those of the
+    /// The connection FDs go in no more queue sockets than the store has room for: those of the
     /// datagrams that fit in them are queued, and the others aren't.
     #[test]
     fn queued_fds_fill_the_room_of_the_store() {
@@ -831,7 +910,7 @@ mod tests {
         let fds = [fd.as_fd()];
         let mut stored = Vec::new();
 
-        // One datagram with a file descriptor, then ones without, more than any queue takes.
+        // One datagram with a connection FD, then ones without, more than any queue socket takes.
         let chunks = iter::once(&fds[..]).chain(iter::repeat(&fds[..0]));
         let (queued, failure) = queue(chunks, 1, |socket| {
             stored.push(socket);
@@ -851,7 +930,7 @@ mod tests {
         assert!(failure.is_none());
     }
 
-    /// A client gets the file descriptors at its place, if they are all there, and none otherwise,
+    /// A client gets the connection FDs at its place, if they are all there, and none otherwise,
     /// while those that are there go all the same.
     #[test]
     fn clients_take_their_fds() {
@@ -866,18 +945,18 @@ mod tests {
         assert!(fds.is_empty(), "{fds:?}");
     }
 
-    /// A client takes the file descriptors of its connection, its socket and those that came with
-    /// the messages that the bus didn't take, and that of its process in the next instance, and one
-    /// that doesn't fit is left out whole, while those after it may still fit.
+    /// A client takes its connection FDs, which are its client socket and its client-sent FDs here,
+    /// and its process FD in the next instance, and one that doesn't fit is left out whole, while
+    /// those after it may still fit.
     #[test]
     fn clients_fit_whole() {
-        // The numbers of the clients, and how many file descriptors each takes.
+        // The numbers of the clients, and how many connection FDs each has.
         let clients: Vec<_> = [1, 3, 1, 2].into_iter().enumerate().collect();
         let ids =
             |clients: &[(usize, usize)]| -> Vec<_> { clients.iter().map(|&(id, _)| id).collect() };
 
-        // The next instance has room for 5 file descriptors of clients: those of the first and the
-        // third, with those of their processes.
+        // The next instance has room for 5 FDs of clients: the connection FDs of the first and the
+        // third, with their process FDs.
         let limit = (FIRST_PASSED_FD + 3 + SPARE_FDS + 5) as u64;
         let mut fitting = clients.clone();
         fit(&mut fitting, false, MIN_STORE, Some(limit), |&(_, fds)| fds);
@@ -888,13 +967,13 @@ mod tests {
         fit(&mut fitting, false, MIN_STORE, None, |&(_, fds)| fds);
         assert_eq!(ids(&fitting), [0, 1, 2, 3]);
 
-        // A store that takes the state and the socket that the bus listens on alone takes none.
+        // A store that takes the state memfd and the listening socket alone takes none.
         let mut fitting = clients;
         fit(&mut fitting, true, MIN_STORE, None, |&(_, fds)| fds);
         assert!(fitting.is_empty());
     }
 
-    /// A file descriptor of no consequence.
+    /// An FD of no consequence.
     fn null() -> OwnedFd {
         File::open("/dev/null").unwrap().into()
     }
