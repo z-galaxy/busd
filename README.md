@@ -141,10 +141,11 @@ WantedBy=sockets.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/busd --session
-# One for each client, and for each file descriptor of the messages that busd didn't take of a
-# client as it stops, or that the client didn't take of busd, and two more. Those that don't fit get
-# disconnected on a restart.
-FileDescriptorStoreMax=4096
+# One for each client, as many as the names of what systemd passes the next instance fit in the
+# 128 KiB of `$LISTEN_FDNAMES`, some 7700, and three more: the state, the socket that busd listens
+# on, and a socket that holds the rest, such as the file descriptors of the messages that busd
+# didn't take of a client as it stops, or that the client didn't take of busd.
+FileDescriptorStoreMax=8192
 # systemd passes the next instance what was stored under its soft limit of open files, which has to
 # take that and a few more.
 LimitNOFILE=8192:524288
@@ -160,8 +161,9 @@ a directory for busd to make one in (`unix:dir=`, `unix:tmpdir=`), where it make
 name each time that it starts afresh, and the files that it left behind stay. A new address only
 applies once busd starts afresh, too, after a stop, as a restart keeps the socket that busd listens
 on. Lower `LimitNOFILE=` with a stop and a start as well, rather than a restart: busd fits what it
-hands over under the limit that it started with, and systemd fails to start the next instance if
-that doesn't fit under the lower one.
+hands over under the limits that it started with, and systemd fails to start the next instance if
+what was stored doesn't fit under a lower soft limit, while the clients that don't fit under a lower
+hard limit get disconnected.
 
 ### Profile-guided optimization
 

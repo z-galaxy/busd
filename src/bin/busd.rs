@@ -63,11 +63,14 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    // The next instance of busd, which it hands over to, starts with the same limit.
+    // The next instance of busd, which it hands over to, starts with the same limit, and raises it
+    // as this one does.
     #[cfg(target_os = "linux")]
-    let fd_limit = getrlimit(Resource::Nofile).current;
+    let start_fd_limit = getrlimit(Resource::Nofile).current;
     // Before the runtime, or anything else, opens file descriptors of its own.
     let raised = raise_fd_limit();
+    #[cfg(target_os = "linux")]
+    let fd_limit = getrlimit(Resource::Nofile).current;
     // systemd passes file descriptors through environment variables, which busd removes as it
     // takes them: that may only happen before any other thread starts.
     #[cfg(target_os = "linux")]
@@ -76,7 +79,7 @@ fn main() -> Result<()> {
     zruntime::block_on(run(
         raised,
         #[cfg(target_os = "linux")]
-        fd_limit,
+        (start_fd_limit, fd_limit),
         #[cfg(target_os = "linux")]
         passed,
     ))
@@ -84,7 +87,7 @@ fn main() -> Result<()> {
 
 async fn run(
     raised: rustix::io::Result<()>,
-    #[cfg(target_os = "linux")] fd_limit: Option<u64>,
+    #[cfg(target_os = "linux")] (start_fd_limit, fd_limit): (Option<u64>, Option<u64>),
     #[cfg(target_os = "linux")] passed: Vec<(String, OwnedFd)>,
 ) -> Result<()> {
     busd::tracing_subscriber::init();
@@ -163,7 +166,9 @@ async fn run(
     // with them, and on a stop, it closes them.
     #[cfg(target_os = "linux")]
     if let Some(notifier) = &notifier {
-        return bus.hand_over_to_systemd(notifier, fd_limit).await;
+        return bus
+            .hand_over_to_systemd(notifier, start_fd_limit, fd_limit)
+            .await;
     }
 
     if let Err(e) = bus.cleanup().await {

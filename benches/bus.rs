@@ -204,7 +204,7 @@ fn handovers(c: &mut Criterion) {
 /// How many file descriptors the store of the fake systemd takes, as `FileDescriptorStoreMax=`
 /// does for busd's service in the README.
 #[cfg(target_os = "linux")]
-const FD_STORE_MAX: usize = 4096;
+const FD_STORE_MAX: usize = 8192;
 
 /// Benchmarks the bus restarting, as `how` says, with `clients` clients that keep their
 /// connections throughout, idle: one restart a round.
@@ -838,7 +838,7 @@ async fn restart_in_process(bus: Bus) -> Bus {
 /// `address`, as busd does at the address that it is told.
 #[cfg(target_os = "linux")]
 async fn restart_through(systemd: &FakeSystemd, bus: Bus, address: &str) -> Bus {
-    bus.hand_over_to_systemd(&systemd.notifier, None)
+    bus.hand_over_to_systemd(&systemd.notifier, None, None)
         .await
         .expect("the bus hands over");
     let stored = systemd.stored();
