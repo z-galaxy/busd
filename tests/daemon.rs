@@ -56,6 +56,27 @@ fn print_address() {
     assert_eq!(rest, "", "busd printed more than its address");
 }
 
+/// busd logs where it listens without being asked to, and without the escape codes of colors, as
+/// what it logs to is a pipe rather than a terminal, as a journal or a file would be.
+#[cfg(feature = "tracing-subscriber")]
+#[test]
+#[timeout(30000)]
+fn logs_plainly_by_default() {
+    let path = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+    let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
+    command.stderr(Stdio::piped());
+    let mut busd = Busd::start(command);
+    busd.address();
+
+    let status = busd.stop(Signal::TERM);
+    assert!(status.success(), "busd exited with {status}");
+    let mut logs = String::new();
+    let mut stderr = busd.child.stderr.take().unwrap();
+    stderr.read_to_string(&mut logs).unwrap();
+    assert!(logs.contains("Listening on UNIX socket file"), "{logs}");
+    assert!(!logs.contains('\x1b'), "{logs:?}");
+}
+
 /// Under systemd, busd tells the service manager once it listens, for a service of `Type=notify` to
 /// be ready then.
 #[cfg(target_os = "linux")]
@@ -120,8 +141,7 @@ impl Busd {
     /// Starts busd, listening on `address`, and logging what `log` says, as `RUST_LOG` would.
     ///
     /// It reads the session configuration of the tests, rather than the one of the system. Without
-    /// `log`, it logs its errors alone, as it does without `RUST_LOG`, whatever the `RUST_LOG` of
-    /// the tests.
+    /// `log`, it logs as it does without `RUST_LOG`, whatever the `RUST_LOG` of the tests.
     fn spawn(address: &str, log: Option<&str>) -> Self {
         Self::start(Self::command(address, log))
     }

@@ -2,11 +2,12 @@ use std::{
     env::current_dir,
     ffi::OsString,
     fs::{read_dir, read_to_string},
+    io,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
-use crate::{error, warn};
+use crate::{debug, error, warn};
 use anyhow::{Error, Result};
 use serde::Deserialize;
 
@@ -62,11 +63,18 @@ impl Document {
                         Ok(ok) => ok,
                         // we treat `<includedir>` as though it has `ignore_missing="yes"`
                         Err(err) => {
-                            warn!(
+                            let message = format!(
                                 "cannot resolve '<includedir>{}</includedir>' to an absolute path: {}",
-                                &dir_path.display(),
+                                dir_path.display(),
                                 err
                             );
+                            // The configuration of the reference implementation names
+                            // directories that many systems lack.
+                            if err.kind() == io::ErrorKind::NotFound {
+                                debug!("{message}");
+                            } else {
+                                warn!("{message}");
+                            }
                             continue;
                         }
                     };
@@ -128,23 +136,26 @@ impl Document {
 
                     let ignore_missing = include.ignore_missing == IncludeOption::Yes;
                     let file_path = resolve_include_path(&base_path, &include.file_path);
-                    let file_path = match file_path.canonicalize().map_err(Error::msg) {
+                    let file_path = match file_path.canonicalize() {
                         Ok(ok) => ok,
                         Err(err) => {
-                            if ignore_missing {
-                                warn!(
-                                    "cannot resolve '<include>{}</include>' to an absolute path: {}",
-                                    file_path.display(),
-                                    err
-                                );
-                                continue;
-                            }
-                            error!(
+                            let message = format!(
                                 "cannot resolve '<include>{}</include>' to an absolute path: {}",
                                 file_path.display(),
                                 err
                             );
-                            return Err(err);
+                            // The configuration of the reference implementation names files
+                            // that it does without, and that many systems lack.
+                            if ignore_missing && err.kind() == io::ErrorKind::NotFound {
+                                debug!("{message}");
+                                continue;
+                            }
+                            if ignore_missing {
+                                warn!("{message}");
+                                continue;
+                            }
+                            error!("{message}");
+                            return Err(Error::msg(err));
                         }
                     };
                     let mut included = match Document::read_file(&file_path) {

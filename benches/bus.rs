@@ -34,7 +34,8 @@
 //! - `handover/fdstore/100-clients`: the same through the file descriptor store of systemd, as busd
 //!   restarts under systemd: the bus stores its state and the connections of its clients there
 //!   (`Bus::hand_over_to_systemd`), and the next instance takes them out (`Bus::for_systemd`). A
-//!   fake systemd, on a thread of its own, keeps what is stored, as systemd does.
+//!   fake systemd, on a thread of its own, keeps what is stored, as systemd does, and the listening
+//!   socket of the socket activation, which the bus hands over under alone.
 //!
 //! The ids of `handover/` time restarts of the bus, each from the bus being stopped until the next
 //! instance is ready to serve, on Linux, the one system that the bus hands over on. They check,
@@ -62,7 +63,11 @@ use std::{
 use std::{
     io::IoSliceMut,
     mem::{self, MaybeUninit},
-    os::{fd::OwnedFd, unix::net::UnixDatagram},
+    os::{
+        fd::OwnedFd,
+        unix::net::{UnixDatagram, UnixListener},
+    },
+    path::Path,
 };
 
 use busd::bus::Bus;
@@ -742,7 +747,8 @@ impl RestartingBus {
     /// systemd on a thread pinned to `systemd_cpu` for [`Restart::FdStore`], and waits until it
     /// listens.
     fn start(how: Restart, cpu: Option<Cpu>, systemd_cpu: Option<Cpu>) -> Self {
-        let address = bus_address();
+        let path = socket_path("bus");
+        let address = format!("unix:path={}", path.display());
         let (requests, requested) = mpmc::unbounded::<(u64, mpsc::Sender<Duration>)>();
         let (listening, listens) = mpsc::channel();
         let bus_address = address.clone();
@@ -751,10 +757,18 @@ impl RestartingBus {
             let _pinned = cpu.map(Cpu::pin);
             let systemd = match how {
                 Restart::InProcess => None,
-                Restart::FdStore => Some(FakeSystemd::start(systemd_cpu)),
+                Restart::FdStore => Some(FakeSystemd::start(systemd_cpu, &path)),
             };
             zruntime::block_on(async move {
-                let mut bus = Bus::for_address(Some(&bus_address)).await.expect("a bus");
+                let bus = match &systemd {
+                    None => Bus::for_address(Some(&bus_address)).await,
+                    // As busd starts under systemd: on the listening socket of the socket
+                    // activation.
+                    Some(systemd) => {
+                        Bus::for_systemd(systemd.passed(Vec::new()), None, Some(&bus_address)).await
+                    }
+                };
+                let mut bus = bus.expect("a bus");
                 listening
                     .send(())
                     .expect("the thread that started the bus waits for it");
@@ -783,6 +797,8 @@ impl RestartingBus {
                     took.send(started.elapsed())
                         .expect("the thread that asked for the restarts waits for them");
                 }
+                // A bus on the listening socket of the fake systemd leaves its file be, for the
+                // fake to remove.
                 bus.cleanup()
                     .await
                     .expect("the socket of the bus is removed");
@@ -841,16 +857,17 @@ async fn restart_through(systemd: &FakeSystemd, bus: Bus, address: &str) -> Bus 
     bus.hand_over_to_systemd(&systemd.notifier, None)
         .await
         .expect("the bus hands over");
-    let stored = systemd.stored();
+    let passed = systemd.passed(systemd.stored());
 
-    Bus::for_systemd(stored, None, Some(address))
+    Bus::for_systemd(passed, None, Some(address))
         .await
         .expect("the next instance starts")
 }
 
 /// A fake systemd, on a thread of its own, that keeps what a bus stores in the file descriptor
-/// store, as systemd does, and passes it to the next instance of the bus: what the bus stored up to
-/// the barrier that it sends once it stored all.
+/// store, as systemd does, and passes it to the next instance of the bus, with the listening socket
+/// of the socket activation, which it keeps too: what the bus stored up to the barrier that it
+/// sends once it stored all.
 #[cfg(target_os = "linux")]
 struct FakeSystemd {
     /// What the bus sends its notifications to the fake with.
@@ -859,14 +876,20 @@ struct FakeSystemd {
     stored: mpsc::Receiver<Vec<(String, OwnedFd)>>,
     /// The path of the notification socket, removed once this is dropped.
     path: PathBuf,
+    /// The listening socket of the socket activation, which the bus listens on.
+    activation: UnixListener,
+    /// Its path, removed once this is dropped.
+    activation_path: PathBuf,
     /// The thread of the fake, joined once this is dropped.
     thread: Option<JoinHandle<()>>,
 }
 
 #[cfg(target_os = "linux")]
 impl FakeSystemd {
-    /// Starts a fake systemd on a thread pinned to `cpu`, with a notification socket of its own.
-    fn start(cpu: Option<Cpu>) -> Self {
+    /// Starts a fake systemd on a thread pinned to `cpu`, with a notification socket of its own,
+    /// and a listening socket of socket activation, bound at `activation_path`.
+    fn start(cpu: Option<Cpu>, activation_path: &Path) -> Self {
+        let activation = UnixListener::bind(activation_path).expect("the listening socket");
         let path = socket_path("systemd");
         let socket = UnixDatagram::bind(&path).expect("the notification socket");
         let notifier = Notifier::new(&path).expect("a notifier of the fake systemd");
@@ -898,6 +921,8 @@ impl FakeSystemd {
             notifier,
             stored,
             path,
+            activation,
+            activation_path: activation_path.to_owned(),
             thread: Some(thread),
         }
     }
@@ -907,6 +932,19 @@ impl FakeSystemd {
         self.stored
             .recv()
             .expect("the fake systemd passes on what the bus stored")
+    }
+
+    /// The passed FDs that the fake starts an instance of the bus with: the listening socket of the
+    /// socket activation, and `stored`, what the previous instance stored, if any.
+    fn passed(&self, stored: Vec<(String, OwnedFd)>) -> Vec<(String, OwnedFd)> {
+        let activation = self
+            .activation
+            .try_clone()
+            .expect("a duplicate of the listening socket");
+
+        std::iter::once((ACTIVATION.to_owned(), activation.into()))
+            .chain(stored)
+            .collect()
     }
 }
 
@@ -923,9 +961,13 @@ impl Drop for FakeSystemd {
                 .expect("the thread of the fake systemd aborts the process on a panic");
         }
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.activation_path);
     }
 }
 
+/// The name of the socket unit that the fake systemd passes the listening socket under.
+#[cfg(target_os = "linux")]
+const ACTIVATION: &str = "busd.socket";
 /// What ends the fake systemd, which systemd knows nothing of.
 #[cfg(target_os = "linux")]
 const STOP_FAKE_SYSTEMD: &str = "X_BENCH_STOP=1";

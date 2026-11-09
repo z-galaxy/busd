@@ -1,9 +1,10 @@
 //! The busd binary, restarted the way that systemd restarts a service with a file descriptor store.
 //!
 //! The test is the service manager: it owns the notification socket that `$NOTIFY_SOCKET` names,
-//! keeps the stored FDs, those that busd stores in the manager, and passes them to the next
-//! instance of busd, among the passed FDs, as `$LISTEN_FDS` does. The FDs of a hand-over go by the
-//! names that the docs of `src/bus/systemd.rs` give them.
+//! and the listening socket of the socket activation, which busd only hands over under. It keeps
+//! the stored FDs, those that busd stores in the manager, and passes them to the next instance of
+//! busd, with the listening socket, among the passed FDs, as `$LISTEN_FDS` does. The FDs of a
+//! hand-over go by the names that the docs of `src/bus/systemd.rs` give them.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -50,40 +51,48 @@ use zruntime::SharedRuntime;
 /// A bus that systemd stops hands over to its next instance, which serves its clients on as if
 /// nothing happened.
 ///
-/// The first instance stores the state memfd, its listening socket and a queue socket, which holds
-/// the connection FDs of its clients, in the store, and exits without removing the file of its
-/// listening socket. The second one, which is passed them, removes them from the store and tells
-/// that it's ready. A client that never reconnected still owns its name, and a client that connects
-/// now gets a number after those of the others, and sees who owns the name. The second instance
-/// hands over in turn, with both clients, as an instance that took over hands over as well as one
-/// that didn't.
+/// The first instance stores the state memfd and a queue socket, which holds the connection FDs of
+/// its clients, in the store, but not the listening socket, which is systemd's: its socket unit may
+/// have any name, even one that starts like those of the stored FDs. The second instance, which is
+/// passed them and the listening socket, removes them from the store and tells that it's ready. A
+/// client that never reconnected still owns its name, one that connected while no instance ran is
+/// served too, and gets the next number, and a client that connects now gets a number after
+/// those, and sees who owns the name. The second instance hands over in turn, with all of them, as
+/// an instance that took over hands over as well as one that didn't.
 #[test]
 #[timeout(60000)]
 fn restart() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    let mut systemd = Systemd::bind();
+    let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
+    assert!(systemd.take_removed().is_empty());
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(true), 1);
+    assert_eq!(systemd.check_stored(), 1);
+    // The client waits in the backlog of the listening socket, and in its handshake, for the next
+    // instance.
+    let waiting = UnixStream::connect(&socket.0).unwrap();
+    let waiting = thread::spawn(move || Client::over(waiting));
 
     let stored = systemd.names();
-    let mut second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
+    let mut second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
     assert_eq!(owner(&client, NAME), client.unique_name);
-    let late = Client::connect(&address, None);
     // The second instance goes on with the numbers of the first.
-    assert_eq!(late.id, client.id + 1);
+    let waiting = waiting.join().unwrap();
+    assert_eq!(waiting.id, client.id + 1);
+    let late = Client::connect(&address, None);
+    assert_eq!(late.id, waiting.id + 1);
     assert_eq!(owner(&late, NAME), client.unique_name);
 
     // SIGINT would do the same: the bus doesn't tell the two apart.
     hand_over(&mut second, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(true), 2);
+    assert_eq!(systemd.check_stored(), 3);
 }
 
 /// File descriptors that a client sent ahead of the message that they are for, as the specification
@@ -95,9 +104,9 @@ fn restart_with_fds_sent_ahead() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    let mut systemd = Systemd::bind();
+    let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     // What goes into one end of the pair comes out of the other, which tells that the end that the
@@ -110,10 +119,10 @@ fn restart_with_fds_sent_ahead() {
     hand_over(&mut first, &mut systemd, &socket);
     // The connection FDs: the client sockets of the two clients, and the client-sent FD of the
     // sender.
-    assert_eq!(systemd.check_stored(true), 3);
+    assert_eq!(systemd.check_stored(), 3);
 
     let stored = systemd.names();
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
+    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
     // The stream takes what the connection reads from now on: the signal among it.
@@ -131,7 +140,7 @@ fn restart_with_more_fds_sent_ahead_than_a_datagram_takes() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    let mut systemd = Systemd::bind();
+    let mut systemd = Systemd::activating(&socket.0);
     // Pairs go first, last, and right after those of the first datagram, and the others are of no
     // consequence.
     let null = File::open("/dev/null").unwrap();
@@ -145,14 +154,14 @@ fn restart_with_more_fds_sent_ahead_than_a_datagram_takes() {
         })
         .collect();
 
-    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     let mut sender = FdClient::connect(&socket.0, &fds).unwrap();
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(true), 2 + AHEAD);
+    assert_eq!(systemd.check_stored(), 2 + AHEAD);
 
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
+    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let mut messages = MessageStream::from(&receiver.connection);
     for n in 0..AHEAD {
@@ -175,9 +184,9 @@ fn restart_with_the_same_fd_sent_ahead_twice() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    let mut systemd = Systemd::bind();
+    let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     let (mut sender, mut kept) = {
@@ -189,9 +198,9 @@ fn restart_with_the_same_fd_sent_ahead_twice() {
         )
     };
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(true), 4);
+    assert_eq!(systemd.check_stored(), 4);
 
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
+    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let mut messages = MessageStream::from(&receiver.connection);
     for _ in 0..2 {
@@ -211,7 +220,7 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    let mut systemd = Systemd::bind();
+    let mut systemd = Systemd::activating(&socket.0);
     let file = Removed(temp_path());
     fs::write(&file.0, b"offsets").unwrap();
     let open_at = |offset| {
@@ -222,7 +231,7 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     };
     let offsets = [1, 4];
 
-    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let receiver = Client::connect(&address, None);
     let mut sender = {
@@ -231,9 +240,9 @@ fn restart_with_fds_of_one_file_sent_ahead() {
         FdClient::connect(&socket.0, &sent.each_ref().map(AsFd::as_fd)).unwrap()
     };
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(true), 2 + offsets.len());
+    assert_eq!(systemd.check_stored(), 2 + offsets.len());
 
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
+    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let mut messages = MessageStream::from(&receiver.connection);
     for offset in offsets {
@@ -243,57 +252,100 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     }
 }
 
-/// A bus that socket activation started hands over its clients, but not its listening socket,
-/// which the activation owns: the unit may have any name, even one that starts like those of the
-/// stored FDs, and the next instance is passed the listening socket along with the stored FDs.
+/// A bus that hands over as many clients as the next instance can take: the next instance takes
+/// their connection FDs out of the queue sockets, and opens their process FDs, under its hard limit
+/// of open FDs, so a bus with that limit low hands over fewer clients than it has, and the others
+/// get disconnected, losing their names.
 #[test]
 #[timeout(60000)]
-fn restart_under_socket_activation() {
+fn hand_over_fits_the_fd_limit() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    // The socket is systemd's, which keeps it open and its file in place as busd comes and goes.
-    let listener = UnixListener::bind(&socket.0).unwrap();
-    let mut systemd = Systemd::bind();
+    let mut systemd = Systemd::activating(&socket.0);
+    let low = Some(LOW_NOFILE);
 
-    let activation = [(ACTIVATION, listener.as_fd())];
-    let mut first = Busd::spawn(&systemd, &address, &activation, FDSTORE_MAX);
+    let mut first = Busd::spawn_limited(&systemd, &address, &systemd.passed(), FDSTORE_MAX, low);
     systemd.until_ready();
-    assert!(systemd.take_removed().is_empty());
-    let client = Client::connect(&address, Some(NAME));
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|i| {
+            let name = format!("{NAME}{i}");
+
+            (Client::connect(&address, Some(&name)), name)
+        })
+        .collect();
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(false), 1);
+    assert_eq!(systemd.check_stored(), FITTING_CLIENTS);
 
-    let stored = systemd.names();
-    let passed = systemd.passed(Some(&listener));
-    let _second = Busd::spawn(&systemd, &address, &passed, FDSTORE_MAX);
+    let removed = systemd.names();
+    let passed = systemd.passed();
+    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, low);
     systemd.until_ready();
-    assert_eq!(systemd.take_removed(), stored);
-    assert_eq!(owner(&client, NAME), client.unique_name);
+    assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
-    assert_eq!(owner(&late, NAME), client.unique_name);
+    assert_eq!(served(&clients, &late), FITTING_CLIENTS);
 }
 
-/// A next instance that fails to take over, as it can't make sense of the state, starts anyway: it
-/// removes everything from the store, disconnects the clients of the previous instance, and serves
-/// new clients on the same address, on the socket file of the previous instance.
+/// A bus that has no FD to spare, as it has as many open as its hard limit takes, still hands
+/// over: it keeps some free from the start for the state memfd, the queue socket and the pipe of
+/// the barrier, so it stores the state memfd, and the connection FDs of the clients whose client
+/// sockets it could duplicate and that fit under that limit. The next instance, under the same
+/// limit, serves the clients that were stored.
+#[test]
+#[timeout(60000)]
+fn hand_over_at_the_hard_fd_limit() {
+    let _serial = serialize();
+    let socket = Removed(temp_path());
+    let address = socket.address();
+    let mut systemd = Systemd::activating(&socket.0);
+
+    let hard = Some(HARD_NOFILE);
+    let mut first = Busd::spawn_limited(&systemd, &address, &systemd.passed(), FDSTORE_MAX, hard);
+    systemd.until_ready();
+    // Clients connect until busd has hardly a file descriptor left.
+    let mut clients = Vec::new();
+    while HARD_NOFILE - first.open_fds() > FREE_FDS {
+        let name = format!("{NAME}{}", clients.len());
+        clients.push((Client::connect(&address, Some(&name)), name));
+    }
+    hand_over(&mut first, &mut systemd, &socket);
+    let stored = systemd.check_stored();
+    assert!(
+        stored > 0,
+        "busd stored none of its {} clients",
+        clients.len()
+    );
+
+    let removed = systemd.names();
+    let passed = systemd.passed();
+    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, hard);
+    systemd.until_ready();
+    assert_eq!(systemd.take_removed(), removed);
+    let late = Client::connect(&address, None);
+    assert_eq!(served(&clients, &late), stored);
+}
+
+/// A next instance that fails to take over, as it can't make sense of the state, starts anyway on
+/// the listening socket that systemd passed it, which stays in place: it removes everything from
+/// the store, disconnects the clients of the previous instance, and serves new clients at the same
+/// address.
 #[test]
 #[timeout(60000)]
 fn failed_take_over() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    let mut systemd = Systemd::bind();
+    let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(true), 1);
+    assert_eq!(systemd.check_stored(), 1);
     systemd.spoil_state();
 
     let stored = systemd.names();
-    let _second = Busd::spawn(&systemd, &address, &systemd.passed(None), FDSTORE_MAX);
+    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
     assert!(socket.0.exists());
@@ -311,106 +363,29 @@ fn failed_take_over() {
     assert_eq!(owner(&late, "org.freedesktop.DBus"), "org.freedesktop.DBus");
 }
 
-/// A bus that hands over as many clients as the next instance can take: the next instance takes
-/// their connection FDs out of the queue sockets, and opens their process FDs, under its hard limit
-/// of open FDs, so a bus with that limit low hands over fewer clients than it has, and the others
-/// get disconnected, losing their names.
+/// A next instance that systemd starts with the stored FDs but without the listening socket, as
+/// once the socket unit went, doesn't take over: it removes everything from the store, disconnects
+/// the clients of the previous instance, and serves new clients at its address, on a listening
+/// socket of its own, in place of the one that systemd closed.
 #[test]
 #[timeout(60000)]
-fn hand_over_fits_the_fd_limit() {
+fn no_take_over_without_socket_activation() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
-    let mut systemd = Systemd::bind();
-    let low = Some(LOW_NOFILE);
+    let mut systemd = Systemd::activating(&socket.0);
 
-    let mut first = Busd::spawn_limited(&systemd, &address, &[], FDSTORE_MAX, low);
-    systemd.until_ready();
-    let clients: Vec<_> = (0..CLIENTS)
-        .map(|i| {
-            let name = format!("{NAME}{i}");
-
-            (Client::connect(&address, Some(&name)), name)
-        })
-        .collect();
-    hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(true), FITTING_CLIENTS);
-
-    let removed = systemd.names();
-    let passed = systemd.passed(None);
-    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, low);
-    systemd.until_ready();
-    assert_eq!(systemd.take_removed(), removed);
-    let late = Client::connect(&address, None);
-    assert_eq!(served(&clients, &late), FITTING_CLIENTS);
-}
-
-/// A bus that has no FD to spare, as it has as many open as its hard limit takes, still hands
-/// over: it keeps some free from the start for the duplicate of its listening socket, the state
-/// memfd, the queue socket and the pipe of the barrier, so it stores the state memfd and its
-/// listening socket, and the connection FDs of the clients whose client sockets it could duplicate
-/// and that fit under that limit. The next instance, under the same limit, serves the clients that
-/// were stored.
-#[test]
-#[timeout(60000)]
-fn hand_over_at_the_hard_fd_limit() {
-    let _serial = serialize();
-    let socket = Removed(temp_path());
-    let address = socket.address();
-    let mut systemd = Systemd::bind();
-
-    let hard = Some(HARD_NOFILE);
-    let mut first = Busd::spawn_limited(&systemd, &address, &[], FDSTORE_MAX, hard);
-    systemd.until_ready();
-    // Clients connect until busd has hardly a file descriptor left.
-    let mut clients = Vec::new();
-    while HARD_NOFILE - first.open_fds() > FREE_FDS {
-        let name = format!("{NAME}{}", clients.len());
-        clients.push((Client::connect(&address, Some(&name)), name));
-    }
-    hand_over(&mut first, &mut systemd, &socket);
-    let stored = systemd.check_stored(true);
-    assert!(
-        stored > 0,
-        "busd stored none of its {} clients",
-        clients.len()
-    );
-
-    let removed = systemd.names();
-    let passed = systemd.passed(None);
-    let _second = Busd::spawn_limited(&systemd, &address, &passed, FDSTORE_MAX, hard);
-    systemd.until_ready();
-    assert_eq!(systemd.take_removed(), removed);
-    let late = Client::connect(&address, None);
-    assert_eq!(served(&clients, &late), stored);
-}
-
-/// A next instance that fails to take over under socket activation starts on the socket that
-/// systemd passed it, which stays in place: it serves new clients at the same address, and
-/// disconnects the clients of the previous instance.
-#[test]
-#[timeout(60000)]
-fn failed_take_over_under_socket_activation() {
-    let _serial = serialize();
-    let socket = Removed(temp_path());
-    let address = socket.address();
-    let listener = UnixListener::bind(&socket.0).unwrap();
-    let mut systemd = Systemd::bind();
-
-    let activation = [(ACTIVATION, listener.as_fd())];
-    let mut first = Busd::spawn(&systemd, &address, &activation, FDSTORE_MAX);
+    let mut first = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     let client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(false), 1);
-    systemd.spoil_state();
+    assert_eq!(systemd.check_stored(), 1);
+    systemd.deactivate();
 
     let stored = systemd.names();
-    let passed = systemd.passed(Some(&listener));
-    let _second = Busd::spawn(&systemd, &address, &passed, FDSTORE_MAX);
+    let _second = Busd::spawn(&systemd, &address, &systemd.passed(), FDSTORE_MAX);
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), stored);
-    assert!(socket.0.exists());
 
     assert!(
         try_owner(&client, NAME).is_err(),
@@ -425,17 +400,39 @@ fn failed_take_over_under_socket_activation() {
 }
 
 /// A file descriptor store that takes one stored FD is too small to hand over with: the bus stops
-/// as it does without systemd. It stores nothing, exits successfully and removes the file of its
-/// listening socket.
+/// as it does without systemd. It stores nothing, exits successfully and leaves the file of the
+/// listening socket, which is systemd's, where it is.
 #[test]
 #[timeout(60000)]
 fn no_hand_over_with_a_small_store() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
+    let mut systemd = Systemd::activating(&socket.0);
+
+    let mut busd = Busd::spawn(&systemd, &address, &systemd.passed(), 1);
+    systemd.until_ready();
+    let _client = Client::connect(&address, Some(NAME));
+
+    busd.signal(Signal::TERM);
+    let status = busd.wait();
+    assert!(status.success(), "busd exited with {status}");
+    assert!(socket.0.exists(), "busd removed {}", socket.0.display());
+    systemd.assert_silent();
+}
+
+/// A bus that listens on a socket of its own, without socket activation, doesn't hand over, however
+/// many stored FDs the store takes: it stops as it does without systemd. It stores nothing, exits
+/// successfully and removes the file of its listening socket.
+#[test]
+#[timeout(60000)]
+fn no_hand_over_without_socket_activation() {
+    let _serial = serialize();
+    let socket = Removed(temp_path());
+    let address = socket.address();
     let mut systemd = Systemd::bind();
 
-    let mut busd = Busd::spawn(&systemd, &address, &[], 1);
+    let mut busd = Busd::spawn(&systemd, &address, &[], FDSTORE_MAX);
     systemd.until_ready();
     let _client = Client::connect(&address, Some(NAME));
 
@@ -465,7 +462,7 @@ fn serialize() -> MutexGuard<'static, ()> {
 
 /// Stop `busd` with SIGTERM, as systemd does, and take what it stores until it exits.
 ///
-/// It exits successfully, and leaves the file of its socket at `socket` where it is.
+/// It exits successfully, and leaves the file of the listening socket at `socket` where it is.
 fn hand_over(busd: &mut Busd, systemd: &mut Systemd, socket: &Removed) {
     busd.signal(Signal::TERM);
     systemd.until_barrier();
@@ -550,16 +547,23 @@ struct Client {
 impl Client {
     /// Connect to the bus at `address`, and own `name` if given.
     fn connect(address: &str, name: Option<&str>) -> Self {
-        let connection = zruntime::block_on(within(async {
-            let builder = connection::Builder::address(address);
-            let builder = match name {
-                Some(name) => builder.name(name),
-                None => builder,
-            };
+        let builder = connection::Builder::address(address);
+        let builder = match name {
+            Some(name) => builder.name(name),
+            None => builder,
+        };
 
-            builder.build().await
-        }))
-        .unwrap();
+        Self::build(builder)
+    }
+
+    /// Say hello to the bus over `stream`, a socket that is connected to it already.
+    fn over(stream: UnixStream) -> Self {
+        Self::build(connection::Builder::unix_stream(stream))
+    }
+
+    /// The client that `builder` connects, once the bus greeted it.
+    fn build(builder: connection::Builder<'_>) -> Self {
+        let connection = zruntime::block_on(within(builder.build())).unwrap();
         let unique_name = connection.unique_name().unwrap().to_string();
         let id = unique_name
             .strip_prefix(UNIQUE_NAME_PREFIX)
@@ -829,6 +833,9 @@ struct Systemd {
     /// The notification socket, `$NOTIFY_SOCKET`.
     socket: UnixDatagram,
     path: Removed,
+    /// The listening socket of the socket activation, if any, which systemd keeps open while busd
+    /// comes and goes, with its file in place.
+    activation: Option<UnixListener>,
     /// The file descriptor store of the service: the stored FDs that busd didn't remove, with the
     /// names it stored them under.
     store: Vec<(String, OwnedFd)>,
@@ -848,9 +855,27 @@ impl Systemd {
         Self {
             socket,
             path,
+            activation: None,
             store: Vec::new(),
             removed: Vec::new(),
         }
+    }
+
+    /// A notification socket, as [`Systemd::bind`] binds, and a listening socket of socket
+    /// activation, bound at `path`.
+    fn activating(path: &Path) -> Self {
+        let activation = UnixListener::bind(path).unwrap();
+
+        Self {
+            activation: Some(activation),
+            ..Self::bind()
+        }
+    }
+
+    /// Close the listening socket of the socket activation, as systemd does once its socket unit
+    /// goes, and leave its file behind.
+    fn deactivate(&mut self) {
+        self.activation = None;
     }
 
     /// The path of the notification socket.
@@ -860,11 +885,11 @@ impl Systemd {
 
     /// The passed FDs, to pass to busd as it starts: the listening socket of the socket
     /// activation, if any, and the stored FDs, with their names.
-    fn passed<'a>(
-        &'a self,
-        activation: Option<&'a UnixListener>,
-    ) -> Vec<(&'a str, BorrowedFd<'a>)> {
-        let activation = activation.map(|listener| (ACTIVATION, listener.as_fd()));
+    fn passed(&self) -> Vec<(&str, BorrowedFd<'_>)> {
+        let activation = self
+            .activation
+            .as_ref()
+            .map(|listener| (ACTIVATION, listener.as_fd()));
         let stored = self
             .store
             .iter()
@@ -960,22 +985,16 @@ impl Systemd {
 
     /// Check that the store holds what a bus hands over, and give how many connection FDs that is.
     ///
-    /// That is its state memfd first, then its listening socket if it bound that itself, so that a
-    /// store too small for all of the stored FDs takes those that matter most, and then the queue
-    /// sockets, which hold the connection FDs: the client socket of each client, and its
-    /// client-sent FDs. This takes those out of the queue sockets, and puts them back in queue
-    /// sockets of its own, in place of those of busd, for the next instance to take them out of.
-    fn check_stored(&mut self, listener: bool) -> usize {
+    /// That is its state memfd first, so that a store too small for all of the stored FDs takes the
+    /// one that matters most, and then the queue sockets, which hold the connection FDs: the client
+    /// socket of each client, and its client-sent FDs. This takes those out of the queue sockets,
+    /// and puts them back in queue sockets of its own, in place of those of busd, for the next
+    /// instance to take them out of.
+    fn check_stored(&mut self) -> usize {
         let names: Vec<_> = self.store.iter().map(|(name, _)| name.as_str()).collect();
-        let head: &[&str] = if listener {
-            &["busd-state", "busd-listener"]
-        } else {
-            &["busd-state"]
+        let Some((&"busd-state", queues)) = names.split_first() else {
+            panic!("busd stored {names:?}, which isn't its state and its clients");
         };
-        let Some((stored_head, queues)) = names.split_at_checked(head.len()) else {
-            panic!("busd stored {names:?}, which isn't {head:?} and its clients");
-        };
-        assert_eq!(stored_head, head);
         for name in queues {
             assert_eq!(
                 *name, "busd-clients",
@@ -984,7 +1003,7 @@ impl Systemd {
         }
 
         let mut count = 0;
-        for (_, stored) in self.store.iter_mut().skip(head.len()) {
+        for (_, stored) in self.store.iter_mut().skip(1) {
             let mut queued = Vec::new();
             busd::systemd::take_queued(stored.as_fd(), |index, fds, complete| {
                 assert!(complete, "the test took some of those at {index} only");
