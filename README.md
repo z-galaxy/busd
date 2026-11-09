@@ -115,17 +115,17 @@ busctl call --user com.intel.dleyna-renderer /com/intel/dLeynaRenderer com.intel
 On Linux, busd listens on the socket that systemd's [socket activation] passes, if any, rather than
 on one of its own, and tells systemd once it's ready, for a service of `Type=notify`.
 
-With a [file descriptor store], under systemd 254 or later, busd survives its restarts without its
-clients noticing anything but a pause. On `SIGTERM`, rather than disconnect them, it stops taking
-their messages, finishes what it took, such as forwarding those messages and answering the calls to
-it among them, without waiting for the clients to take what it sends them, and hands their
-connections and its state over to systemd: their unique names, the well-known names that they own or
-queue for, their match rules, the calls that wait for their replies, what zbus read of their
-messages but busd hasn't taken yet, as the start of one that a client is in the middle of sending,
-and what busd sent them that they haven't taken yet, with the file descriptors that came with those.
-On a restart, systemd hands all of that over to the next instance of busd, which serves the clients
-on from there, on the same connections, and writes them what they hadn't taken first. On a stop,
-systemd closes them. A session bus, for example:
+With socket activation and a [file descriptor store], under systemd 254 or later, busd survives its
+restarts without its clients noticing anything but a pause. On `SIGTERM`, rather than disconnect
+them, it stops taking their messages, finishes what it took, such as forwarding those messages and
+answering the calls to it among them, without waiting for the clients to take what it sends them,
+and hands their connections and its state over to systemd: their unique names, the well-known names
+that they own or queue for, their match rules, the calls that wait for their replies, what zbus read
+of their messages but busd hasn't taken yet, as the start of one that a client is in the middle of
+sending, and what busd sent them that they haven't taken yet, with the file descriptors that came
+with those. On a restart, systemd hands all of that over to the next instance of busd, which serves
+the clients on from there, on the same connections, and writes them what they hadn't taken first. On
+a stop, systemd closes them. A session bus, for example:
 
 ```ini
 # ~/.config/systemd/user/busd.socket
@@ -141,24 +141,18 @@ WantedBy=sockets.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/busd --session
-# The state, the socket that busd listens on, and sockets that hold the file descriptors of the
-# clients, tens of thousands in each.
+# The state, and sockets that hold the file descriptors of the clients, tens of thousands in each.
 FileDescriptorStoreMax=16
 ```
 
 `systemctl --user restart busd` then restarts busd, as after an update, with its clients connected
-throughout. The store only keeps what busd hands over until the next instance takes it, which
-`systemctl restart` starts right away, while `systemctl stop` followed by `systemctl start` doesn't
-keep it. Without socket activation, busd keeps the socket that it listens on in the store too, and
-as it can't tell a stop from a restart, it leaves the file of the socket behind on a stop, which it
-replaces as it starts again. That takes the address of a socket file (`unix:path=`), rather than of
-a directory for busd to make one in (`unix:dir=`, `unix:tmpdir=`), where it makes one of another
-name each time that it starts afresh, and the files that it left behind stay. A new address only
-applies once busd starts afresh, too, after a stop, as a restart keeps the socket that busd listens
-on. Lower the hard limit of `LimitNOFILE=` with a stop and a start as well, rather than a restart:
-busd fits what it hands over under its limit of open files, which the next instance raises its own
-to as it takes that out of the store, and the clients that don't fit under a lower one get
-disconnected.
+throughout, while those that connect meanwhile wait in the socket, which systemd keeps open. The
+store only keeps what busd hands over until the next instance takes it, which `systemctl restart`
+starts right away, while `systemctl stop` followed by `systemctl start` doesn't keep it. Without
+socket activation, busd doesn't hand over: it disconnects its clients as it stops. Lower the hard
+limit of `LimitNOFILE=` with a stop and a start, rather than a restart: busd fits what it hands
+over under its limit of open files, which the next instance raises its own to as it takes that out
+of the store, and the clients that don't fit under a lower one get disconnected.
 
 ### Profile-guided optimization
 

@@ -4,11 +4,11 @@ sequenceDiagram
     systemd->>old: SIGTERM
     Note over old: pauses its clients, and<br/>hands their connections over
     old->>systemd: FDSTORE busd-state (the state memfd)
-    old->>systemd: FDSTORE busd-listener (its listening socket, if its own)
     old->>systemd: FDSTORE busd-clients (each queue socket)
     old->>systemd: BARRIER
     destroy old
     old->>systemd: exits
+    Note over systemd: keeps the listening socket open, which<br/>queues the clients that connect
     create participant new as busd that starts
     systemd->>new: starts it with the passed FDs
     Note over new: raises its soft limit of<br/>open FDs to the hard one

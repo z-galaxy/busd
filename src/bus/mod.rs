@@ -365,8 +365,7 @@ fn default_address() -> String {
 }
 
 /// A socket bound to `addr`, in place of a socket file there that no one listens on anymore, as one
-/// that a bus left behind when it was killed, or when it handed its socket over to its next
-/// instance, through systemd's file descriptor store, on a stop rather than a restart.
+/// that a bus left behind when it was killed.
 ///
 /// On Linux, the file goes only if it's a socket that refuses connections. Elsewhere, as on macOS,
 /// a socket also refuses connections while more of them wait for its bus than it takes, so the file
