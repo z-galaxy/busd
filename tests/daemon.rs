@@ -120,8 +120,7 @@ impl Busd {
     /// Starts busd, listening on `address`, and logging what `log` says, as `RUST_LOG` would.
     ///
     /// It reads the session configuration of the tests, rather than the one of the system. Without
-    /// `log`, it logs its errors alone, as it does without `RUST_LOG`, whatever the `RUST_LOG` of
-    /// the tests.
+    /// `log`, it logs as it does without `RUST_LOG`, whatever the `RUST_LOG` of the tests.
     fn spawn(address: &str, log: Option<&str>) -> Self {
         Self::start(Self::command(address, log))
     }

@@ -102,6 +102,11 @@ busctl --user introspect org.freedesktop.DBus /org/freedesktop/DBus
 busctl --user list
 ```
 
+busd logs its errors, warnings and notable events, such as where it listens, to stderr. `RUST_LOG`
+asks for more, or less, with comma-separated `target=level` directives, and a bare level for the
+other targets: `RUST_LOG=busd=debug` adds the debugging logs of busd, and `RUST_LOG=warn` leaves the
+events out.
+
 Since auto-starting of services is not yet implemented, you'll have to start services manually:
 
 ```bash
