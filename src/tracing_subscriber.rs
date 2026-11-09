@@ -1,6 +1,8 @@
 pub fn init() {
     #[cfg(feature = "tracing-subscriber")]
     {
+        use std::io::{self, IsTerminal};
+
         use tracing_subscriber::{
             filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, FmtSubscriber,
         };
@@ -9,12 +11,17 @@ pub fn init() {
         // The formatter's own level filter defaults to INFO, which would cap whatever `targets`
         // lets through, so open it fully and leave the filtering to `targets`. The logs go to
         // stderr, so that stdout carries only what `--print-address` prints.
-        FmtSubscriber::builder()
+        let builder = FmtSubscriber::builder()
             .with_max_level(LevelFilter::TRACE)
-            .with_writer(std::io::stderr)
-            .finish()
-            .with(targets)
-            .init();
+            .with_writer(io::stderr);
+        // Only a terminal turns the escape codes of the colors into colors: in a journal, a file
+        // or a pipe, they would clutter every line. A terminal gets them, unless `NO_COLOR` is set,
+        // as the formatter has it by default.
+        let builder = match io::stderr().is_terminal() {
+            true => builder,
+            false => builder.with_ansi(false),
+        };
+        builder.finish().with(targets).init();
     }
 }
 

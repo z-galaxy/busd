@@ -56,6 +56,27 @@ fn print_address() {
     assert_eq!(rest, "", "busd printed more than its address");
 }
 
+/// busd logs where it listens without being asked to, and without the escape codes of colors, as
+/// what it logs to is a pipe rather than a terminal, as a journal or a file would be.
+#[cfg(feature = "tracing-subscriber")]
+#[test]
+#[timeout(30000)]
+fn logs_plainly_by_default() {
+    let path = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+    let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
+    command.stderr(Stdio::piped());
+    let mut busd = Busd::start(command);
+    busd.address();
+
+    let status = busd.stop(Signal::TERM);
+    assert!(status.success(), "busd exited with {status}");
+    let mut logs = String::new();
+    let mut stderr = busd.child.stderr.take().unwrap();
+    stderr.read_to_string(&mut logs).unwrap();
+    assert!(logs.contains("Listening on UNIX socket file"), "{logs}");
+    assert!(!logs.contains('\x1b'), "{logs:?}");
+}
+
 /// Under systemd, busd tells the service manager once it listens, for a service of `Type=notify` to
 /// be ready then.
 #[cfg(target_os = "linux")]
