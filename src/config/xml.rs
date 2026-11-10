@@ -36,11 +36,26 @@ impl FromStr for Document {
 
 impl Document {
     pub fn read_file(file_path: impl AsRef<Path>) -> Result<Document> {
-        let text = read_to_string(file_path.as_ref())?;
+        Document::read_included(file_path.as_ref(), &mut Vec::new())
+    }
+
+    /// The document of the file at `file_path`, which the files of `ancestors` led to: each of them
+    /// includes the next, and the last one includes this file. They go by their canonical paths.
+    fn read_included(file_path: &Path, ancestors: &mut Vec<PathBuf>) -> Result<Document> {
+        let text = read_to_string(file_path)?;
 
         let mut doc = Document::from_str(&text)?;
-        doc.file_path = Some(file_path.as_ref().to_path_buf());
-        doc.resolve_includedirs()?.resolve_includes()
+        doc.file_path = Some(file_path.to_path_buf());
+        let doc = doc.resolve_includedirs()?;
+        let Ok(canonical) = file_path.canonicalize() else {
+            return doc.resolve_includes(ancestors);
+        };
+        // The file is one of the ancestors of the files that it includes.
+        ancestors.push(canonical);
+        let doc = doc.resolve_includes(ancestors);
+        ancestors.pop();
+
+        doc
     }
 
     fn resolve_includedirs(self) -> Result<Document> {
@@ -111,8 +126,13 @@ impl Document {
         Ok(doc)
     }
 
-    fn resolve_includes(self) -> Result<Document> {
-        // TODO: implement protection against circular `<include>` references
+    /// The document, with the elements of each file that it includes in place of the `<include>`.
+    ///
+    /// `ancestors` are the files that are being read on the way to this document, its own included.
+    /// An `<include>` of one of them is ignored, with a warning, as dbus-broker does, since reading
+    /// the file again would never end. A file that several files include is no such thing, and is
+    /// read each time.
+    fn resolve_includes(self, ancestors: &mut Vec<PathBuf>) -> Result<Document> {
         let base_path = self.base_path()?;
         let Document {
             busconfig,
@@ -158,7 +178,15 @@ impl Document {
                             return Err(Error::msg(err));
                         }
                     };
-                    let mut included = match Document::read_file(&file_path) {
+                    if ancestors.contains(&file_path) {
+                        warn!(
+                            "ignoring '<include>{}</include>': the file is being read already, \
+                             so including it again would never end",
+                            file_path.display()
+                        );
+                        continue;
+                    }
+                    let mut included = match Document::read_included(&file_path, ancestors) {
                         Ok(ok) => ok,
                         Err(err) => {
                             if ignore_missing {
