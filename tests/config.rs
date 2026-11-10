@@ -484,3 +484,95 @@ fn config_read_file_with_transitive_missing_include_err() {
     Config::read_file("./tests/data/transitive_missing_include.conf")
         .expect("should read and parse XML input");
 }
+
+/// A file that includes itself is read once, and the include is ignored.
+#[test]
+fn config_read_file_with_self_include_ok() {
+    let got = Config::read_file("./tests/data/circular_self.conf")
+        .expect("should read and parse XML input");
+
+    assert_eq!(
+        got,
+        Config {
+            listen: Some(Address::from_str("unix:path=/tmp/self").expect("should parse address")),
+            ..Default::default()
+        }
+    );
+}
+
+/// Files that include each other are each read once, in the order of the chain from the first.
+#[test]
+fn config_read_file_with_circular_includes_ok() {
+    let got =
+        Config::read_file("./tests/data/circular_a.conf").expect("should read and parse XML input");
+    assert_eq!(
+        got,
+        Config {
+            policies: vec![allow_own("org.example.A"), allow_own("org.example.B")],
+            ..Default::default()
+        }
+    );
+
+    let got =
+        Config::read_file("./tests/data/circular_b.conf").expect("should read and parse XML input");
+    assert_eq!(
+        got,
+        Config {
+            policies: vec![allow_own("org.example.B"), allow_own("org.example.A")],
+            ..Default::default()
+        }
+    );
+}
+
+/// A file of an `<includedir>` that includes the file with that `<includedir>` is ignored.
+#[test]
+fn config_read_file_with_circular_includedir_ok() {
+    let got = Config::read_file("./tests/data/circular_includedir.conf")
+        .expect("should read and parse XML input");
+    assert_eq!(
+        got,
+        Config {
+            policies: vec![allow_own("org.example.Dir"), allow_own("org.example.Back")],
+            ..Default::default()
+        }
+    );
+}
+
+/// A file that is included from two places is read both times, as it is not circular.
+#[test]
+fn config_read_file_with_file_included_twice_ok() {
+    let got = Config::read_file("./tests/data/included_twice.conf")
+        .expect("should read and parse XML input");
+
+    let mandatory = Policy::MandatoryContext(vec![
+        (
+            Access::Deny,
+            Operation::Own(NameOwnership {
+                own: Some(Name::Any),
+            }),
+        ),
+        (
+            Access::Allow,
+            Operation::Own(NameOwnership {
+                own: Some(Name::Any),
+            }),
+        ),
+    ]);
+    assert_eq!(
+        got,
+        Config {
+            policies: vec![mandatory.clone(), mandatory],
+            ..Default::default()
+        }
+    );
+}
+
+/// A default-context policy that allows owning `name`.
+fn allow_own(name: &str) -> Policy {
+    Policy::DefaultContext(vec![(
+        Access::Allow,
+        Operation::Own(NameOwnership {
+            own: Some(Name::Exact(String::from(name))),
+        }),
+    )])
+}
