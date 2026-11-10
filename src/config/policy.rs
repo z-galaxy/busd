@@ -1,3 +1,4 @@
+use crate::warn;
 use anyhow::Error;
 use serde::Deserialize;
 
@@ -12,9 +13,6 @@ use super::{
 /// as the rank of a rule goes by its place in the file as well as by its context.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum Policy {
-    /// `<policy at_console="true">` or `<policy at_console="false">`, after the `bool`: the rules
-    /// for the peers of the users at the console, or for those of the other users.
-    Console(Vec<Rule>, bool),
     /// `<policy context="default">`: the rules for every peer.
     DefaultContext(Vec<Rule>),
     /// `<policy group="...">`: the rules for the peers in the group so named.
@@ -23,6 +21,9 @@ pub enum Policy {
     MandatoryContext(Vec<Rule>),
     /// `<policy user="...">`: the rules for the peers of the user so named.
     User(Vec<Rule>, String),
+    /// `<policy at_console="...">`, a context that the bus doesn't support: its rules are left
+    /// out.
+    Unsupported,
 }
 
 pub type OptionalPolicy = Option<Policy>;
@@ -32,16 +33,22 @@ impl TryFrom<PolicyElement> for OptionalPolicy {
 
     fn try_from(value: PolicyElement) -> std::result::Result<Self, Self::Error> {
         match value {
+            // Ignore the rules of the unsupported `at_console` context, but keep a placeholder for
+            // the policy. Otherwise, a configuration of a bus other than a system bus that has
+            // only such policies would fall back to the open policy.
             PolicyElement {
-                at_console: Some(at_console),
+                at_console: Some(_),
                 context: None,
                 group: None,
-                rules,
                 user: None,
-            } if at_console == "true" || at_console == "false" => Ok(Some(Policy::Console(
-                rules_try_from_rule_elements(rules)?,
-                at_console == "true",
-            ))),
+                ..
+            } => {
+                warn!(
+                    "Ignoring the rules of an `at_console` policy, which the bus doesn't support"
+                );
+
+                Ok(Some(Policy::Unsupported))
+            }
             PolicyElement {
                 at_console: None,
                 context: Some(c),

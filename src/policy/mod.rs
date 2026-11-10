@@ -3,9 +3,9 @@
 //!
 //! The policy is built from the `<policy>` elements of the configuration, each a list of `<allow>`
 //! and `<deny>` rules and a *context* that says whom they apply to: everyone (`context="default"`
-//! and `context="mandatory"`), the peers of a user (`user="..."`), the peers in a group
-//! (`group="..."`), or the peers of the users at the console or of the others
-//! (`at_console="true"` and `at_console="false"`).
+//! and `context="mandatory"`), the peers of a user (`user="..."`), or the peers in a group
+//! (`group="..."`). The deprecated `at_console` context is not supported: the configuration
+//! leaves the rules of such a policy out, with a warning.
 //!
 //! # Rank
 //!
@@ -16,11 +16,7 @@
 //! 1. `context="default"`,
 //! 2. `group="..."`,
 //! 3. `user="..."`,
-//! 4. `at_console="true"`,
-//! 5. `at_console="false"`,
-//! 6. `context="mandatory"`.
-//!
-//! No peer gets the rules of both `at_console` contexts, so their order never decides.
+//! 4. `context="mandatory"`.
 //!
 //! Within a context, a rule outranks those before it in the configuration: the rules of all the
 //! `<policy>` elements are numbered in the order of the configuration, and a higher number ranks
@@ -44,10 +40,8 @@
 //! # Which rules apply to a peer
 //!
 //! A peer is known by its uid and its gids. The rules that apply to it are those of the default
-//! and mandatory contexts, those of the `user` policies of its uid, those of the `group` policies
-//! of its gids, and those of the `at_console="true"` policies if its uid is above 999, the highest
-//! uid of a system user, or else those of the `at_console="false"` policies. The `at_console`
-//! context is deprecated, and the bus warns of each such policy, but it still applies.
+//! and mandatory contexts, those of the `user` policies of its uid, and those of the `group`
+//! policies of its gids.
 //!
 //! The names of the users and groups are resolved to ids as the policy is built, through [`Ids`],
 //! and a name that is all digits is the id itself. A policy of a name that does not resolve is
@@ -84,14 +78,13 @@
 //!
 //! # How a question is answered
 //!
-//! The rules are kept in sets that are built once and shared: one for everyone, one for each uid
-//! and each gid, and one each for the users at the console and the others. The [`PeerPolicy`] of
-//! a peer holds the few sets that apply to it. Within a set, the send rules and the receive rules
-//! are indexed by the name of the other party that they name, each list sorted from the highest
-//! rank down, so that a message is checked against the rules that may match it, and only until a
-//! rule that ranks below the best match so far. Where the highest-ranking send or receive rule of
-//! a peer has no condition at all, it gives every message its verdict, which the [`PeerPolicy`]
-//! keeps so that it has nothing to check.
+//! The rules are kept in sets that are built once and shared: one for everyone, and one for each
+//! uid and each gid. The [`PeerPolicy`] of a peer holds the few sets that apply to it. Within a
+//! set, the send rules and the receive rules are indexed by the name of the other party that they
+//! name, each list sorted from the highest rank down, so that a message is checked against the
+//! rules that may match it, and only until a rule that ranks below the best match so far. Where the
+//! highest-ranking send or receive rule of a peer has no condition at all, it gives every message
+//! its verdict, which the [`PeerPolicy`] keeps so that it has nothing to check.
 //!
 //! # Differences from dbus-broker
 //!
@@ -100,7 +93,7 @@
 //! - `send_destination_prefix` is supported, as dbus-daemon has it, and dbus-broker does not.
 //! - A configuration without any `<policy>` gets the open policy of [`Policy::open`], unless it is
 //!   that of a system bus. dbus-broker denies everything without a `<policy>`, whatever the bus.
-//! - The users at the console are those of a uid above 999, with no list of others.
+//! - The deprecated `at_console` context is not supported; dbus-broker still supports it.
 //! - The names of users and groups are resolved from `/etc/passwd` and `/etc/group` alone.
 
 use std::{collections::HashMap, sync::Arc};
@@ -129,10 +122,6 @@ pub struct Policy {
     users: HashMap<u32, Arc<RuleSet>>,
     /// The rules of the `group` policies, by gid.
     groups: HashMap<u32, Arc<RuleSet>>,
-    /// The rules of the `at_console="true"` policies.
-    console: Option<Arc<RuleSet>>,
-    /// The rules of the `at_console="false"` policies.
-    not_console: Option<Arc<RuleSet>>,
 }
 
 impl Policy {
@@ -152,11 +141,10 @@ impl Policy {
         let mut everyone = RuleSet::default();
         let mut users = HashMap::<u32, RuleSet>::new();
         let mut groups = HashMap::<u32, RuleSet>::new();
-        let mut console = RuleSet::default();
-        let mut not_console = RuleSet::default();
         let mut position = 0;
         for policy in policies {
             let (context, rules, set) = match policy {
+                config::Policy::Unsupported => continue,
                 config::Policy::DefaultContext(rules) => {
                     (Context::Default, rules, Some(&mut everyone))
                 }
@@ -173,17 +161,6 @@ impl Policy {
                         warn!("Ignoring the policy of the user `{user}`, who is unknown");
                     }
                     (Context::User, rules, set)
-                }
-                config::Policy::Console(rules, at_console) => {
-                    warn!(
-                        "The `at_console` context of a policy is deprecated, though it still \
-                         applies: the users at the console are those of a uid above 999"
-                    );
-                    if *at_console {
-                        (Context::Console, rules, Some(&mut console))
-                    } else {
-                        (Context::NotConsole, rules, Some(&mut not_console))
-                    }
                 }
                 config::Policy::MandatoryContext(rules) => {
                     (Context::Mandatory, rules, Some(&mut everyone))
@@ -207,8 +184,6 @@ impl Policy {
             everyone: everyone.finish(),
             users: finish_all(users),
             groups: finish_all(groups),
-            console: console.finish(),
-            not_console: not_console.finish(),
         }
     }
 
@@ -221,8 +196,6 @@ impl Policy {
             everyone: Some(Arc::new(RuleSet::unrestricted())),
             users: HashMap::new(),
             groups: HashMap::new(),
-            console: None,
-            not_console: None,
         }
     }
 
@@ -241,13 +214,8 @@ impl Policy {
 
     /// What the policy has for a peer of `uid`, in the groups `gids`.
     pub fn for_peer(&self, uid: u32, gids: &[u32]) -> PeerPolicy {
-        let console = if uid > MAX_SYSTEM_UID {
-            self.console.as_ref()
-        } else {
-            self.not_console.as_ref()
-        };
         let groups = gids.iter().filter_map(|gid| self.groups.get(gid));
-        let applying = [self.everyone.as_ref(), self.users.get(&uid), console]
+        let applying = [self.everyone.as_ref(), self.users.get(&uid)]
             .into_iter()
             .flatten()
             .chain(groups);
@@ -479,9 +447,6 @@ fn add_rule(
     }
 }
 
-/// The highest uid of a system user: the users of the uids above it are at the console.
-const MAX_SYSTEM_UID: u32 = 999;
-
 /// The rank of a rule: by its context first, and then by its position in the configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
@@ -495,8 +460,6 @@ enum Context {
     Default,
     Group,
     User,
-    Console,
-    NotConsole,
     Mandatory,
 }
 
@@ -997,38 +960,6 @@ mod tests {
         assert!(!bob.may_own("org.example.Group"));
     }
 
-    /// The rules of the `at_console` contexts outrank those of a user, and mandatory rules
-    /// outrank them.
-    #[test]
-    fn console_contexts_rank_above_users() {
-        let policy = policy(
-            r#"<policy context="mandatory">
-                <deny own="org.example.Mandatory"/>
-            </policy>
-            <policy at_console="true">
-                <allow own="org.example.Mandatory"/>
-                <allow own="org.example.User"/>
-            </policy>
-            <policy at_console="false">
-                <allow own="org.example.Mandatory"/>
-                <allow own="org.example.User"/>
-            </policy>
-            <policy user="alice">
-                <deny own="org.example.User"/>
-            </policy>
-            <policy user="root">
-                <deny own="org.example.User"/>
-            </policy>"#,
-        );
-
-        let alice = policy.for_peer(ALICE, &[]);
-        assert!(!alice.may_own("org.example.Mandatory"));
-        assert!(alice.may_own("org.example.User"));
-        let root = policy.for_peer(ROOT, &[]);
-        assert!(!root.may_own("org.example.Mandatory"));
-        assert!(root.may_own("org.example.User"));
-    }
-
     /// The rules of a user policy apply to the peers of that user alone, whether the policy names
     /// the user or its uid, and a policy of a user that does not resolve is left out.
     #[test]
@@ -1085,10 +1016,10 @@ mod tests {
         assert!(!named.may_own("org.example.Wheel"));
     }
 
-    /// The users of a uid above 999 get the rules of `at_console="true"`, and the others those of
-    /// `at_console="false"`.
+    /// The rules of a policy of the `at_console` context are left out, whichever value it has, but
+    /// the configuration has a policy all the same, so it is not the open one.
     #[test]
-    fn console_policies_apply_by_uid() {
+    fn console_policies_are_left_out() {
         let policy = policy(
             r#"<policy at_console="true">
                 <allow own="org.example.Console"/>
@@ -1098,13 +1029,11 @@ mod tests {
             </policy>"#,
         );
 
-        let alice = policy.for_peer(ALICE, &[]);
-        assert!(alice.may_own("org.example.Console"));
-        assert!(!alice.may_own("org.example.NotConsole"));
-        for uid in [999, ROOT] {
+        for uid in [ALICE, 999, ROOT] {
             let peer = policy.for_peer(uid, &[]);
             assert!(!peer.may_own("org.example.Console"), "uid {uid}");
-            assert!(peer.may_own("org.example.NotConsole"), "uid {uid}");
+            assert!(!peer.may_own("org.example.NotConsole"), "uid {uid}");
+            assert!(!peer.sends_freely(), "uid {uid}");
         }
     }
 

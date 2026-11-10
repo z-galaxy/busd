@@ -716,44 +716,11 @@ mod tests {
                             })
                         ),
                     ]),
-                    Policy::Console(
-                        vec![(
-                            Access::Allow,
-                            Operation::Send(SendOperation {
-                                broadcast: None,
-                                destination: Some(Name::Exact(String::from(
-                                    "org.freedesktop.DBus"
-                                ))),
-                                error: None,
-                                interface: Some(String::from("org.freedesktop.systemd1.Activator")),
-                                max_fds: None,
-                                member: None,
-                                min_fds: None,
-                                path: None,
-                                r#type: None
-                            })
-                        )],
-                        true
-                    ),
+                    Policy::Unsupported,
                 ],
                 ..Default::default()
             }
         );
-    }
-
-    #[should_panic]
-    #[test]
-    fn config_parse_with_policies_with_invalid_at_console_error() {
-        let input = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
-        "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-        <busconfig>
-            <policy at_console="yes">
-                <allow own="*"/>
-            </policy>
-        </busconfig>
-        "#;
-
-        Config::parse(input).expect("should parse XML input");
     }
 
     #[should_panic]
