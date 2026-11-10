@@ -41,6 +41,8 @@ impl TryFrom<RuleAttributes> for OptionalOperation {
     fn try_from(value: RuleAttributes) -> std::result::Result<Self, Self::Error> {
         let has_connect = value.group.is_some() || value.user.is_some();
         let has_own = value.own.is_some() || value.own_prefix.is_some();
+        // The `*_requested_reply` attributes make a send or receive rule, but are ignored
+        // otherwise: they only concern replies, which the policy of the bus does not apply to.
         let has_send = value.send_broadcast.is_some()
             || value.send_destination.is_some()
             || value.send_destination_prefix.is_some()
@@ -75,6 +77,11 @@ impl TryFrom<RuleAttributes> for OptionalOperation {
             Ok(Some(Operation::Receive(ReceiveOperation::from(value))))
         } else if has_send {
             Ok(Some(Operation::Send(SendOperation::from(value))))
+        } else if value.eavesdrop.is_some() {
+            // `eavesdrop` is ignored, so a rule that has nothing else is a receive rule for every
+            // message: `<allow eavesdrop="true"/>` is how the stock session.conf lets everyone
+            // receive everything.
+            Ok(Some(Operation::Receive(ReceiveOperation::from(value))))
         } else {
             Err(Error::msg(format!("rule must specify supported attributes for connect, own, receive, or send operations: {value:?}")))
         }
@@ -180,67 +187,15 @@ impl TryFrom<RuleElement> for OptionalRule {
             }) => Err(Error::msg(format!(
                 "`send_destination_prefix` cannot be combined with `send_destination` in the same rule: {value:?}"
             ))),
-            RuleElement::Allow(RuleAttributes {
-                eavesdrop: Some(true),
-                group: None,
-                own: None,
-                receive_requested_reply: None,
-                receive_sender: None,
-                send_broadcast: None,
-                send_destination: None,
-                send_destination_prefix: None,
-                send_error: None,
-                send_interface: None,
-                send_member: None,
-                send_path: None,
-                send_requested_reply: None,
-                send_type: None,
-                user: None,
-                ..
-            }) => {
-                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
-                Ok(None)
-            }
-            RuleElement::Allow(
-                RuleAttributes {
-                    receive_requested_reply: Some(false),
-                    ..
-                }
-                | RuleAttributes {
-                    send_requested_reply: Some(false),
-                    ..
-                },
-            ) => {
-                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
-                Ok(None)
-            }
-            RuleElement::Allow(attrs) => {
-                // if attrs.eavesdrop == Some(true) {
-                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
-                // }
-                match OptionalOperation::try_from(attrs)? {
-                    Some(some) => Ok(Some((Access::Allow, some))),
-                    None => Ok(None),
-                }
-            }
+            RuleElement::Allow(attrs) => match OptionalOperation::try_from(attrs)? {
+                Some(some) => Ok(Some((Access::Allow, some))),
+                None => Ok(None),
+            },
             RuleElement::Deny(RuleAttributes {
                 eavesdrop: Some(true),
                 ..
             }) => {
-                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
-                Ok(None)
-            }
-            RuleElement::Deny(
-                RuleAttributes {
-                    receive_requested_reply: Some(true),
-                    ..
-                }
-                | RuleAttributes {
-                    send_requested_reply: Some(true),
-                    ..
-                },
-            ) => {
-                // see: https://github.com/z-galaxy/busd/pull/146#issuecomment-2408429760
+                // Such a rule only concerns eavesdropping, which the bus does not do.
                 Ok(None)
             }
             RuleElement::Deny(attrs) => match OptionalOperation::try_from(attrs)? {

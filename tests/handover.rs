@@ -26,7 +26,9 @@ use std::{
 use anyhow::{bail, Context};
 use busd::{
     bus::{Bus, Handover, STOP_TIMEOUT},
+    config::Config,
     peer::SEND_TIMEOUT,
+    policy::{Ids, Policy},
 };
 use futures_util::{
     future::{select, Either},
@@ -44,7 +46,7 @@ use rustix::{
 use serde::Serialize;
 use zbus::{
     connection,
-    fdo::{DBusProxy, MonitoringProxy, RequestNameFlags},
+    fdo::{self, DBusProxy, MonitoringProxy, RequestNameFlags},
     message,
     names::BusName,
     proxy::CacheProperties,
@@ -214,7 +216,7 @@ fn users_keep_their_objects() {
 
         // The two clients and the call are all of the objects that the next instance keeps for
         // their user, the user of the tests.
-        let mut next = Bus::take_over(bus.hand_over().await, None, SEND_TIMEOUT)
+        let mut next = Bus::take_over(bus.hand_over().await, None, SEND_TIMEOUT, Arc::default())
             .await
             .unwrap();
         next.set_max_objects_per_user(3);
@@ -225,6 +227,63 @@ fn users_keep_their_objects() {
         service.reply(&ping.header(), &"Pong").await.unwrap();
         within(call).await.unwrap().unwrap();
         let _late = connect(&address).await;
+
+        bus.finish().await;
+    });
+}
+
+/// The next instance goes by the policy that it is given from the first message of each client
+/// that it took over, with nothing set on it once it has them: it refuses what its policy denies
+/// to a call that a client made while no instance served it, which the previous instance, with its
+/// open policy, would have let through.
+#[test]
+#[timeout(30000)]
+fn policy_from_the_first_message() {
+    init_tracing();
+
+    zruntime::block_on(async {
+        let (bus, address) = start().await;
+        let client = connect(&address).await;
+        request_name(&client, "org.zbus.Handover.Before").await;
+
+        let handover = bus.hand_over().await;
+        let late = zruntime::spawn({
+            let client = client.clone();
+            async move {
+                let name = "org.zbus.Handover.Late";
+
+                client
+                    .call_method(
+                        Some(BUS_NAME),
+                        BUS_PATH,
+                        Some(BUS_NAME),
+                        "RequestName",
+                        &(name, 0u32),
+                    )
+                    .await
+            }
+        });
+        // The call goes out before the next instance is there to take it.
+        let _ = SharedRuntime::current()
+            .unwrap()
+            .sleep(Duration::ZERO)
+            .await;
+        let policy = Arc::new(owns_no_name());
+        let bus = Bus::take_over(handover, None, SEND_TIMEOUT, policy)
+            .await
+            .unwrap();
+        let (bus, _) = serve(bus);
+
+        let refused = within(late).await.unwrap().map_err(fdo::Error::from);
+        assert!(
+            matches!(
+                &refused,
+                Err(fdo::Error::AccessDenied(why)) if why == "Request to own name refused by policy"
+            ),
+            "The next instance didn't refuse the name: {refused:?}"
+        );
+        // The policy lets the client talk to the bus.
+        get_id(&client).await;
 
         bus.finish().await;
     });
@@ -612,7 +671,7 @@ fn bus_on_a_given_socket_hands_over() {
 
         let handover = bus.hand_over().await;
         assert!(handover.listener.is_none());
-        let bus = Bus::take_over(handover, Some(activator_copy), SEND_TIMEOUT)
+        let bus = Bus::take_over(handover, Some(activator_copy), SEND_TIMEOUT, Arc::default())
             .await
             .unwrap();
         let (bus, _) = serve(bus);
@@ -1806,6 +1865,24 @@ async fn connect(address: &str) -> Connection {
     connection::Builder::address(address).build().await.unwrap()
 }
 
+/// A policy that lets everyone send and receive everything, and own no name.
+fn owns_no_name() -> Policy {
+    let config = Config::parse(
+        r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+        "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+        <busconfig>
+            <policy context="default">
+                <allow send_destination="*"/>
+                <allow eavesdrop="true"/>
+                <deny own="*"/>
+            </policy>
+        </busconfig>"#,
+    )
+    .unwrap();
+
+    Policy::new(&config, &Ids::default(), rustix::process::getuid().as_raw())
+}
+
 /// Set the tracing subscriber up, once for all the tests of this file, which run in one process.
 fn init_tracing() {
     static INIT: Once = Once::new();
@@ -1878,7 +1955,9 @@ impl Running {
     /// Run the instance of the bus that takes over from the one that handed `handover` over, and
     /// gives each client `send_timeout` to take a message, those that it takes over included.
     async fn take_over_with(handover: Handover, send_timeout: Duration) -> Self {
-        Self::new(Bus::take_over(handover, None, send_timeout).await.unwrap())
+        let bus = Bus::take_over(handover, None, send_timeout, Arc::default()).await;
+
+        Self::new(bus.unwrap())
     }
 
     /// Stop the bus and clean up after it.

@@ -139,6 +139,20 @@ fn config_read_file_session_conf_ok() {
                         r#type: None,
                     }),
                 ),
+                // `<allow eavesdrop="true"/>` is a receive rule with no restriction.
+                (
+                    Access::Allow,
+                    Operation::Receive(ReceiveOperation {
+                        error: None,
+                        interface: None,
+                        max_fds: None,
+                        member: None,
+                        min_fds: None,
+                        path: None,
+                        sender: None,
+                        r#type: None,
+                    }),
+                ),
                 (
                     Access::Allow,
                     Operation::Own(NameOwnership {

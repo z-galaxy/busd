@@ -1,4 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    iter,
+};
 use zbus::{
     fdo::{ReleaseNameReply, RequestNameFlags, RequestNameReply},
     names::{
@@ -6,7 +9,9 @@ use zbus::{
     },
 };
 
-#[derive(Debug, Default)]
+use crate::fdo;
+
+#[derive(Debug)]
 pub struct NameRegistry {
     names: HashMap<OwnedWellKnownName, NameEntry>,
     /// The current and peak name counts of each owner, kept up to date as names change owners, so
@@ -14,10 +19,32 @@ pub struct NameRegistry {
     /// name, to preserve the peak: `release_all` removes it, when the peer disconnects or becomes
     /// a monitor.
     owned: HashMap<OwnedUniqueName, Owned>,
+    /// The well-known names that each peer owns or queues for, each once, by its unique name: what
+    /// the policy knows the peer by. A peer without any has no entry. It is kept up to date as
+    /// names change hands, so that telling the names of a peer takes no pass over the names.
+    names_of: HashMap<OwnedUniqueName, Vec<OwnedWellKnownName>>,
     /// The most names that had an owner at a time.
     peak_names: usize,
     /// The most names that one owner had at a time.
     peak_names_per_owner: usize,
+}
+
+/// A registry without names, but for the one that the bus itself has: its unique name and its
+/// well-known name are both `org.freedesktop.DBus`, which it has without asking for it, so that
+/// name is in `names_of` and not in `names`.
+impl Default for NameRegistry {
+    fn default() -> Self {
+        let bus = UniqueName::from_static_str_unchecked(fdo::BUS_NAME).into();
+        let name = WellKnownName::from_static_str_unchecked(fdo::BUS_NAME).into();
+
+        Self {
+            names: HashMap::new(),
+            owned: HashMap::new(),
+            names_of: HashMap::from([(bus, vec![name])]),
+            peak_names: 0,
+            peak_names_per_owner: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +120,8 @@ impl NameRegistry {
                     };
                     self.note_lost(&old_owner);
                     self.note_gained(&unique_name);
+                    self.index(&old_owner, &name);
+                    self.index(&unique_name, &name);
 
                     (
                         RequestNameReply::PrimaryOwner,
@@ -108,6 +137,7 @@ impl NameRegistry {
                         allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
                     };
                     entry.waiting_list.push_back(owner);
+                    self.index(&unique_name, &name);
 
                     (RequestNameReply::InQueue, None)
                 } else {
@@ -130,6 +160,7 @@ impl NameRegistry {
                     },
                 );
                 self.note_gained(&unique_name);
+                self.index(&unique_name, &name);
 
                 (
                     RequestNameReply::PrimaryOwner,
@@ -170,6 +201,8 @@ impl NameRegistry {
                     if let Some(new_owner) = &new_owner_name {
                         self.note_gained(new_owner);
                     }
+                    // The one that the name passes on to queued for it, so it has the name already.
+                    self.index(&owner, &name);
 
                     (
                         ReleaseNameReply::Released,
@@ -183,6 +216,7 @@ impl NameRegistry {
                     for (i, waiting) in entry.waiting_list.iter().enumerate() {
                         if *waiting.unique_name == owner {
                             entry.waiting_list.remove(i);
+                            self.index(&owner, &name);
 
                             return (ReleaseNameReply::Released, None);
                         }
@@ -226,6 +260,11 @@ impl NameRegistry {
         all_changed
     }
 
+    /// The well-known names that `peer` owns or queues for: what the policy knows it by.
+    pub fn names_of(&self, peer: &str) -> &[OwnedWellKnownName] {
+        self.names_of.get(peer).map_or(&[], Vec::as_slice)
+    }
+
     /// The unique name of the owner of `name`, if it has one.
     pub fn lookup(&self, name: &WellKnownName<'_>) -> Option<&OwnedUniqueName> {
         self.names.get(name.as_str()).map(|e| &e.owner.unique_name)
@@ -248,8 +287,15 @@ impl NameRegistry {
             owner,
             waiting_list: waiting_list.into_iter().collect(),
         };
-        self.names.insert(name, entry);
+        let peers: Vec<_> = iter::once(&entry.owner)
+            .chain(&entry.waiting_list)
+            .map(|peer| peer.unique_name.clone())
+            .collect();
+        self.names.insert(name.clone(), entry);
         self.note_gained(&owner_name);
+        for peer in &peers {
+            self.index(peer, &name);
+        }
     }
 
     /// The most names that had an owner at a time.
@@ -287,6 +333,43 @@ impl NameRegistry {
     fn note_lost(&mut self, owner: &OwnedUniqueName) {
         if let Some(owned) = self.owned.get_mut(owner) {
             owned.now = owned.now.saturating_sub(1);
+        }
+    }
+
+    /// Note whether `peer` owns or queues for `name`, as that may have changed.
+    ///
+    /// Only `name` is looked at, as the other names of `peer` did not change. The entry of the bus
+    /// itself is left as [`NameRegistry::default`] made it: the bus has its name without it being
+    /// in `names`, and asks for no other.
+    fn index(&mut self, peer: &UniqueName<'_>, name: &WellKnownName<'_>) {
+        if peer == fdo::BUS_NAME {
+            return;
+        }
+        let has = self.names.get(name.as_str()).is_some_and(|entry| {
+            *entry.owner.unique_name == *peer
+                || entry
+                    .waiting_list
+                    .iter()
+                    .any(|waiting| *waiting.unique_name == *peer)
+        });
+        let Some(names) = self.names_of.get_mut(peer.as_str()) else {
+            if has {
+                let names = vec![name.to_owned().into()];
+                self.names_of.insert(peer.to_owned().into(), names);
+            }
+
+            return;
+        };
+        let noted = names.iter().position(|noted| noted == name);
+        match (has, noted) {
+            (true, None) => names.push(name.to_owned().into()),
+            (false, Some(i)) => {
+                names.swap_remove(i);
+                if names.is_empty() {
+                    self.names_of.remove(peer.as_str());
+                }
+            }
+            (true, Some(_)) | (false, None) => (),
         }
     }
 }
@@ -592,6 +675,160 @@ mod tests {
             let owned = registry.owned_by(":busd.2");
             assert_eq!((owned.now, owned.peak), (1, 1));
         });
+    }
+
+    /// A peer is known by the names that it owns and those that it queues for, each once.
+    #[test]
+    fn names_of_owners_and_queued_peers() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            assert!(registry.names_of(":busd.1").is_empty());
+
+            let flags = RequestNameFlags::empty();
+            request(&mut registry, "org.busd.One", ":busd.1", flags).await;
+            request(&mut registry, "org.busd.Two", ":busd.2", flags).await;
+            request(&mut registry, "org.busd.Two", ":busd.1", flags).await;
+            request(&mut registry, "org.busd.Two", ":busd.1", flags).await;
+            assert_eq!(
+                names_of(&registry, ":busd.1"),
+                ["org.busd.One", "org.busd.Two"]
+            );
+            assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.Two"]);
+        });
+    }
+
+    /// A name that another peer takes over is a name of that peer, and no more one of its owner.
+    #[test]
+    fn names_of_peers_after_a_name_is_taken_over() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            let replaceable = RequestNameFlags::ALLOW_REPLACEMENT;
+            request(&mut registry, "org.busd.One", ":busd.1", replaceable).await;
+            request(
+                &mut registry,
+                "org.busd.One",
+                ":busd.2",
+                RequestNameFlags::REPLACE_EXISTING,
+            )
+            .await;
+
+            assert!(registry.names_of(":busd.1").is_empty());
+            assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.One"]);
+        });
+    }
+
+    /// A name that its owner releases goes from the names of the owner, and stays one of the peer
+    /// that it goes to from the queue; a peer that leaves the queue loses it too.
+    #[test]
+    fn names_of_peers_after_a_name_is_released() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            let flags = RequestNameFlags::empty();
+            request(&mut registry, "org.busd.One", ":busd.1", flags).await;
+            request(&mut registry, "org.busd.Two", ":busd.1", flags).await;
+            request(&mut registry, "org.busd.One", ":busd.2", flags).await;
+            request(&mut registry, "org.busd.One", ":busd.3", flags).await;
+
+            release(&mut registry, "org.busd.One", ":busd.1").await;
+            assert_eq!(names_of(&registry, ":busd.1"), ["org.busd.Two"]);
+            assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.One"]);
+            release(&mut registry, "org.busd.One", ":busd.3").await;
+            assert!(registry.names_of(":busd.3").is_empty());
+
+            release(&mut registry, "org.busd.Two", ":busd.1").await;
+            assert!(registry.names_of(":busd.1").is_empty());
+            let changes = registry
+                .release_all(UniqueName::try_from(":busd.2").unwrap())
+                .await;
+            assert_eq!(changes.len(), 1);
+            assert!(registry.names_of(":busd.2").is_empty());
+        });
+    }
+
+    /// A name that passes on to the one that lets go of it, which queued for it before it took it
+    /// over, stays a name of that peer until the peer lets go of it once more.
+    #[test]
+    fn names_of_a_peer_that_a_name_comes_back_to() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            let replaceable = RequestNameFlags::ALLOW_REPLACEMENT;
+            let replace = RequestNameFlags::REPLACE_EXISTING;
+            request(&mut registry, "org.busd.One", ":busd.1", replaceable).await;
+            request(&mut registry, "org.busd.One", ":busd.2", replaceable).await;
+            request(&mut registry, "org.busd.One", ":busd.2", replace).await;
+            assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.One"]);
+
+            release(&mut registry, "org.busd.One", ":busd.2").await;
+            assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.One"]);
+            release(&mut registry, "org.busd.One", ":busd.2").await;
+            assert!(registry.names_of(":busd.2").is_empty());
+        });
+    }
+
+    /// The names that another instance of the bus hands over are names of their owners and of the
+    /// peers that queue for them.
+    #[test]
+    fn names_of_peers_after_names_are_inserted() {
+        let mut registry = NameRegistry::default();
+        let owner = |name: &str| NameOwner::new(name.try_into().unwrap(), false);
+        registry.insert(
+            "org.busd.One".try_into().unwrap(),
+            owner(":busd.1"),
+            [owner(":busd.2"), owner(":busd.3")],
+        );
+        registry.insert("org.busd.Two".try_into().unwrap(), owner(":busd.2"), []);
+
+        assert_eq!(names_of(&registry, ":busd.1"), ["org.busd.One"]);
+        assert_eq!(
+            names_of(&registry, ":busd.2"),
+            ["org.busd.One", "org.busd.Two"]
+        );
+        assert_eq!(names_of(&registry, ":busd.3"), ["org.busd.One"]);
+    }
+
+    /// The bus has its own name, which nothing that the registry is asked to do takes from it.
+    #[test]
+    fn names_of_the_bus() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            assert_eq!(names_of(&registry, fdo::BUS_NAME), [fdo::BUS_NAME]);
+
+            let flags = RequestNameFlags::empty();
+            request(&mut registry, "org.busd.One", fdo::BUS_NAME, flags).await;
+            assert_eq!(names_of(&registry, fdo::BUS_NAME), [fdo::BUS_NAME]);
+            release(&mut registry, "org.busd.One", fdo::BUS_NAME).await;
+            registry.insert(
+                "org.busd.Two".try_into().unwrap(),
+                NameOwner::new(fdo::BUS_NAME.try_into().unwrap(), false),
+                [],
+            );
+            release(&mut registry, "org.busd.Two", fdo::BUS_NAME).await;
+            assert_eq!(names_of(&registry, fdo::BUS_NAME), [fdo::BUS_NAME]);
+        });
+    }
+
+    /// The names of `peer` in `registry`, sorted.
+    fn names_of<'r>(registry: &'r NameRegistry, peer: &str) -> Vec<&'r str> {
+        let mut names: Vec<_> = registry
+            .names_of(peer)
+            .iter()
+            .map(|name| name.as_str())
+            .collect();
+        names.sort_unstable();
+
+        names
+    }
+
+    /// Release `name` for `owner`.
+    async fn release(registry: &mut NameRegistry, name: &str, owner: &str) -> ReleaseNameReply {
+        let (reply, _) = registry
+            .release_name(
+                name.try_into().unwrap(),
+                UniqueName::try_from(owner).unwrap(),
+            )
+            .await;
+
+        reply
     }
 
     /// Request `name` for `owner`.

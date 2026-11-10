@@ -66,7 +66,10 @@ argument parsing via clap). Key modules:
 - **`fdo/`** — the standard `org.freedesktop.DBus` interfaces (`dbus.rs`), monitoring
   (`monitoring.rs`) and statistics (`stats.rs`).
 - **`config/`** — bus configuration file parsing: `xml.rs` (the `.conf` format),
-  `policy.rs` and `rule.rs` (access-control policy).
+  `policy.rs` and `rule.rs` (the access-control policy, as parsed).
+- **`policy/`** — the access-control policy that the bus enforces, built from the parsed one:
+  who may connect, own which names, and send and receive which messages; `ids.rs` resolves
+  the names of users and groups.
 - **`tracing_subscriber.rs`** — logging setup (behind the default `tracing-subscriber`
   feature).
 

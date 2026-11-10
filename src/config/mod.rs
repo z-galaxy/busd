@@ -644,18 +644,116 @@ mod tests {
                                 r#type: None
                             })
                         ),
-                        // `<allow eavesdrop="true"/>` has nothing left after dropping eavesdrop
-                        // `<deny eavesdrop="true" ...` is completely ignored
-                        // `<deny send_requested_reply="true" ...` is completely ignored
-                        // `<allow send_requested_reply="false" ...` is completely ignored
-                        // `<deny receive_requested_reply="true" ...` is completely ignored
-                        // `<allow receive_requested_reply="false" ...` is completely ignored
+                        // `<allow eavesdrop="true"/>` is a receive rule with no restriction
+                        (
+                            Access::Allow,
+                            Operation::Receive(ReceiveOperation {
+                                error: None,
+                                interface: None,
+                                max_fds: None,
+                                member: None,
+                                min_fds: None,
+                                path: None,
+                                sender: None,
+                                r#type: None
+                            })
+                        ),
+                        // `<deny eavesdrop="true"/>` is dropped: it only concerns eavesdropping
+                        // `send_requested_reply` is dropped, keep other attributes
+                        (
+                            Access::Deny,
+                            Operation::Send(SendOperation {
+                                broadcast: None,
+                                destination: None,
+                                error: None,
+                                interface: None,
+                                max_fds: None,
+                                member: None,
+                                min_fds: None,
+                                path: None,
+                                r#type: Some(MessageType::MethodReturn)
+                            })
+                        ),
+                        (
+                            Access::Allow,
+                            Operation::Send(SendOperation {
+                                broadcast: None,
+                                destination: None,
+                                error: None,
+                                interface: None,
+                                max_fds: None,
+                                member: None,
+                                min_fds: None,
+                                path: None,
+                                r#type: Some(MessageType::MethodReturn)
+                            })
+                        ),
+                        // `receive_requested_reply` is dropped, keep other attributes
+                        (
+                            Access::Deny,
+                            Operation::Receive(ReceiveOperation {
+                                error: None,
+                                interface: None,
+                                max_fds: None,
+                                member: None,
+                                min_fds: None,
+                                path: None,
+                                sender: None,
+                                r#type: Some(MessageType::Error)
+                            })
+                        ),
+                        (
+                            Access::Allow,
+                            Operation::Receive(ReceiveOperation {
+                                error: None,
+                                interface: None,
+                                max_fds: None,
+                                member: None,
+                                min_fds: None,
+                                path: None,
+                                sender: None,
+                                r#type: Some(MessageType::Error)
+                            })
+                        ),
                     ]),
-                    // `<policy at_console="true">` is completely ignored
+                    Policy::Console(
+                        vec![(
+                            Access::Allow,
+                            Operation::Send(SendOperation {
+                                broadcast: None,
+                                destination: Some(Name::Exact(String::from(
+                                    "org.freedesktop.DBus"
+                                ))),
+                                error: None,
+                                interface: Some(String::from("org.freedesktop.systemd1.Activator")),
+                                max_fds: None,
+                                member: None,
+                                min_fds: None,
+                                path: None,
+                                r#type: None
+                            })
+                        )],
+                        true
+                    ),
                 ],
                 ..Default::default()
             }
         );
+    }
+
+    #[should_panic]
+    #[test]
+    fn config_parse_with_policies_with_invalid_at_console_error() {
+        let input = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+        "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+        <busconfig>
+            <policy at_console="yes">
+                <allow own="*"/>
+            </policy>
+        </busconfig>
+        "#;
+
+        Config::parse(input).expect("should parse XML input");
     }
 
     #[should_panic]

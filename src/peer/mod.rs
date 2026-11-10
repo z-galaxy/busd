@@ -17,6 +17,7 @@ use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 use zbus::{
     connection::{self, AuthMechanism},
+    fdo::ConnectionCredentials,
     names::{BusName, OwnedUniqueName},
     Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
@@ -27,6 +28,7 @@ use crate::{
     fdo,
     match_rules::MatchRules,
     name_registry::NameRegistry,
+    policy::PeerPolicy,
     user::{Charge, User},
 };
 
@@ -47,6 +49,11 @@ pub struct Peer {
     /// The peer, as an object that the bus keeps for its user, as with dbus-broker; none for the
     /// bus itself. A monitor that the peer becomes takes it over.
     charge: Option<Charge>,
+    /// The gids of the client, as its credentials tell; none for the bus itself, or where they
+    /// can't be told.
+    groups: Box<[u32]>,
+    /// What the policy of the bus has for the peer.
+    policy: PeerPolicy,
     greeted: bool,
     /// Notified as the peer goes, and as the bus pauses to hand over, for the task that serves the
     /// peer to see why.
@@ -93,6 +100,8 @@ impl Peer {
             .await?;
         let conn = Connection::from(&msg_stream);
         trace!("created: {:?}", conn);
+        // Those credentials tell the groups of the client too.
+        let groups = groups(conn.peer_creds().await?);
 
         let peer = Self {
             recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
@@ -104,6 +113,9 @@ impl Peer {
             match_rules: MatchRules::default(),
             peak_match_rules: 0,
             pending_calls: Arc::new(PendingCalls::new(user)),
+            groups,
+            // The bus gives the peer its policy as it adds the peer.
+            policy: PeerPolicy::default(),
             greeted: false,
             canceled_event: Event::new(),
             #[cfg(target_os = "linux")]
@@ -137,6 +149,8 @@ impl Peer {
             match_rules: MatchRules::default(),
             peak_match_rules: 0,
             pending_calls: Arc::new(PendingCalls::of_bus()),
+            groups: Box::default(),
+            policy: PeerPolicy::unrestricted(),
             greeted: true,
             canceled_event: Event::new(),
             #[cfg(target_os = "linux")]
@@ -180,6 +194,21 @@ impl Peer {
     /// The user of the peer.
     pub fn user(&self) -> &User {
         self.caller.user()
+    }
+
+    /// The gids of the client of the peer: none for the bus itself.
+    pub fn groups(&self) -> &[u32] {
+        &self.groups
+    }
+
+    /// What the policy of the bus has for the peer.
+    pub fn policy(&self) -> &PeerPolicy {
+        &self.policy
+    }
+
+    /// Have the peer go by `policy`, what the policy of the bus has for it.
+    pub fn set_policy(&mut self, policy: PeerPolicy) {
+        self.policy = policy;
     }
 
     /// Whether the peer called `Hello`.
@@ -282,11 +311,9 @@ impl Peer {
         // looked up now, before anything is sent to the client, which a lookup would wait for,
         // what the instance that handed the client over left unwritten included. zbus keeps them.
         // They tell the user of the client too.
-        let uid = conn
-            .peer_creds()
-            .await?
-            .unix_user_id()
-            .context("The client has no user")?;
+        let creds = conn.peer_creds().await?;
+        let uid = creds.unix_user_id().context("The client has no user")?;
+        let groups = groups(creds);
         let user = users.user(uid);
 
         let peer = Self {
@@ -299,6 +326,9 @@ impl Peer {
             peak_match_rules: match_rules.len(),
             match_rules,
             pending_calls: Arc::new(PendingCalls::new(user)),
+            groups,
+            // The bus gives the peer its policy as it adds the peer.
+            policy: PeerPolicy::default(),
             greeted,
             canceled_event: Event::new(),
             paused: None,
@@ -309,7 +339,6 @@ impl Peer {
     }
 
     /// Whether the peer is the bus itself.
-    #[cfg(target_os = "linux")]
     pub(crate) fn is_bus(&self) -> bool {
         self.id == BUS_ID
     }
@@ -366,6 +395,13 @@ pub(crate) struct HandedOver {
     pub(crate) greeted: bool,
     /// The match rules that the client added.
     pub(crate) match_rules: MatchRules,
+}
+
+/// The gids that `creds` tell, or none if they can't be told.
+fn groups(creds: &ConnectionCredentials) -> Box<[u32]> {
+    creds
+        .unix_group_ids()
+        .map_or_else(Box::default, |gids| gids.as_slice().into())
 }
 
 /// The number of the bus, as a peer of its own.

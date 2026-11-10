@@ -6,6 +6,7 @@ use futures_util::{
 };
 use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap},
+    fmt,
     future::poll_fn,
     num::NonZeroU32,
     ops::{Deref, DerefMut, Range},
@@ -18,7 +19,10 @@ use zbus::{
     names::{BusName, OwnedUniqueName, UniqueName},
     Connection, Message, MessageStream, Optional, OwnedGuid, OwnedMatchRule,
 };
-use zruntime::{lock::RwLock, spawn, Event, EventListener};
+use zruntime::{
+    lock::{self, RwLock},
+    spawn, unblock, Event, EventListener,
+};
 
 #[cfg(target_os = "linux")]
 mod handover;
@@ -28,6 +32,7 @@ use crate::{
     match_rules::MatchRules,
     name_registry::{NameOwnerChanged, NameRegistry},
     peer::{Caller, Invalid, Monitor, Peer, PendingCalls, Recipient, Refusal, Stream},
+    policy::{Facts, Policy},
     user::{Charge, Users, MAX_OBJECTS},
 };
 
@@ -53,6 +58,9 @@ pub struct Peers {
     users: Users,
     /// The uid of the user that the bus itself runs as.
     uid: u32,
+    /// How the bus reads its policy again, if it was told how: see [`Peers::set_reload`]. A reload
+    /// holds it until the bus goes by what it read, so that reloads take turns.
+    reload: lock::Mutex<Option<Reload>>,
     /// What the bus does on its own, besides forwarding the messages of its peers.
     chores: Mutex<Chores>,
     /// Notified on each change of `chores`.
@@ -73,6 +81,7 @@ impl Peers {
             bus_conn: Mutex::new(None),
             users: Users::new(MAX_OBJECTS),
             uid: rustix::process::getuid().as_raw(),
+            reload: lock::Mutex::new(None),
             chores: Mutex::new(Chores::default()),
             chores_changed: Event::new(),
             #[cfg(target_os = "linux")]
@@ -85,6 +94,49 @@ impl Peers {
     /// The users of the peers, and of the bus itself.
     pub fn users(&self) -> &Users {
         &self.users
+    }
+
+    /// Have the bus go by `policy` from now on: for the clients that connect, and for the peers
+    /// that it has, each of which gets what `policy` has for it.
+    pub async fn set_policy(&self, policy: Arc<Policy>) {
+        let mut routing = self.routing_mut().await;
+        for peer in routing.peers.values_mut().filter(|peer| !peer.is_bus()) {
+            peer.set_policy(policy.for_peer(peer.user().uid(), peer.groups()));
+        }
+        routing.policy = policy;
+    }
+
+    /// Have [`Peers::reload`] set the policy that `read` returns: `read` reads the configuration of
+    /// the bus again, and may block, as it runs on a thread of its own.
+    pub async fn set_reload<F>(&self, read: F)
+    where
+        F: Fn() -> Result<Policy> + Send + Sync + 'static,
+    {
+        *self.reload.lock().await = Some(Reload(Arc::new(read)));
+    }
+
+    /// Read the policy of the bus again, as [`Peers::set_reload`] told how to, and have the bus go
+    /// by it, as [`Peers::set_policy`] does: nothing if the bus was not told how to.
+    ///
+    /// The policy is read on a thread of its own, so the bus goes on forwarding the messages of
+    /// its peers meanwhile, and a reload waits for the one before it. If reading fails, the bus
+    /// goes on by the policy that it has.
+    pub async fn reload(&self) -> Option<Result<()>> {
+        // Held until the bus goes by what was read, so that reloads take turns.
+        let reload = self.reload.lock().await;
+        let Reload(read) = reload.clone()?;
+        let policy = match unblock(move || read()).await {
+            Ok(policy) => policy,
+            Err(e) => return Some(Err(e)),
+        };
+        self.set_policy(Arc::new(policy)).await;
+
+        Some(Ok(()))
+    }
+
+    /// Whether the policy of the bus lets a client of `uid`, in the groups `gids`, connect.
+    pub async fn may_connect(&self, uid: u32, gids: &[u32]) -> bool {
+        self.routing().await.policy.may_connect(uid, gids)
     }
 
     /// Add a client, of the user of `uid`, which the bus gives `send_timeout` to take each message.
@@ -669,6 +721,17 @@ impl Peers {
     /// it expects no reply, and so does one with file descriptors to a callee that didn't negotiate
     /// passing them, which can't take it, rather than wait for a reply that can't come.
     ///
+    /// The policy of the bus has its say on each method call and signal, for each peer that would
+    /// get it, the bus itself included: first the part of the receiver, as to whether it may
+    /// receive the message from `sender`, and then that of `sender`, as to whether it may send it
+    /// to the receiver, each by the well-known names of the other. A call, or a signal with a
+    /// destination, that the policy refuses goes nowhere, and a call that expects a reply gets an
+    /// `AccessDenied` error from the bus, as with dbus-broker; a call is refused before it is
+    /// recorded as one that waits. A signal without a destination goes to those of its subscribers
+    /// that the policy lets have it. Replies and errors are not subject to the policy. The calls
+    /// and signals of a `sender` that is a peer no more, as it became a monitor meanwhile, go
+    /// nowhere.
+    ///
     /// The monitors get each message, whether it goes on to its destination or not, as dbus-broker
     /// passes every message on to its monitors before it routes it.
     async fn forward(
@@ -692,16 +755,34 @@ impl Peers {
                 name_registry,
                 ..
             } = &*routing;
+            // The sender is a peer no more if it became a monitor meanwhile.
+            let sender_peer = peers.get(sender.as_str());
             for (i, msg) in msgs.iter().enumerate() {
                 if msg.message_type() == message::Type::Signal {
                     trace!("Broadcasting message: {:?}", msg);
-                    for (name, peer) in peers.iter() {
-                        if !peer.interested(msg, name_registry) {
-                            trace!("Peer {} not interested in {msg:?}", name);
-                            continue;
-                        }
+                    if let Some(sender_peer) = sender_peer {
+                        // Parsed only for the policy to look at, if it has to.
+                        let mut header = None;
+                        for (name, peer) in peers.iter() {
+                            if !peer.interested(msg, name_registry) {
+                                trace!("Peer {} not interested in {msg:?}", name);
+                                continue;
+                            }
+                            if denial(
+                                sender_peer,
+                                peer,
+                                || Facts::new(msg, header.get_or_insert_with(|| msg.header())),
+                                name_registry,
+                            )
+                            .is_some()
+                            {
+                                continue;
+                            }
 
-                        outbox.add(msgs, peer.id(), peer.recipient(), i);
+                            outbox.add(msgs, peer.id(), peer.recipient(), i);
+                        }
+                    } else {
+                        trace!("Dropping {msg:?}, as `{sender}` is a peer no more");
                     }
                 } else {
                     let header = msg.header();
@@ -734,13 +815,32 @@ impl Peers {
                             && !from_bus;
                     let primary = msg.primary_header();
                     let flags = primary.flags();
-                    let expects_reply = msg_type == message::Type::MethodCall
-                        && !flags.contains(message::Flags::NO_REPLY_EXPECTED);
-                    match peer {
+                    let is_call = msg_type == message::Type::MethodCall;
+                    let expects_reply =
+                        is_call && !flags.contains(message::Flags::NO_REPLY_EXPECTED);
+                    // The policy has its say on a call before the call waits for its reply.
+                    let denied = match (peer, sender_peer) {
+                        (Some((_, peer)), Some(sender_peer)) if is_call => denial(
+                            sender_peer,
+                            peer,
+                            || Facts::new(msg, &header),
+                            name_registry,
+                        ),
+                        _ => None,
+                    };
+                    match (peer, denied) {
                         _ if answers_none => {
                             debug!("{msg:?} answers no call that waits on {sender}")
                         }
-                        Some((name, peer)) => {
+                        _ if is_call && sender_peer.is_none() => {
+                            trace!("Dropping {msg:?}, as `{sender}` is a peer no more")
+                        }
+                        (Some(_), Some(rejection)) => {
+                            if expects_reply {
+                                rejected.push((msg.clone(), rejection));
+                            }
+                        }
+                        (Some((name, peer)), None) => {
                             let refusal = if expects_reply {
                                 peer.pending_calls()
                                     .add(sender_id, caller, primary.serial_num())
@@ -755,7 +855,7 @@ impl Peers {
                                 _ => outbox.add(msgs, peer.id(), peer.recipient(), i),
                             }
                         }
-                        None => {
+                        (None, _) => {
                             debug!("no peer for destination `{destination}`");
                             // The bus starts no services, so no name is one that a service can be
                             // started for.
@@ -911,6 +1011,8 @@ pub struct Routing {
     /// How many match rules the peers have, kept up to date by the methods that change them, so
     /// that counting them takes no pass over the peers.
     match_rule_counts: MatchRuleCounts,
+    /// The policy of the bus, which each peer but the bus itself gets its part of as it is added.
+    policy: Arc<Policy>,
 }
 
 impl Routing {
@@ -948,8 +1050,12 @@ impl Routing {
         Ok(())
     }
 
-    /// Add `peer` under `name`, along with the match rules that it has already.
-    fn insert_peer(&mut self, name: OwnedUniqueName, peer: Peer) {
+    /// Add `peer` under `name`, along with the match rules that it has already, and give it what
+    /// the policy has for it, unless it is the bus itself.
+    fn insert_peer(&mut self, name: OwnedUniqueName, mut peer: Peer) {
+        if !peer.is_bus() {
+            peer.set_policy(self.policy.for_peer(peer.user().uid(), peer.groups()));
+        }
         let rules = peer.match_rules().len();
         self.match_rule_counts.add(rules, rules);
         self.peers.insert(name, peer);
@@ -1037,6 +1143,16 @@ impl Drop for Connecting<'_> {
     }
 }
 
+/// How the bus reads its policy again: see [`Peers::set_reload`].
+#[derive(Clone)]
+struct Reload(Arc<dyn Fn() -> Result<Policy> + Send + Sync>);
+
+impl fmt::Debug for Reload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Reload")
+    }
+}
+
 /// What the bus does on its own, besides forwarding the messages of its peers.
 #[derive(Debug, Default)]
 struct Chores {
@@ -1053,6 +1169,69 @@ struct Chores {
     barriers_sent: u32,
     #[cfg(target_os = "linux")]
     barrier: u32,
+}
+
+/// Why the policy keeps the message of `facts` from going from `sender` to `receiver`, if it does:
+/// first the part of `receiver` is asked whether it may receive the message from `sender`, and then
+/// the part of `sender` whether it may send it to `receiver`, each by the names of the other in
+/// `name_registry`.
+///
+/// Where `sender` sends freely and `receiver` receives freely, as with the open policy, that is
+/// all there is to it: the facts of the message are only looked at otherwise.
+fn denial<'m, F>(
+    sender: &Peer,
+    receiver: &Peer,
+    facts: F,
+    name_registry: &NameRegistry,
+) -> Option<Rejection>
+where
+    F: FnOnce() -> Facts<'m>,
+{
+    if sender.policy().sends_freely() && receiver.policy().receives_freely() {
+        return None;
+    }
+    let facts = facts();
+    let sender_names = name_registry.names_of(sender.unique_name());
+    let receiver_names = name_registry.names_of(receiver.unique_name());
+    let (rejection, denied, action, preposition, other) =
+        if !receiver.policy().may_receive(&facts, sender_names) {
+            (
+                Rejection::ReceiveDenied,
+                receiver,
+                "receiving",
+                "from",
+                sender,
+            )
+        } else if !sender.policy().may_send(&facts, receiver_names) {
+            (Rejection::SendDenied, sender, "sending", "to", receiver)
+        } else {
+            return None;
+        };
+    let Facts {
+        msg_type,
+        path,
+        interface,
+        member,
+        broadcast,
+        ..
+    } = facts;
+    let (denied, other) = (denied.unique_name(), other.unique_name());
+    let [path, interface, member] = [path, interface, member].map(|value| value.unwrap_or("none"));
+    // A broadcast still goes to those that the policy lets have it, which is nothing for an
+    // administrator to look at.
+    if broadcast {
+        trace!(
+            "The policy denies `{denied}` {action} the {msg_type:?} (path {path}, interface \
+             {interface}, member {member}) {preposition} `{other}`"
+        );
+    } else {
+        warn!(
+            "The policy denies `{denied}` {action} the {msg_type:?} (path {path}, interface \
+             {interface}, member {member}) {preposition} `{other}`"
+        );
+    }
+
+    Some(rejection)
 }
 
 /// The `NoReply` error, from the bus, to the call of `caller` with `serial`, as dbus-broker sends
@@ -1087,6 +1266,10 @@ enum Rejection {
     NameHasNoOwner,
     /// The call has file descriptors, and the callee didn't negotiate passing them.
     UnexpectedFds,
+    /// The policy of the bus doesn't let the callee receive the call from the caller.
+    ReceiveDenied,
+    /// The policy of the bus doesn't let the caller send the call to the callee.
+    SendDenied,
 }
 
 impl Rejection {
@@ -1112,6 +1295,14 @@ impl Rejection {
             Self::UnexpectedFds => (
                 "org.freedesktop.DBus.Error.Failed",
                 "Peer does not support file descriptor passing.",
+            ),
+            Self::ReceiveDenied => (
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Receiver is not authorized to receive message",
+            ),
+            Self::SendDenied => (
+                "org.freedesktop.DBus.Error.AccessDenied",
+                "Sender is not authorized to send message",
             ),
         }
     }
