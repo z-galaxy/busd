@@ -10,7 +10,7 @@ use anyhow::{ensure, Context};
 use busd::{bus::Bus, peer::SEND_TIMEOUT, peers::Peers};
 use futures_util::{
     future::{join, select, Either},
-    TryStreamExt,
+    StreamExt, TryStreamExt,
 };
 use ntest::timeout;
 use rand::{
@@ -59,6 +59,43 @@ fn become_monitor() {
         });
 
         let ret = become_monitor_client(&address).await;
+        stop.notify(usize::MAX);
+        let bus = handle.await.unwrap();
+        bus.cleanup().await.unwrap();
+        ret.unwrap();
+    });
+}
+
+/// A name of a peer that becomes a monitor passes on to the peer that queued for it, and both the
+/// signal about its owner and the one to its new owner say so.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn name_of_a_monitor_passes_on() {
+    init_tracing();
+
+    zruntime::block_on(async {
+        let s = Alphanumeric.sample_string(&mut rng(), 10);
+        let path = temp_dir().join(s);
+        let address = format!("unix:path={}", path.display());
+        let mut bus = Bus::for_address(Some(&address)).await.unwrap();
+        let stop = Event::new();
+        let stopped = stop.listen();
+
+        let handle = zruntime::spawn(async move {
+            {
+                let running = pin!(bus.run());
+                match select(stopped, running).await {
+                    Either::Left(_) => (),
+                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
+                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
+                }
+            }
+
+            bus
+        });
+
+        let ret = name_of_a_monitor_passes_on_client(&address).await;
         stop.notify(usize::MAX);
         let bus = handle.await.unwrap();
         bus.cleanup().await.unwrap();
@@ -299,6 +336,60 @@ async fn become_monitor_client(address: &str) -> anyhow::Result<()> {
 
         num_received += 1;
     }
+
+    Ok(())
+}
+
+async fn name_of_a_monitor_passes_on_client(address: &str) -> anyhow::Result<()> {
+    let name = "org.z-galaxy.MonitorTest.Queued";
+    let owner = connection::Builder::address(address).build().await?;
+    let reply = DBusProxy::new(&owner)
+        .await?
+        .request_name(name.try_into()?, RequestNameFlags::empty())
+        .await?;
+    ensure!(reply == RequestNameReply::PrimaryOwner, "got {reply:?}");
+    let queued = connection::Builder::address(address).build().await?;
+    let queued_dbus = DBusProxy::builder(&queued)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?;
+    let reply = queued_dbus
+        .request_name(name.try_into()?, RequestNameFlags::empty())
+        .await?;
+    ensure!(reply == RequestNameReply::InQueue, "got {reply:?}");
+    let mut changes = queued_dbus.receive_name_owner_changed().await?;
+    let mut msgs = MessageStream::from(&queued);
+
+    MonitoringProxy::builder(&owner)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?
+        .become_monitor(&[], 0)
+        .await?;
+
+    let changed = changes.next().await.context("no signal")?;
+    let args = changed.args()?;
+    let owner_name = owner.unique_name().context("no unique name")?.as_str();
+    let queued_name = queued.unique_name().context("no unique name")?;
+    ensure!(
+        *args.name() == name
+            && args.old_owner().as_deref() == Some(owner_name)
+            && args.new_owner().as_deref() == Some(queued_name.as_str()),
+        "unexpected change of owner: {args:?}"
+    );
+    loop {
+        let msg = msgs.try_next().await?.context("no message")?;
+        let Some(acquired) = NameAcquired::from_message(msg) else {
+            continue;
+        };
+        ensure!(
+            *acquired.args()?.name() == name,
+            "`NameAcquired` of another name"
+        );
+        break;
+    }
+    let now = queued_dbus.get_name_owner(name.try_into()?).await?;
+    ensure!(now == *queued_name, "the owner is {now}");
 
     Ok(())
 }
