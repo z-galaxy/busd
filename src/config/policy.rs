@@ -6,18 +6,24 @@ use super::{
     xml::{PolicyContext, PolicyElement},
 };
 
+/// A `<policy>` element: its rules, and whom they apply to.
+///
+/// The configuration keeps its policies in the order of the file, rather than sorted by context,
+/// as the rank of a rule goes by its place in the file as well as by its context.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum Policy {
     /// `<policy at_console="true">` or `<policy at_console="false">`, after the `bool`: the rules
     /// for the peers of the users at the console, or for those of the other users.
     Console(Vec<Rule>, bool),
+    /// `<policy context="default">`: the rules for every peer.
     DefaultContext(Vec<Rule>),
+    /// `<policy group="...">`: the rules for the peers in the group so named.
     Group(Vec<Rule>, String),
+    /// `<policy context="mandatory">`: the rules for every peer, which outrank all others.
     MandatoryContext(Vec<Rule>),
+    /// `<policy user="...">`: the rules for the peers of the user so named.
     User(Vec<Rule>, String),
 }
-// TODO: implement Cmp/Ord to help stable-sort Policy values:
-// DefaultContext < Group < User < MandatoryContext
 
 pub type OptionalPolicy = Option<Policy>;
 
