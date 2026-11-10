@@ -3,6 +3,8 @@
 //!
 //! These are exported at the crate root (e.g. `busd::error!`) so both the library and the `busd`
 //! binary can use them without a hard dependency on `tracing`.
+//!
+//! [`tracing`]: https://docs.rs/tracing
 
 #[doc(hidden)]
 #[cfg(feature = "tracing")]

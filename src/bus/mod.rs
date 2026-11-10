@@ -109,7 +109,7 @@ impl Bus {
 
     /// Set how long the bus waits for a client to take a message, before it disconnects the client.
     ///
-    /// It is [`SEND_TIMEOUT`] unless set otherwise, or given to [`Bus::take_over`], and applies to
+    /// It is [`SEND_TIMEOUT`] unless set otherwise, or given to `Bus::take_over`, and applies to
     /// the clients that connect from then on.
     pub fn set_send_timeout(&mut self, timeout: Duration) {
         self.inner.send_timeout = timeout;
