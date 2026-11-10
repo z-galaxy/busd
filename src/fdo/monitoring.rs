@@ -5,7 +5,6 @@ use zbus::{
     fdo::{Error, Result},
     interface, message,
     object_server::{ResponseDispatchNotifier, SignalEmitter},
-    Optional,
 };
 use zruntime::spawn;
 
@@ -70,21 +69,10 @@ impl Monitoring {
                 .name_registry
                 .release_all(owner.clone())
                 .await;
+            // Notify each new owner, as when the previous owner disconnects.
             for changed in names_changes {
-                if let Err(e) = DBus::name_owner_changed(
-                    &ctxt,
-                    changed.name.clone().into(),
-                    Some(owner.clone()).into(),
-                    Optional::default(),
-                )
-                .await
-                {
+                if let Err(e) = peers.notify_name_changes(changed).await {
                     warn!("Failed to notify peers of name change: {}", e);
-                }
-
-                let ctxt = ctxt.clone().set_destination(owner.clone().into());
-                if let Err(e) = DBus::name_lost(&ctxt, changed.name.into()).await {
-                    warn!("Failed to send `NameLost` signal: {}", e);
                 }
             }
 

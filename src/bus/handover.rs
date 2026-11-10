@@ -240,16 +240,17 @@ pub(crate) struct MonitorState {
 }
 
 /// A well-known name, as the bus hands it over: its owner first, then those that queue for it, in
-/// order, each with whether it lets another take the name over from it.
+/// order, each with whether it lets another take the name over from it, and whether it doesn't
+/// queue for the name once that happens.
 #[derive(Debug, Deserialize, Serialize, Type)]
 pub(crate) struct NameState {
     pub(crate) name: OwnedWellKnownName,
-    pub(crate) owners: Vec<(OwnedUniqueName, bool)>,
+    pub(crate) owners: Vec<(OwnedUniqueName, bool, bool)>,
 }
 
 /// The version of the encoding of the state: an instance of the bus that encodes its state
 /// otherwise doesn't take over from this one, nor this one from it.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -278,7 +279,7 @@ mod tests {
             }],
             names: vec![NameState {
                 name: OwnedWellKnownName::try_from("org.zbus.Test").unwrap(),
-                owners: vec![(name(1), false), (name(2), true)],
+                owners: vec![(name(1), false, true), (name(2), true, false)],
             }],
         };
 
