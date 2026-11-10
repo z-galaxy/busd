@@ -225,6 +225,11 @@ impl Caller {
     pub fn new(unique_name: OwnedUniqueName, user: Arc<User>) -> Arc<Self> {
         Arc::new(Self { unique_name, user })
     }
+
+    /// The user of the peer.
+    pub fn user(&self) -> &User {
+        &self.user
+    }
 }
 
 /// Why the bus can't record a call as one that waits for its reply, and refuses the call.

@@ -367,7 +367,13 @@ impl DBus {
     }
 
     /// This method adds to or modifies that environment when activating services.
-    fn update_activation_environment(&self, _environment: HashMap<&str, &str>) -> Result<()> {
+    async fn update_activation_environment(
+        &self,
+        _environment: HashMap<&str, &str>,
+        #[zbus(header)] hdr: message::Header<'_>,
+    ) -> Result<()> {
+        let peers = self.peers()?;
+        super::ensure_privileged(&peers, &hdr).await?;
         // TODO: Implement when we support service activation.
         Err(Error::Failed(
             "Service activation not yet supported".to_string(),

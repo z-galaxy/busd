@@ -51,6 +51,8 @@ pub struct Peers {
     bus_conn: Mutex<Option<Connection>>,
     /// The users of the peers, and of the bus itself.
     users: Users,
+    /// The uid of the user that the bus itself runs as.
+    uid: u32,
     /// What the bus does on its own, besides forwarding the messages of its peers.
     chores: Mutex<Chores>,
     /// Notified on each change of `chores`.
@@ -70,6 +72,7 @@ impl Peers {
             routing: RwLock::new(Routing::default()),
             bus_conn: Mutex::new(None),
             users: Users::new(MAX_OBJECTS),
+            uid: rustix::process::getuid().as_raw(),
             chores: Mutex::new(Chores::default()),
             chores_changed: Event::new(),
             #[cfg(target_os = "linux")]
@@ -148,7 +151,7 @@ impl Peers {
     ) -> Result<()> {
         *self.bus_conn() = Some(conn);
         // The user of the process of the bus, as with dbus-broker.
-        let user = self.users.user(rustix::process::getuid().as_raw());
+        let user = self.users.user(self.uid);
         let (peer, peer_stream) = Peer::new_us(msg_stream, user).await?;
 
         self.insert(&mut *self.routing_mut().await, peer, peer_stream);
@@ -173,6 +176,15 @@ impl Peers {
     /// What the bus routes messages by, to change.
     pub async fn routing_mut(&self) -> impl DerefMut<Target = Routing> + '_ {
         self.routing.write().await
+    }
+
+    /// Whether the peer `name` is privileged: of root, or of the user that the bus itself runs as,
+    /// as dbus-broker has it. Nothing if the bus has no such peer.
+    pub async fn privileged(&self, name: &UniqueName<'_>) -> Option<bool> {
+        let routing = self.routing().await;
+        let uid = routing.peers.get(name.as_str())?.user().uid();
+
+        Some(uid == 0 || uid == self.uid)
     }
 
     pub async fn make_monitor(
