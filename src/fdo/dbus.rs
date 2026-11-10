@@ -58,6 +58,19 @@ impl DBus {
             // Can it happen in any other situation than the bus shutting down?
             .ok_or_else(|| Error::Failed("Bus shutting down.".to_string()))
     }
+
+    /// Fails for the name of the bus itself, which no client may ask for or let go of, as with
+    /// dbus-broker and the reference implementation.
+    fn ensure_not_reserved(name: &WellKnownName<'_>) -> Result<()> {
+        if name == super::BUS_NAME {
+            return Err(Error::InvalidArgs(format!(
+                "{} is a reserved name",
+                super::BUS_NAME
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 // The bus answers the calls one at a time, in the order that they come in, rather than in a task of
@@ -133,6 +146,7 @@ impl DBus {
         flags: RequestNameFlags,
         #[zbus(header)] hdr: message::Header<'_>,
     ) -> Result<RequestNameReply> {
+        Self::ensure_not_reserved(&name)?;
         let unique_name = msg_sender(&hdr);
         let peers = self.peers()?;
         let (reply, name_owner_changed) = peers
@@ -157,6 +171,7 @@ impl DBus {
         name: WellKnownName<'_>,
         #[zbus(header)] hdr: message::Header<'_>,
     ) -> Result<ReleaseNameReply> {
+        Self::ensure_not_reserved(&name)?;
         let unique_name = msg_sender(&hdr);
         let peers = self.peers()?;
         let (reply, name_owner_changed) = peers

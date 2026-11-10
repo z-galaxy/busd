@@ -42,6 +42,22 @@ fn name_ownership_changes() {
     });
 }
 
+/// A client can neither ask for nor release the name of the bus itself: the bus refuses both with
+/// `InvalidArgs`, goes on owning the name, and sends no signal about it.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn reserved_name() {
+    init_tracing();
+
+    zruntime::block_on(async {
+        let s = Alphanumeric.sample_string(&mut rng(), 10);
+        let path = temp_dir().join(s);
+        let address = format!("unix:path={}", path.display());
+        with_bus(&address, reserved_name_client).await;
+    });
+}
+
 /// Every method of the bus, among many other calls to the bus that a client sends at once, gets its
 /// reply, whether it asks about the bus itself, the client or another one, as do the other calls,
 /// and the bus goes on serving everyone, a client that becomes a monitor meanwhile included.
@@ -295,6 +311,71 @@ async fn name_ownership_changes_client(address: String) -> anyhow::Result<()> {
             panic!("unexpected name owner changed signal");
         }
     }
+
+    Ok(())
+}
+
+#[instrument]
+async fn reserved_name_client(address: String) -> anyhow::Result<()> {
+    let conn = connection::Builder::address(address.as_str())
+        .build()
+        .await?;
+    let conn_unique_name = conn.unique_name().unwrap().to_owned();
+    let dbus_proxy = DBusProxy::builder(&conn)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?;
+    let reserved: WellKnownName = BUS_NAME.try_into()?;
+
+    let mut name_changed_stream = dbus_proxy.receive_name_owner_changed().await?;
+
+    for flags in [
+        RequestNameFlags::empty(),
+        RequestNameFlags::REPLACE_EXISTING | RequestNameFlags::DO_NOT_QUEUE,
+    ] {
+        let ret = dbus_proxy.request_name(reserved.clone(), flags).await;
+        ensure!(
+            matches!(ret, Err(fdo::Error::InvalidArgs(_))),
+            "expected `InvalidArgs` for requesting the name of the bus with {flags:?}, got {ret:?}"
+        );
+    }
+    let ret = dbus_proxy.release_name(reserved.clone()).await;
+    ensure!(
+        matches!(ret, Err(fdo::Error::InvalidArgs(_))),
+        "expected `InvalidArgs` for releasing the name of the bus, got {ret:?}"
+    );
+
+    let names = dbus_proxy.list_names().await?;
+    let count = names.iter().filter(|&name| *name == BUS_NAME).count();
+    ensure!(
+        count == 1,
+        "expected the name of the bus once in the list of names, got {count} times"
+    );
+    let owner = dbus_proxy.get_name_owner(reserved.clone().into()).await?;
+    ensure!(
+        owner == BUS_NAME,
+        "expected the bus to own its name still, got {owner}"
+    );
+
+    // The signals come in the order the bus sent them, so the one about an ordinary name that
+    // we ask for next must be the first about a well-known name.
+    let ordinary: WellKnownName = "org.zbus.Reserved".try_into()?;
+    let ret = dbus_proxy
+        .request_name(ordinary.clone(), RequestNameFlags::empty())
+        .await?;
+    ensure!(
+        ret == RequestNameReply::PrimaryOwner,
+        "expected to become primary owner"
+    );
+    let mut changed = name_changed_stream.next().await.unwrap();
+    if *changed.args()?.name() == *conn_unique_name {
+        changed = name_changed_stream.next().await.unwrap();
+    }
+    ensure!(
+        *changed.args()?.name() == ordinary,
+        "expected the first name owner changed signal to be about our name, got {:?}",
+        changed.args()?.name()
+    );
 
     Ok(())
 }
