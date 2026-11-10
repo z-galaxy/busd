@@ -415,8 +415,7 @@ impl DBus {
     /// property either, because they do not indicate features of the message bus implementation.
     #[zbus(property)]
     fn interfaces(&self) -> &[InterfaceName<'_>] {
-        // TODO: List `org.freedesktop.DBus.Monitoring` when we support it.
-        &[]
+        &INTERFACES
     }
 
     /// This signal indicates that the owner of a name has changed.
@@ -438,3 +437,9 @@ impl DBus {
     #[zbus(signal)]
     pub async fn name_acquired(emitter: &SignalEmitter<'_>, name: BusName<'_>) -> zbus::Result<()>;
 }
+
+/// The interfaces of the `/org/freedesktop/DBus` object that the `Interfaces` property lists, which
+/// leave out the interfaces that every bus has, as the specification says.
+static INTERFACES: [InterfaceName<'static>; 1] = [InterfaceName::from_static_str_unchecked(
+    super::Monitoring::INTERFACE,
+)];

@@ -61,6 +61,21 @@ fn every_call_to_the_bus_among_calls() {
     });
 }
 
+/// The `Interfaces` property of the bus lists the `org.freedesktop.DBus.Monitoring` interface and
+/// nothing else, every interface it lists is one that the bus introspects, and `Features` is empty.
+#[test]
+#[timeout(30000)]
+fn properties() {
+    init_tracing();
+
+    zruntime::block_on(async {
+        let s = Alphanumeric.sample_string(&mut rng(), 10);
+        let path = temp_dir().join(s);
+        let address = format!("unix:path={}", path.display());
+        with_bus(&address, properties_client).await;
+    });
+}
+
 /// Run `test` against a bus at `address`.
 async fn with_bus<F, T>(address: &str, test: F)
 where
@@ -369,6 +384,38 @@ async fn every_call_to_the_bus_among_calls_client(address: String) -> anyhow::Re
         .await?
         .get_id()
         .await?;
+
+    Ok(())
+}
+
+async fn properties_client(address: String) -> anyhow::Result<()> {
+    let conn = connect(&address).await?;
+    let proxy = DBusProxy::builder(&conn)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?;
+    let interfaces = proxy.interfaces().await?;
+    let names: Vec<&str> = interfaces.iter().map(|name| name.as_str()).collect();
+    ensure!(
+        names == ["org.freedesktop.DBus.Monitoring"],
+        "unexpected interfaces: {names:?}"
+    );
+    let features = proxy.features().await?;
+    ensure!(features.is_empty(), "unexpected features: {features:?}");
+
+    let xml = fdo::IntrospectableProxy::builder(&conn)
+        .destination(BUS_NAME)
+        .path(PATH)
+        .build()
+        .await?
+        .introspect()
+        .await?;
+    for name in names {
+        ensure!(
+            xml.contains(&format!("<interface name=\"{name}\">")),
+            "the bus does not introspect `{name}`: {xml}"
+        );
+    }
 
     Ok(())
 }
