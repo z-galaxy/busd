@@ -6,9 +6,16 @@ use std::{
     os::fd::FromRawFd,
     path::{Path, PathBuf},
     pin::pin,
+    sync::Arc,
 };
 
-use busd::{bus, config::Config, error, info, warn};
+use busd::{
+    bus,
+    config::Config,
+    error, info,
+    policy::{Ids, Policy},
+    warn,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -95,6 +102,14 @@ async fn run(
         config.listen.as_ref().map(ToString::to_string)
     };
 
+    // The names of the users and groups of the policy are looked up here, once, before the bus
+    // serves anyone, as the lookup reads files.
+    let policy = Arc::new(Policy::new(
+        &config,
+        &Ids::read(),
+        rustix::process::getuid().as_raw(),
+    ));
+
     // SIGTERM is what service managers, such as systemd, and `kill` send to stop a service. Taking
     // the signals over before the bus listens, and so before anyone can tell that it's ready, has
     // the bus clean up however soon one of them comes.
@@ -113,11 +128,15 @@ async fn run(
         None
     });
     // Under systemd, the bus takes over from its previous instance, or listens on the socket of the
-    // socket activation, if systemd passes either.
+    // socket activation, if systemd passes either. The clients that it takes over go by the policy
+    // from the start.
     #[cfg(target_os = "linux")]
-    let mut bus = bus::Bus::for_systemd(passed, store.as_mut(), address.as_deref()).await?;
+    let mut bus = bus::Bus::for_systemd(passed, store.as_mut(), address.as_deref(), policy).await?;
     #[cfg(not(target_os = "linux"))]
     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
+    // The bus has no clients yet.
+    #[cfg(not(target_os = "linux"))]
+    bus.set_policy(policy).await;
 
     if let Some(fd) = args.ready_fd {
         // SAFETY: We don't have any way to know if the fd is valid or not. The parent process is

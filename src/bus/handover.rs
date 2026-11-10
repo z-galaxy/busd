@@ -4,6 +4,7 @@
 use std::{
     collections::HashMap,
     os::fd::{AsFd, OwnedFd},
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,7 +19,7 @@ use zbus::{
 };
 
 use super::Bus;
-use crate::{info, match_rules::MatchRules};
+use crate::{info, match_rules::MatchRules, policy::Policy};
 
 impl Bus {
     /// Stop the bus where its next instance can take over from it, and hand it over.
@@ -88,14 +89,17 @@ impl Bus {
     ///
     /// The bus gives each client `send_timeout` to take a message, as [`Bus::set_send_timeout`]
     /// sets it, the clients of `handover` included, from the start: the bus writes each of those
-    /// what the previous instance left unwritten as soon as it serves them, within that time. Its
-    /// other settings, such as [`Bus::set_max_objects_per_user`], are those of a new bus, and apply
-    /// to the clients that it took over too, once set on the returned bus. The objects that it took
-    /// over count, even beyond a maximum that is lower than the previous one.
+    /// what the previous instance left unwritten as soon as it serves them, within that time. It
+    /// goes by `policy` from the start too, as [`Bus::set_policy`] sets it, so that the policy has
+    /// its say on the first message of each client of `handover`. Its other settings, such as
+    /// [`Bus::set_max_objects_per_user`], are those of a new bus, and apply to the clients that it
+    /// took over too, once set on the returned bus. The objects that it took over count, even
+    /// beyond a maximum that is lower than the previous one.
     pub async fn take_over(
         handover: Handover,
         listener: Option<OwnedFd>,
         send_timeout: Duration,
+        policy: Arc<Policy>,
     ) -> Result<Self> {
         let state = handover.state;
         let (listener, bound) = match (listener, handover.listener) {
@@ -109,6 +113,8 @@ impl Bus {
         let mut bus = Self::new(listener, address, guid, bound).await?;
         bus.inner.next_id = usize::try_from(state.last_id)?;
         bus.set_send_timeout(send_timeout);
+        // Before the bus has the clients of the hand-over, which it serves as soon as it has them.
+        bus.set_policy(policy).await;
         let clients: HashMap<_, _> = handover
             .clients
             .into_iter()

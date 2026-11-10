@@ -361,6 +361,14 @@ impl PeerPolicy {
     }
 }
 
+/// The policy of a peer that the bus has not given its own yet: it may own, send and receive
+/// nothing.
+impl Default for PeerPolicy {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
 /// What the policy looks at in a message.
 #[derive(Clone, Copy, Debug)]
 pub struct Facts<'m> {
@@ -870,6 +878,18 @@ mod tests {
         assert!(peer.may_own("org.freedesktop.DBus"));
         assert!(peer.may_send(&call(), &names(&["org.example.Service"])));
         assert!(peer.may_receive(&signal(), &[]));
+    }
+
+    /// The default policy of a peer denies everything.
+    #[test]
+    fn the_default_peer_policy_denies_everything() {
+        let peer = PeerPolicy::default();
+
+        assert!(!peer.sends_freely());
+        assert!(!peer.receives_freely());
+        assert!(!peer.may_own("org.example.Service"));
+        assert!(!peer.may_send(&call(), &names(&["org.example.Service"])));
+        assert!(!peer.may_receive(&signal(), &[]));
     }
 
     /// Where no rule matches, the answer is deny.

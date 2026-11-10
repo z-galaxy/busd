@@ -25,9 +25,9 @@ than other D-Bus brokers.
 ## Status
 
 Alpha. The essentials are in place, but busd is not ready for production use yet. It is meant to
-serve as a system bus as well as a session bus, but until it enforces the [policies] of its
-configuration, it can only serve as a session bus, and it doesn't start services on demand
-([service activation]) yet. The [feature parity] issues track what else it lacks.
+serve as a system bus as well as a session bus, and it enforces the [policies] of its
+configuration. What it still lacks to serve as a system bus is tracked by the [feature parity]
+issues, starting services on demand ([service activation]) among them.
 
 ## Performance
 
@@ -233,6 +233,6 @@ addition of [peer credentials] to every message, which can avoid round trips on 
 [peer credentials]: https://github.com/z-galaxy/busd/issues/29
 [dbus-broker]: https://github.com/bus1/dbus-broker
 [dbus-daemon]: https://gitlab.freedesktop.org/dbus/dbus
-[policies]: https://github.com/z-galaxy/busd/issues/79
+[policies]: https://dbus.freedesktop.org/doc/dbus-daemon.1.html#configuration_file
 [service activation]: https://github.com/z-galaxy/busd/issues/82
 [feature parity]: https://github.com/z-galaxy/busd/labels/feature%20parity

@@ -133,12 +133,29 @@ impl DBus {
         Self::ensure_not_reserved(&name)?;
         let unique_name = msg_sender(&hdr);
         let peers = self.peers()?;
-        let (reply, name_owner_changed) = peers
-            .routing_mut()
-            .await
-            .name_registry
-            .request_name(name, unique_name.clone(), flags)
-            .await;
+        let (reply, name_owner_changed) = {
+            let mut routing = peers.routing_mut().await;
+            let peer = routing
+                .peers
+                .get(unique_name.as_str())
+                .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {unique_name}")))?;
+            if !peer.policy().may_own(&name) {
+                warn!(
+                    "Refusing `{name}` to `{unique_name}`, as the policy does not let it own the \
+                     name"
+                );
+
+                return Err(Error::AccessDenied(
+                    "Request to own name refused by policy".to_string(),
+                ));
+            }
+
+            routing
+                .name_registry
+                .request_name(name, unique_name.clone(), flags)
+                .await
+        };
+        // The signals go out once the lock of the routing is let go of.
         if let Some(changed) = name_owner_changed {
             peers
                 .notify_name_changes(changed)

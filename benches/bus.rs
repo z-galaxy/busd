@@ -54,7 +54,7 @@ use std::{
     pin::pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc,
+        mpsc, Arc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -766,7 +766,8 @@ impl RestartingBus {
                     // activation.
                     Some(systemd) => {
                         let passed = Passed::new(systemd.passed(Vec::new()));
-                        Bus::for_systemd(passed, store.as_mut(), Some(&bus_address)).await
+                        Bus::for_systemd(passed, store.as_mut(), Some(&bus_address), Arc::default())
+                            .await
                     }
                 };
                 let mut bus = bus.expect("a bus");
@@ -853,7 +854,7 @@ impl Drop for RestartingBus {
 async fn restart_in_process(bus: Bus) -> Bus {
     let handover = bus.hand_over().await.expect("the bus hands over");
 
-    Bus::take_over(handover, None, SEND_TIMEOUT)
+    Bus::take_over(handover, None, SEND_TIMEOUT, Arc::default())
         .await
         .expect("the next instance takes over")
 }
@@ -873,7 +874,7 @@ async fn restart_through(
         .expect("the bus hands over");
     let passed = Passed::new(systemd.passed(systemd.stored()));
     let mut store = systemd.store();
-    let bus = Bus::for_systemd(passed, Some(&mut store), Some(address))
+    let bus = Bus::for_systemd(passed, Some(&mut store), Some(address), Arc::default())
         .await
         .expect("the next instance starts");
 

@@ -35,6 +35,7 @@ use crate::{
     fdo::{self, DBus, Monitoring, Stats},
     peer::SEND_TIMEOUT,
     peers::Peers,
+    policy::Policy,
 };
 
 /// The bus.
@@ -125,6 +126,16 @@ impl Bus {
     /// [`MAX_OBJECTS`]: crate::user::MAX_OBJECTS
     pub fn set_max_objects_per_user(&mut self, max: usize) {
         self.inner.peers.users().set_max_objects(max);
+    }
+
+    /// Set the policy that the bus goes by: who may connect, own which names, and send and receive
+    /// which messages.
+    ///
+    /// It is the open policy of [`Policy::default`] unless set otherwise, or given to
+    /// `Bus::take_over`, and applies to the clients that connect from then on, and to those that
+    /// the bus has.
+    pub async fn set_policy(&mut self, policy: Arc<Policy>) {
+        self.inner.peers.set_policy(policy).await;
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -312,10 +323,18 @@ impl Bus {
                 // The client is an object of its user from the start, before its handshake, so
                 // its user is the one that its socket tells, as zbus looks it up for a connection
                 // over the socket, for a client in another PID namespace too.
-                let uid = ConnectionCredentials::of_peer(&stream)
-                    .await?
-                    .unix_user_id()
-                    .context("The client has no user")?;
+                let creds = ConnectionCredentials::of_peer(&stream).await?;
+                let uid = creds.unix_user_id().context("The client has no user")?;
+                let gids = creds.unix_group_ids().map_or(&[][..], Vec::as_slice);
+                // Dropping the stream closes the connection.
+                if !inner.peers.may_connect(uid, gids).await {
+                    warn!(
+                        "Refusing a client of the user {uid}, as the policy does not let it \
+                         connect"
+                    );
+
+                    return Ok(());
+                }
                 let builder = connection::Builder::unix_stream(stream);
 
                 inner

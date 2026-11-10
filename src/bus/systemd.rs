@@ -60,7 +60,7 @@
 //!
 //! [zoter]: https://github.com/z-galaxy/zoter
 
-use std::{os::fd::OwnedFd, time::Duration};
+use std::{os::fd::OwnedFd, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use zbus::connection;
@@ -68,7 +68,7 @@ use zoter::{Passed, Restored, Store};
 use zruntime::SharedRuntime;
 
 use super::{handover::State, Bus, ClientHandover, Handover};
-use crate::{debug, error, info, peer::SEND_TIMEOUT, warn};
+use crate::{debug, error, info, peer::SEND_TIMEOUT, policy::Policy, warn};
 
 impl Bus {
     /// Create a bus that systemd runs, out of the FDs that systemd passed, `passed`, and the store
@@ -84,10 +84,14 @@ impl Bus {
     /// this fails if systemd passed more than one listening socket of socket activation. What was
     /// stored is removed from the store first, so that whatever comes of it, the instances that
     /// come after don't find it again.
+    ///
+    /// The bus goes by `policy`, as [`Bus::set_policy`] sets it, and the clients that it takes over
+    /// do from the start, as with [`Bus::take_over`].
     pub async fn for_systemd(
         mut passed: Passed,
         store: Option<&mut Store>,
         address: Option<&str>,
+        policy: Arc<Policy>,
     ) -> Result<Self> {
         let restored = match store {
             Some(store) => store.take_over(&mut passed).unwrap_or_else(|e| {
@@ -106,21 +110,27 @@ impl Bus {
                 None
             }
         };
-        let Some(activation) = Self::take_activation(passed)? else {
-            if restored.is_some() {
-                warn!(
-                    "Dropping what the previous instance of the bus handed over, which disconnects \
-                     its clients, as systemd passed no socket of socket activation to take over on"
-                );
+        let mut bus = match (Self::take_activation(passed)?, restored) {
+            (None, restored) => {
+                if restored.is_some() {
+                    warn!(
+                        "Dropping what the previous instance of the bus handed over, which \
+                         disconnects its clients, as systemd passed no socket of socket \
+                         activation to take over on"
+                    );
+                }
+
+                Self::for_address(address).await?
             }
-
-            return Self::for_address(address).await;
+            (Some(activation), None) => Self::for_listener(activation).await?,
+            (Some(activation), Some(restored)) => {
+                Self::out_of_restored(restored, activation, policy.clone()).await?
+            }
         };
-        let Some(restored) = restored else {
-            return Self::for_listener(activation).await;
-        };
+        // A bus that took over goes by the policy already, and any other has no clients yet.
+        bus.set_policy(policy).await;
 
-        Self::out_of_restored(restored, activation).await
+        Ok(bus)
     }
 
     /// Hand the bus over to its next instance, through `store`, the store of systemd, if the bus
@@ -215,10 +225,15 @@ impl Bus {
     }
 
     /// The next instance of the bus that handed `restored` over, on `activation`, the listening
-    /// socket of the socket activation.
+    /// socket of the socket activation, whose clients go by `policy` from the start.
     ///
-    /// If taking over fails, it is a bus on `activation`, as [`Bus::for_listener`] creates.
-    async fn out_of_restored(restored: Restored, activation: OwnedFd) -> Result<Self> {
+    /// If taking over fails, it is a bus on `activation`, as [`Bus::for_listener`] creates, which
+    /// `policy` is yet to be set on.
+    async fn out_of_restored(
+        restored: Restored,
+        activation: OwnedFd,
+        policy: Arc<Policy>,
+    ) -> Result<Self> {
         let handover = match Handover::from_restored(restored) {
             Ok(handover) => handover,
             Err(e) => {
@@ -232,7 +247,7 @@ impl Bus {
         };
         let clients = handover.clients.len();
         let fallback = activation.try_clone()?;
-        match Self::take_over(handover, Some(activation), SEND_TIMEOUT).await {
+        match Self::take_over(handover, Some(activation), SEND_TIMEOUT, policy).await {
             Ok(bus) => {
                 info!("Took {clients} clients over from the previous instance of the bus.");
 
