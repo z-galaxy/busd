@@ -204,7 +204,11 @@ impl Peers {
                     name: name.clone(),
                     owners: iter::once(entry.owner())
                         .chain(entry.waiting_list())
-                        .map(|owner| (owner.unique_name().clone(), owner.allow_replacement()))
+                        .map(|owner| {
+                            let name = owner.unique_name().clone();
+
+                            (name, owner.allow_replacement(), owner.do_not_queue())
+                        })
                         .collect(),
                 })
                 .collect()
@@ -339,7 +343,9 @@ impl Peers {
             for NameState { name, owners } in names {
                 let mut owners = owners
                     .into_iter()
-                    .map(|(unique_name, replace)| NameOwner::new(unique_name, replace));
+                    .map(|(unique_name, replace, do_not_queue)| {
+                        NameOwner::new(unique_name, replace, do_not_queue)
+                    });
                 let owner = owners.next().context("A name with no owner")?;
                 routing.name_registry.insert(name, owner, owners);
             }

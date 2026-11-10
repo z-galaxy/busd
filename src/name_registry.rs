@@ -67,15 +67,18 @@ impl NameEntry {
 pub struct NameOwner {
     unique_name: OwnedUniqueName,
     allow_replacement: bool,
+    do_not_queue: bool,
 }
 
 impl NameOwner {
     /// An owner of a name, or one that queues for it, which lets another take the name over from
-    /// it if `allow_replacement`.
-    pub fn new(unique_name: OwnedUniqueName, allow_replacement: bool) -> Self {
+    /// it if `allow_replacement`, and doesn't queue for the name once that happens if
+    /// `do_not_queue`.
+    pub fn new(unique_name: OwnedUniqueName, allow_replacement: bool, do_not_queue: bool) -> Self {
         Self {
             unique_name,
             allow_replacement,
+            do_not_queue,
         }
     }
 
@@ -86,6 +89,11 @@ impl NameOwner {
     /// Whether the owner lets another take the name over from it.
     pub fn allow_replacement(&self) -> bool {
         self.allow_replacement
+    }
+
+    /// Whether the owner doesn't queue for the name once another takes it over from it.
+    pub fn do_not_queue(&self) -> bool {
+        self.do_not_queue
     }
 }
 
@@ -108,21 +116,33 @@ impl NameRegistry {
         match self.names.get_mut(&*name) {
             Some(entry) => {
                 if entry.owner.unique_name == unique_name {
+                    // The flags of an owner are those of its last request.
+                    entry.owner.allow_replacement =
+                        flags.contains(RequestNameFlags::ALLOW_REPLACEMENT);
+                    entry.owner.do_not_queue = flags.contains(RequestNameFlags::DO_NOT_QUEUE);
+
                     (RequestNameReply::AlreadyOwner, None)
                 } else if flags.contains(RequestNameFlags::REPLACE_EXISTING)
                     && entry.owner.allow_replacement
                 {
-                    let old_owner = entry.owner.unique_name.clone();
                     let unique_name = OwnedUniqueName::from(unique_name.clone());
-                    entry.owner = NameOwner {
-                        unique_name: unique_name.clone(),
-                        allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
-                    };
+                    let new_owner = NameOwner::new(
+                        unique_name.clone(),
+                        flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
+                        flags.contains(RequestNameFlags::DO_NOT_QUEUE),
+                    );
+                    let replaced = std::mem::replace(&mut entry.owner, new_owner);
+                    let old_owner = replaced.unique_name.clone();
                     // It has the name now, so it queues for it no more: left in the queue, it
                     // would get the name again later, even once it is gone.
                     entry
                         .waiting_list
                         .retain(|waiting| waiting.unique_name != unique_name);
+                    // The one that it took the name from is first in line to get it back, unless
+                    // it asked not to queue.
+                    if !replaced.do_not_queue {
+                        entry.waiting_list.push_front(replaced);
+                    }
                     self.note_lost(&old_owner);
                     self.note_gained(&unique_name);
                     self.index(&old_owner, &name);
@@ -147,10 +167,11 @@ impl NameRegistry {
                         .find(|waiting| waiting.unique_name == unique_name);
                     match queued {
                         Some(queued) => queued.allow_replacement = allow_replacement,
-                        None => entry.waiting_list.push_back(NameOwner {
-                            unique_name: OwnedUniqueName::from(unique_name.clone()),
+                        None => entry.waiting_list.push_back(NameOwner::new(
+                            OwnedUniqueName::from(unique_name.clone()),
                             allow_replacement,
-                        }),
+                            false,
+                        )),
                     }
                     self.index(&unique_name, &name);
 
@@ -162,10 +183,11 @@ impl NameRegistry {
             None => {
                 let unique_name = OwnedUniqueName::from(unique_name.clone());
                 let name = OwnedWellKnownName::from(name);
-                let owner = NameOwner {
-                    unique_name: unique_name.clone(),
-                    allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
-                };
+                let owner = NameOwner::new(
+                    unique_name.clone(),
+                    flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
+                    flags.contains(RequestNameFlags::DO_NOT_QUEUE),
+                );
 
                 self.names.insert(
                     name.clone(),
@@ -580,7 +602,7 @@ mod tests {
     #[test]
     fn peaks_of_names_inserted() {
         let mut registry = NameRegistry::default();
-        let owner = |name: &str| NameOwner::new(name.try_into().unwrap(), false);
+        let owner = |name: &str| NameOwner::new(name.try_into().unwrap(), false, false);
         for (name, owner_name) in [
             ("org.busd.One", ":busd.1"),
             ("org.busd.Two", ":busd.1"),
@@ -659,6 +681,61 @@ mod tests {
             );
             let owned = registry.owned_by(":busd.2");
             assert_eq!((owned.now, owned.peak), (0, 1));
+        });
+    }
+
+    /// The owner that a name is taken over from is first in line to get it back, ahead of those
+    /// that queued before, unless it asked not to queue.
+    #[test]
+    fn a_replaced_owner_queues_for_its_name() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            let replaceable = RequestNameFlags::ALLOW_REPLACEMENT;
+            let replace = RequestNameFlags::REPLACE_EXISTING;
+            request(&mut registry, "org.busd.One", ":busd.1", replaceable).await;
+            request(&mut registry, "org.busd.One", ":busd.3", replaceable).await;
+            let (reply, changed) = request(&mut registry, "org.busd.One", ":busd.2", replace).await;
+            assert_eq!(reply, RequestNameReply::PrimaryOwner);
+            let changed = changed.unwrap();
+            assert_eq!(changed.old_owner.unwrap(), ":busd.1");
+            assert_eq!(queue(&registry, "org.busd.One"), [":busd.1", ":busd.3"]);
+
+            let name = WellKnownName::try_from("org.busd.One").unwrap();
+            let owner = UniqueName::try_from(":busd.2").unwrap();
+            let (_, changed) = registry.release_name(name.clone(), owner).await;
+            assert_eq!(changed.unwrap().new_owner.unwrap(), ":busd.1");
+            // It queued as it asked for the name, so it lets another take the name over still.
+            let (reply, _) = request(&mut registry, "org.busd.One", ":busd.2", replace).await;
+            assert_eq!(reply, RequestNameReply::PrimaryOwner);
+
+            let unqueued = replaceable | RequestNameFlags::DO_NOT_QUEUE;
+            request(&mut registry, "org.busd.Two", ":busd.1", unqueued).await;
+            request(&mut registry, "org.busd.Two", ":busd.2", replace).await;
+            assert_eq!(queue(&registry, "org.busd.Two"), [""; 0]);
+        });
+    }
+
+    /// The flags of an owner are those of its last request for the name: one that asks again
+    /// changes whether it queues once another takes the name over, and whether another may.
+    #[test]
+    fn an_owner_that_asks_again_changes_its_flags() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            let replaceable = RequestNameFlags::ALLOW_REPLACEMENT;
+            let replace = RequestNameFlags::REPLACE_EXISTING;
+            let unqueued = replaceable | RequestNameFlags::DO_NOT_QUEUE;
+            request(&mut registry, "org.busd.One", ":busd.1", replaceable).await;
+            let (reply, _) = request(&mut registry, "org.busd.One", ":busd.1", unqueued).await;
+            assert_eq!(reply, RequestNameReply::AlreadyOwner);
+            request(&mut registry, "org.busd.One", ":busd.2", replace).await;
+            assert_eq!(queue(&registry, "org.busd.One"), [""; 0]);
+
+            // The new owner asked without `ALLOW_REPLACEMENT`, and then asks again with it.
+            let (reply, _) = request(&mut registry, "org.busd.One", ":busd.1", replace).await;
+            assert_eq!(reply, RequestNameReply::InQueue);
+            request(&mut registry, "org.busd.One", ":busd.2", replaceable).await;
+            let (reply, _) = request(&mut registry, "org.busd.One", ":busd.1", replace).await;
+            assert_eq!(reply, RequestNameReply::PrimaryOwner);
         });
     }
 
@@ -742,23 +819,27 @@ mod tests {
         });
     }
 
-    /// A name that another peer takes over is a name of that peer, and no more one of its owner.
+    /// A name that another peer takes over is a name of that peer. It stays one of the peer that
+    /// had it, which queues for it, unless that peer asked not to queue.
     #[test]
     fn names_of_peers_after_a_name_is_taken_over() {
         zruntime::block_on(async {
             let mut registry = NameRegistry::default();
             let replaceable = RequestNameFlags::ALLOW_REPLACEMENT;
+            let replace = RequestNameFlags::REPLACE_EXISTING;
             request(&mut registry, "org.busd.One", ":busd.1", replaceable).await;
-            request(
-                &mut registry,
-                "org.busd.One",
-                ":busd.2",
-                RequestNameFlags::REPLACE_EXISTING,
-            )
-            .await;
-
-            assert!(registry.names_of(":busd.1").is_empty());
+            request(&mut registry, "org.busd.One", ":busd.2", replace).await;
+            assert_eq!(names_of(&registry, ":busd.1"), ["org.busd.One"]);
             assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.One"]);
+
+            let unqueued = replaceable | RequestNameFlags::DO_NOT_QUEUE;
+            request(&mut registry, "org.busd.Two", ":busd.1", unqueued).await;
+            request(&mut registry, "org.busd.Two", ":busd.2", replace).await;
+            assert_eq!(names_of(&registry, ":busd.1"), ["org.busd.One"]);
+            assert_eq!(
+                names_of(&registry, ":busd.2"),
+                ["org.busd.One", "org.busd.Two"]
+            );
         });
     }
 
@@ -814,7 +895,7 @@ mod tests {
     #[test]
     fn names_of_peers_after_names_are_inserted() {
         let mut registry = NameRegistry::default();
-        let owner = |name: &str| NameOwner::new(name.try_into().unwrap(), false);
+        let owner = |name: &str| NameOwner::new(name.try_into().unwrap(), false, false);
         registry.insert(
             "org.busd.One".try_into().unwrap(),
             owner(":busd.1"),
@@ -843,7 +924,7 @@ mod tests {
             release(&mut registry, "org.busd.One", fdo::BUS_NAME).await;
             registry.insert(
                 "org.busd.Two".try_into().unwrap(),
-                NameOwner::new(fdo::BUS_NAME.try_into().unwrap(), false),
+                NameOwner::new(fdo::BUS_NAME.try_into().unwrap(), false, false),
                 [],
             );
             release(&mut registry, "org.busd.Two", fdo::BUS_NAME).await;
