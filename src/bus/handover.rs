@@ -13,7 +13,7 @@ use zbus::{
     address::Transport,
     connection,
     names::{OwnedUniqueName, OwnedWellKnownName},
-    wire::{serialized, serialized_size, to_bytes, LE},
+    wire::{serialized, to_bytes, LE},
     Address, OwnedGuid, Type,
 };
 
@@ -187,42 +187,6 @@ pub(crate) struct State {
 }
 
 impl State {
-    /// Where the bus stored what it hands over of the connection of each client, as
-    /// [`PeerState::stored`] says, with the number of the client: those of the peers, then those
-    /// of the monitors.
-    pub(crate) fn stored(&self) -> impl Iterator<Item = (u64, Stored)> + '_ {
-        let peers = self.peers.iter().map(|peer| (peer.id, peer.stored));
-        let monitors = self
-            .monitors
-            .iter()
-            .map(|monitor| (monitor.id, monitor.stored));
-
-        peers.chain(monitors)
-    }
-
-    /// Where the bus stored what it hands over of the connection of each client, as
-    /// [`State::stored`] gives it, to set.
-    pub(crate) fn stored_mut(&mut self) -> impl Iterator<Item = (u64, &mut Stored)> {
-        let peers = self
-            .peers
-            .iter_mut()
-            .map(|peer| (peer.id, &mut peer.stored));
-        let monitors = self
-            .monitors
-            .iter_mut()
-            .map(|monitor| (monitor.id, &mut monitor.stored));
-
-        peers.chain(monitors)
-    }
-
-    /// How long the state is, encoded, as [`State::encode`] encodes it, which doesn't depend on
-    /// where the records are.
-    pub(crate) fn encoded_len(&self) -> Result<usize> {
-        let len = serialized_size(serialized::Context::new(LE, 0), &(VERSION, self))?;
-
-        Ok(*len)
-    }
-
     /// The state, encoded in the D-Bus wire format, after the version of its encoding, as the bus
     /// passes it on to its next instance in another process.
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
@@ -255,10 +219,6 @@ pub(crate) struct PeerState {
     pub(crate) id: u64,
     /// Whether the peer called `Hello`.
     pub(crate) greeted: bool,
-    /// Where the bus stored what it hands over of the connection of the peer, for a next instance
-    /// in another process. It is the default otherwise, as for a peer that the bus left out of the
-    /// hand-over.
-    pub(crate) stored: Stored,
     pub(crate) match_rules: MatchRules,
     /// The calls to the peer that wait for its reply: the number of the caller, its unique name,
     /// and the serial of the call.
@@ -270,24 +230,7 @@ pub(crate) struct PeerState {
 pub(crate) struct MonitorState {
     /// The number of the peer that became the monitor.
     pub(crate) id: u64,
-    /// Where the bus stored what it hands over of the connection of the monitor, as for a peer:
-    /// see [`PeerState::stored`].
-    pub(crate) stored: Stored,
     pub(crate) match_rules: MatchRules,
-}
-
-/// Where a bus that hands over to its next instance in another process stores what it hands over
-/// of the connection of a client, besides what the state holds, as [`super::systemd`] describes.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Type)]
-pub(crate) struct Stored {
-    /// The record of the hand-over of the connection, as zbus saves it
-    /// ([`connection::Handover::save`]), in the state memfd: its offset from the start of the
-    /// memfd, and its length.
-    pub(crate) record: (u64, u64),
-    /// The connection FDs of the client, in the order that [`connection::Handover::fds`] gives
-    /// them, among those of all the clients, which the bus queues for its next instance in the
-    /// order of the hand-over: the index of the first, and how many.
-    pub(crate) fds: (u64, u64),
 }
 
 /// A well-known name, as the bus hands it over: its owner first, then those that queue for it, in
@@ -300,7 +243,7 @@ pub(crate) struct NameState {
 
 /// The version of the encoding of the state: an instance of the bus that encodes its state
 /// otherwise doesn't take over from this one, nor this one from it.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -320,16 +263,11 @@ mod tests {
             peers: vec![PeerState {
                 id: 1,
                 greeted: true,
-                stored: Stored {
-                    record: (64, 104),
-                    fds: (0, 1),
-                },
                 match_rules,
                 pending_calls: vec![(2, name(2), 7)],
             }],
             monitors: vec![MonitorState {
                 id: 3,
-                stored: Stored::default(),
                 match_rules: MatchRules::default(),
             }],
             names: vec![NameState {
@@ -341,16 +279,6 @@ mod tests {
         let encoded = state.encode().unwrap();
         let decoded = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
-        assert_eq!(state.encoded_len().unwrap(), encoded.len());
-        // The records and the file descriptors take as many bytes wherever they are.
-        let mut moved = decoded;
-        for (_, stored) in moved.stored_mut() {
-            *stored = Stored {
-                record: (u64::MAX, u64::MAX),
-                fds: (u64::MAX, u64::MAX),
-            };
-        }
-        assert_eq!(moved.encode().unwrap().len(), encoded.len());
 
         let mut other = encoded.clone();
         let version = VERSION + 1;

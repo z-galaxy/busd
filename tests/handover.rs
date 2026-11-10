@@ -51,6 +51,7 @@ use zbus::{
     wire::{DynamicType, Fd},
     Connection, MatchRule, Message, MessageStream,
 };
+use zoter::Save;
 use zruntime::{Event, SharedRuntime, Task};
 
 /// The clients keep their unique names and the names that they own, and a client that connects
@@ -439,7 +440,7 @@ fn messages_that_the_bus_did_not_take_are_handed_over() {
             client.connection.unread_len() > 0,
             "The bus took all of the signals"
         );
-        let socket = client.connection.fds().next().unwrap();
+        let socket = client.connection.fds()[0];
         let unread = rustix::io::ioctl_fionread(socket).unwrap();
         assert_eq!(unread, 0, "zbus didn't read all that the sender sent");
         let bus = Running::take_over(handover).await;

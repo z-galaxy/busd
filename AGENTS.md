@@ -23,6 +23,7 @@ must call `.detach()`.
 
 [zbus]: https://github.com/z-galaxy/zbus
 [zruntime]: https://github.com/z-galaxy/zruntime
+[zoter]: https://github.com/z-galaxy/zoter
 
 ## Development Commands
 
@@ -51,11 +52,13 @@ The crate is both a library (`src/lib.rs`) and a thin CLI binary (`src/bin/busd.
 argument parsing via clap). Key modules:
 
 - **`bus/`** — the broker core: accepts peer connections and routes messages between them.
-- **`systemd.rs`, `bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket
-  activation, readiness notifications, and restarts through systemd's file descriptor store,
-  which hand the clients over to the next instance. The module docs of `bus/systemd.rs`
-  describe the hand-over, with a diagram of a restart (`bus/systemd/restart.mmd`, in
-  mermaid), and name the many kinds of FDs that it takes.
+- **`bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket activation,
+  readiness notifications, and restarts through systemd's file descriptor store, which hand the
+  clients over to the next instance. The protocols of systemd, and the layout of a hand-over in
+  the store, are [zoter]'s; zbus's hand-over of each connection is an item of zoter's hand-over.
+  The module docs of `bus/systemd.rs` describe the hand-over, with a diagram of a restart
+  (`bus/systemd/restart.mmd`, in mermaid), and name the many kinds of FDs that it takes. The
+  tests and the benchmark restart busd through zoter's fake service manager.
 - **`peer/`, `peers.rs`** — per-connection peer state and the set of connected peers,
   including monitor (eavesdropping) support.
 - **`name_registry.rs`** — ownership of well-known bus names.
