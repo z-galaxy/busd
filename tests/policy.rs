@@ -1,13 +1,14 @@
 use std::{
+    collections::VecDeque,
     env::temp_dir,
     fmt::Debug,
     future::Future,
     os::unix::net::UnixStream,
     pin::pin,
-    sync::{Arc, Once},
+    sync::{mpsc, Arc, Mutex, Once},
 };
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{anyhow, bail, ensure, Context};
 use busd::{
     bus::Bus,
     config::Config,
@@ -222,6 +223,28 @@ fn set_policy_applies_to_connected_peers() {
     init_tracing();
 
     zruntime::block_on(with_bus("", set_policy_applies_to_connected_peers_));
+}
+
+/// `ReloadConfig` has the bus read its policy again and go by it, the peers that it has included.
+/// A bus that fails to read its policy goes on by the one that it has, and one that was not told
+/// how to read it has nothing to reload.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn reload() {
+    init_tracing();
+
+    zruntime::block_on(with_bus("", reload_));
+}
+
+/// The bus goes on forwarding the messages of its peers while it reads its policy again.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn forwards_during_a_reload() {
+    init_tracing();
+
+    zruntime::block_on(with_bus("", forwards_during_a_reload_));
 }
 
 /// The signals of the bus are subject to the policy of their receivers.
@@ -482,6 +505,86 @@ async fn set_policy_applies_to_connected_peers_(bus: TestBus) -> anyhow::Result<
     Ok(())
 }
 
+async fn reload_(bus: TestBus) -> anyhow::Result<()> {
+    let conn = bus.connect().await?;
+    let dbus = dbus_proxy(&conn).await?;
+    let result = dbus.reload_config().await;
+    ensure_error(result, FAILED, "No server configuration to reload.")?;
+
+    // What the bus reads, one reload after the other: a policy that lets no one own a name, and
+    // then nothing that it can go by.
+    let policies = format!(
+        r#"<policy context="default">
+            {SEND_AND_RECEIVE}
+            <deny own="*"/>
+        </policy>"#
+    );
+    let read = Mutex::new(VecDeque::from([policy(&policies)]));
+    bus.peers
+        .set_reload(move || {
+            let next = read.lock().unwrap().pop_front();
+
+            next.unwrap_or_else(|| Err(anyhow!("No policy to read")))
+        })
+        .await;
+    let reply = request_name(&dbus, "org.busd.Policy.Before").await?;
+    ensure!(
+        reply == RequestNameReply::PrimaryOwner,
+        "expected `PrimaryOwner`, got {reply:?}"
+    );
+
+    dbus.reload_config().await?;
+    let result = request_name(&dbus, "org.busd.Policy.After").await;
+    ensure_denied(result, OWN_REFUSED)?;
+
+    let result = dbus.reload_config().await;
+    ensure_error(result, FAILED, "Config invalid. Reload ignored.")?;
+    let result = request_name(&dbus, "org.busd.Policy.Still").await;
+    ensure_denied(result, OWN_REFUSED)?;
+    dbus.get_id().await?;
+
+    Ok(())
+}
+
+async fn forwards_during_a_reload_(bus: TestBus) -> anyhow::Result<()> {
+    let sender = bus.connect().await?;
+    let receiver = bus.connect().await?;
+    let ours = MatchRule::builder()
+        .msg_type(message::Type::Signal)
+        .interface(INTERFACE)
+        .build()?;
+    dbus_proxy(&receiver).await?.add_match_rule(ours).await?;
+    let mut msgs = MessageStream::from(&receiver);
+
+    // The bus reads its policy for as long as the test holds the read up.
+    let (started, starts) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    bus.peers
+        .set_reload(move || {
+            started.send(()).ok();
+            released.lock().unwrap().recv().ok();
+
+            Ok(Policy::default())
+        })
+        .await;
+    let reloading = zruntime::spawn({
+        let conn = sender.clone();
+        async move { call(&conn, BUS_NAME, BUS_PATH, BUS_NAME, "ReloadConfig").await }
+    });
+    zruntime::unblock(move || starts.recv()).await?;
+
+    sender
+        .emit_signal(None::<&str>, PATH, INTERFACE, "Marker", &())
+        .await?;
+    ensure_member(&mut msgs, "Marker").await?;
+
+    release.send(()).ok();
+    reloading.await.unwrap()?;
+
+    Ok(())
+}
+
 async fn bus_signals_(bus: TestBus) -> anyhow::Result<()> {
     let owner_changes = MatchRule::builder()
         .msg_type(message::Type::Signal)
@@ -685,14 +788,27 @@ where
     T: Debug,
     E: Into<zbus::Error>,
 {
+    ensure_error(
+        result,
+        "org.freedesktop.DBus.Error.AccessDenied",
+        description,
+    )
+}
+
+/// Fail unless `result` is the error of the bus that is named `error`, of `description`.
+fn ensure_error<T, E>(result: Result<T, E>, error: &str, description: &str) -> anyhow::Result<()>
+where
+    T: Debug,
+    E: Into<zbus::Error>,
+{
     let (name, got) = match result.map_err(Into::into) {
         Err(zbus::Error::MethodError(name, got, _)) => (name.to_string(), got),
         Err(zbus::Error::FDO(e)) => (e.name().to_string(), e.description().map(Into::into)),
-        other => bail!("expected `AccessDenied`, got {other:?}"),
+        other => bail!("expected `{error}`, got {other:?}"),
     };
     ensure!(
-        name == "org.freedesktop.DBus.Error.AccessDenied" && got.as_deref() == Some(description),
-        "expected `AccessDenied` of `{description}`, got `{name}` of {got:?}"
+        name == error && got.as_deref() == Some(description),
+        "expected `{error}` of `{description}`, got `{name}` of {got:?}"
     );
 
     Ok(())
@@ -840,8 +956,10 @@ const PATH: &str = "/org/busd/Policy";
 const INTERFACE: &str = "org.busd.Policy";
 const SERVICE: &str = "org.busd.Policy.Service";
 const BUS_NAME: &str = "org.freedesktop.DBus";
+const BUS_PATH: &str = "/org/freedesktop/DBus";
 /// The rules that let everyone send and receive everything.
 const SEND_AND_RECEIVE: &str = r#"<allow send_destination="*"/> <allow eavesdrop="true"/>"#;
 const OWN_REFUSED: &str = "Request to own name refused by policy";
 const SEND_REFUSED: &str = "Sender is not authorized to send message";
 const RECEIVE_REFUSED: &str = "Receiver is not authorized to receive message";
+const FAILED: &str = "org.freedesktop.DBus.Error.Failed";

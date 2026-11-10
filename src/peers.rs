@@ -6,6 +6,7 @@ use futures_util::{
 };
 use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap},
+    fmt,
     future::poll_fn,
     num::NonZeroU32,
     ops::{Deref, DerefMut, Range},
@@ -18,7 +19,10 @@ use zbus::{
     names::{BusName, OwnedUniqueName, UniqueName},
     Connection, Message, MessageStream, Optional, OwnedGuid, OwnedMatchRule,
 };
-use zruntime::{lock::RwLock, spawn, Event, EventListener};
+use zruntime::{
+    lock::{self, RwLock},
+    spawn, unblock, Event, EventListener,
+};
 
 #[cfg(target_os = "linux")]
 mod handover;
@@ -54,6 +58,9 @@ pub struct Peers {
     users: Users,
     /// The uid of the user that the bus itself runs as.
     uid: u32,
+    /// How the bus reads its policy again, if it was told how: see [`Peers::set_reload`]. A reload
+    /// holds it until the bus goes by what it read, so that reloads take turns.
+    reload: lock::Mutex<Option<Reload>>,
     /// What the bus does on its own, besides forwarding the messages of its peers.
     chores: Mutex<Chores>,
     /// Notified on each change of `chores`.
@@ -74,6 +81,7 @@ impl Peers {
             bus_conn: Mutex::new(None),
             users: Users::new(MAX_OBJECTS),
             uid: rustix::process::getuid().as_raw(),
+            reload: lock::Mutex::new(None),
             chores: Mutex::new(Chores::default()),
             chores_changed: Event::new(),
             #[cfg(target_os = "linux")]
@@ -96,6 +104,34 @@ impl Peers {
             peer.set_policy(policy.for_peer(peer.user().uid(), peer.groups()));
         }
         routing.policy = policy;
+    }
+
+    /// Have [`Peers::reload`] set the policy that `read` returns: `read` reads the configuration of
+    /// the bus again, and may block, as it runs on a thread of its own.
+    pub async fn set_reload<F>(&self, read: F)
+    where
+        F: Fn() -> Result<Policy> + Send + Sync + 'static,
+    {
+        *self.reload.lock().await = Some(Reload(Arc::new(read)));
+    }
+
+    /// Read the policy of the bus again, as [`Peers::set_reload`] told how to, and have the bus go
+    /// by it, as [`Peers::set_policy`] does: nothing if the bus was not told how to.
+    ///
+    /// The policy is read on a thread of its own, so the bus goes on forwarding the messages of
+    /// its peers meanwhile, and a reload waits for the one before it. If reading fails, the bus
+    /// goes on by the policy that it has.
+    pub async fn reload(&self) -> Option<Result<()>> {
+        // Held until the bus goes by what was read, so that reloads take turns.
+        let reload = self.reload.lock().await;
+        let Reload(read) = reload.clone()?;
+        let policy = match unblock(move || read()).await {
+            Ok(policy) => policy,
+            Err(e) => return Some(Err(e)),
+        };
+        self.set_policy(Arc::new(policy)).await;
+
+        Some(Ok(()))
     }
 
     /// Whether the policy of the bus lets a client of `uid`, in the groups `gids`, connect.
@@ -1104,6 +1140,16 @@ impl Drop for Connecting<'_> {
     fn drop(&mut self) {
         self.0.chores().connecting -= 1;
         self.0.chores_changed.notify(usize::MAX);
+    }
+}
+
+/// How the bus reads its policy again: see [`Peers::set_reload`].
+#[derive(Clone)]
+struct Reload(Arc<dyn Fn() -> Result<Policy> + Send + Sync>);
+
+impl fmt::Debug for Reload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Reload")
     }
 }
 

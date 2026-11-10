@@ -1,17 +1,16 @@
 //! The busd binary, run the way that a service manager or a script runs it.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::{
     env::temp_dir,
+    fs,
     io::{BufRead, BufReader, Read},
+    path::Path,
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     str::FromStr,
     thread,
     time::{Duration, Instant},
-};
-#[cfg(target_os = "linux")]
-use std::{
-    fs,
-    os::unix::net::{UnixDatagram, UnixStream},
 };
 
 use ntest::timeout;
@@ -20,7 +19,7 @@ use rand::{
     rng,
 };
 use rustix::process::{kill_process, Pid, Signal};
-use zbus::{connection, Address};
+use zbus::{connection, fdo, Address, Connection};
 use zruntime::SharedRuntime;
 
 /// On SIGTERM, which service managers and `kill` send to stop a service, busd stops as it does on
@@ -131,6 +130,87 @@ fn notify_socket_nobody_listens_on() {
     assert!(status.success(), "busd exited with {status}");
 }
 
+/// On `ReloadConfig`, busd reads its configuration again, and goes by the policy of it from then
+/// on: it refuses a name to a client that it let own one, once the configuration lets no one own
+/// names. A configuration that it can't read leaves it as it is.
+#[test]
+#[timeout(30000)]
+fn reloads_its_configuration() {
+    let s = Alphanumeric.sample_string(&mut rng(), 10);
+    let address = format!("unix:path={}", temp_dir().join(&s).display());
+    let config = temp_dir().join(format!("{s}.conf"));
+    write_config(&config, r#"<allow own="*"/>"#);
+    let mut busd = Busd::start(Busd::command_with(config.to_str().unwrap(), &address, None));
+    let address = busd.address();
+
+    zruntime::block_on(async {
+        let client = connection::Builder::address(address).build().await.unwrap();
+        request_name(&client, "org.busd.Daemon.Before")
+            .await
+            .unwrap();
+
+        write_config(&config, r#"<deny own="*"/>"#);
+        call_bus(&client, "ReloadConfig", &()).await.unwrap();
+        let refused = request_name(&client, "org.busd.Daemon.After").await;
+        assert!(
+            matches!(refused, Err(fdo::Error::AccessDenied(_))),
+            "busd goes by the configuration that it started with: {refused:?}"
+        );
+
+        fs::write(&config, "<busconfig>").unwrap();
+        let failed = call_bus(&client, "ReloadConfig", &()).await;
+        let ignored = "Config invalid. Reload ignored.";
+        assert!(
+            matches!(&failed, Err(fdo::Error::Failed(why)) if why == ignored),
+            "busd took a configuration that it can't read: {failed:?}"
+        );
+        let refused = request_name(&client, "org.busd.Daemon.Still").await;
+        assert!(
+            matches!(refused, Err(fdo::Error::AccessDenied(_))),
+            "busd let go of its policy: {refused:?}"
+        );
+    });
+
+    fs::remove_file(&config).unwrap();
+    let status = busd.stop(Signal::TERM);
+    assert!(status.success(), "busd exited with {status}");
+}
+
+/// Write a configuration to `path` whose policy lets everyone send and receive everything, and
+/// has the rule `own` for the names that they ask for.
+fn write_config(path: &Path, own: &str) {
+    let config = format!(
+        r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+        "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+        <busconfig>
+            <policy context="default">
+                <allow send_destination="*"/>
+                <allow eavesdrop="true"/>
+                {own}
+            </policy>
+        </busconfig>"#
+    );
+
+    fs::write(path, config).unwrap();
+}
+
+/// Have `conn` ask the bus for the well-known `name`.
+async fn request_name(conn: &Connection, name: &str) -> fdo::Result<()> {
+    call_bus(conn, "RequestName", &(name, 0u32)).await
+}
+
+/// Have `conn` call `method` of the bus, with `body`, and wait for the reply.
+async fn call_bus<B>(conn: &Connection, method: &str, body: &B) -> fdo::Result<()>
+where
+    B: serde::Serialize + zbus::wire::DynamicType,
+{
+    let bus = "org.freedesktop.DBus";
+    conn.call_method(Some(bus), "/org/freedesktop/DBus", Some(bus), method, body)
+        .await?;
+
+    Ok(())
+}
+
 /// A busd process, killed if it's still running when dropped.
 struct Busd {
     child: Child,
@@ -150,9 +230,15 @@ impl Busd {
     ///
     /// busd runs as it would without systemd, whatever the environment of the tests tells of it.
     fn command(address: &str, log: Option<&str>) -> Command {
+        Self::command_with(CONFIG, address, log)
+    }
+
+    /// The command that [`Busd::spawn`] runs, with the configuration file `config` rather than the
+    /// session configuration of the tests.
+    fn command_with(config: &str, address: &str, log: Option<&str>) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_busd"));
         command
-            .args(["--config", CONFIG, "--address", address, "--print-address"])
+            .args(["--config", config, "--address", address, "--print-address"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         match log {

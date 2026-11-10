@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use crate::warn;
+use crate::{info, warn};
 use zbus::{
     fdo::{
         ConnectionCredentials, Error, ReleaseNameReply, RequestNameFlags, RequestNameReply, Result,
@@ -394,11 +394,30 @@ impl DBus {
     }
 
     /// Reload server configuration.
-    fn reload_config(&self) -> Result<()> {
-        // TODO: Implement when we support configuration.
-        Err(Error::Failed(
-            "No server configuration to reload.".to_string(),
-        ))
+    ///
+    /// The bus reads its policy again, and goes by it. If that fails, the bus goes on by the
+    /// policy that it has, and the call fails, as with dbus-broker: the reason is for the log
+    /// alone.
+    ///
+    /// The policy is read off the thread of the bus, which forwards the messages of its peers
+    /// meanwhile. The calls to the bus that come in before the reload is done wait for it, as
+    /// they wait for any call before them.
+    async fn reload_config(&self) -> Result<()> {
+        match self.peers()?.reload().await {
+            Some(Ok(())) => {
+                info!("Reloaded the configuration.");
+
+                Ok(())
+            }
+            Some(Err(e)) => {
+                warn!("Failed to reload the configuration, which stays as it is: {e:#}");
+
+                Err(Error::Failed("Config invalid. Reload ignored.".to_string()))
+            }
+            None => Err(Error::Failed(
+                "No server configuration to reload.".to_string(),
+            )),
+        }
     }
 
     /// Easter egg method.

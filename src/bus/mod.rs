@@ -138,6 +138,20 @@ impl Bus {
         self.inner.peers.set_policy(policy).await;
     }
 
+    /// Have `ReloadConfig` set the policy that `read` returns, as [`Bus::set_policy`] does.
+    ///
+    /// `read` reads the configuration of the bus again, on a thread of its own, as that may block:
+    /// the bus goes on forwarding the messages of its peers meanwhile, but the calls to the bus
+    /// itself wait for the reload, as the bus answers them one at a time. If `read` fails, so does
+    /// the call, and the bus goes on by the policy that it has. Until the bus is told how to read
+    /// its policy again, it has nothing to reload, and the call fails.
+    pub async fn set_reload<F>(&mut self, read: F)
+    where
+        F: Fn() -> Result<Policy> + Send + Sync + 'static,
+    {
+        self.inner.peers.set_reload(read).await;
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         loop {
             self.accept_next().await?;

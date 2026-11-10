@@ -93,22 +93,16 @@ async fn run(
         warn!("Failed to raise the limit of open file descriptors: {e}");
     }
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     let config = read_config(&args, Path::new(SESSION_CONFIG))?;
 
-    let address = if let Some(address) = args.address {
-        Some(address)
-    } else {
-        config.listen.as_ref().map(ToString::to_string)
-    };
+    let address = args
+        .address
+        .take()
+        .or_else(|| config.listen.as_ref().map(ToString::to_string));
 
-    // The names of the users and groups of the policy are looked up here, once, before the bus
-    // serves anyone, as the lookup reads files.
-    let policy = Arc::new(Policy::new(
-        &config,
-        &Ids::read(),
-        rustix::process::getuid().as_raw(),
-    ));
+    // Before the bus serves anyone, as building the policy reads files.
+    let policy = Arc::new(policy_of(&config));
 
     // SIGTERM is what service managers, such as systemd, and `kill` send to stop a service. Taking
     // the signals over before the bus listens, and so before anyone can tell that it's ready, has
@@ -148,6 +142,14 @@ async fn run(
     if args.print_address {
         println!("{}", bus.address());
     }
+
+    // `ReloadConfig` has the bus read its configuration again, for the policy of it.
+    bus.set_reload(move || {
+        let config = read_config(&args, Path::new(SESSION_CONFIG))?;
+
+        Ok(policy_of(&config))
+    })
+    .await;
 
     // Under systemd, a service of `Type=notify` tells systemd once it's ready.
     #[cfg(target_os = "linux")]
@@ -248,6 +250,14 @@ fn read_config(args: &Args, session_config: &Path) -> Result<Config> {
 
     Config::read_file(path)
         .with_context(|| format!("failed to read configuration file {}", path.display()))
+}
+
+/// The policy of `config`, for a bus that runs as the user of this process.
+///
+/// This blocks, as it looks the names of the users and groups of the policy up in the files of
+/// the system.
+fn policy_of(config: &Config) -> Policy {
+    Policy::new(config, &Ids::read(), rustix::process::getuid().as_raw())
 }
 
 const SESSION_CONFIG: &str = "/usr/share/dbus-1/session.conf";
