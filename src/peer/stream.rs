@@ -1,19 +1,26 @@
 use std::{
+    fmt,
     pin::Pin,
     task::{ready, Context, Poll},
 };
 
 use crate::trace;
-use anyhow::{bail, Result};
+use anyhow::anyhow;
 use futures_util::{Stream as FutureStream, StreamExt};
-use zbus::{message, names::OwnedUniqueName, Message, MessageStream};
+use zbus::{
+    message,
+    names::{InterfaceName, OwnedUniqueName},
+    Message, MessageStream, ObjectPath,
+};
 
-use crate::peer::Peer;
+use crate::peer::{Peer, MAX_MESSAGE_FDS};
 
 /// Message stream for a peer.
 ///
 /// This stream ensures the following for each message produced:
 ///
+/// * It carries no more file descriptors than the bus can pass on, [`MAX_MESSAGE_FDS`].
+/// * It has neither the interface nor the path that the specification reserves for local use.
 /// * The destination field is present and readable for non-signals.
 /// * The sender field is present and set to the unique name of the peer.
 pub struct Stream {
@@ -38,35 +45,97 @@ impl Stream {
 }
 
 impl FutureStream for Stream {
-    type Item = Result<Message>;
+    type Item = Result<Message, Invalid>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Message>>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let msg = ready!(this.msg_stream.poll_next_unpin(cx));
 
-        Poll::Ready(msg.map(|msg| checked(msg?, &this.unique_name)))
+        Poll::Ready(msg.map(|msg| match msg {
+            Ok(msg) => checked(msg, &this.unique_name),
+            Err(e) => Err(Invalid::Dropped(e.into())),
+        }))
+    }
+}
+
+/// A message of a peer that the bus doesn't pass on.
+#[derive(Debug)]
+pub enum Invalid {
+    /// It carries more file descriptors than the bus can pass on, [`MAX_MESSAGE_FDS`]: the bus
+    /// disconnects the peer.
+    TooManyFds,
+    /// It has the interface or the path that the specification reserves for the `Disconnected`
+    /// signal that a D-Bus library raises locally as its connection goes, which clients are not
+    /// to send: the bus disconnects the peer, as the reference implementation and dbus-broker do.
+    Local,
+    /// Anything else that is wrong with it: the bus drops the message, and serves the peer on.
+    Dropped(anyhow::Error),
+}
+
+impl fmt::Display for Invalid {
+    /// What the peer sent, to go on from "Disconnecting the peer, as it sent".
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyFds => write!(
+                f,
+                "a message with more than {MAX_MESSAGE_FDS} file descriptors"
+            ),
+            Self::Local => write!(
+                f,
+                "a message with the interface or the path that the specification reserves for \
+                 local use, `{LOCAL_INTERFACE}`"
+            ),
+            Self::Dropped(e) => write!(f, "{e}"),
+        }
     }
 }
 
 /// `msg`, which the peer `unique_name` sent, with its sender field set if it has none.
-fn checked(msg: Message, unique_name: &OwnedUniqueName) -> Result<Message> {
+fn checked(msg: Message, unique_name: &OwnedUniqueName) -> Result<Message, Invalid> {
+    // Passing such a message on would fail, and get its recipients disconnected.
+    if msg.data().fds().len() > MAX_MESSAGE_FDS {
+        return Err(Invalid::TooManyFds);
+    }
+
     let header = msg.header();
+
+    // A recipient that goes by such a message, as libdbus has its applications do, would take it
+    // for the loss of its connection.
+    if header
+        .interface()
+        .is_some_and(|interface| *interface == LOCAL_INTERFACE)
+        || header.path().is_some_and(|path| *path == LOCAL_PATH)
+    {
+        return Err(Invalid::Local);
+    }
 
     // Ensure destination field is present and readable for non-signals.
     if msg.message_type() != message::Type::Signal && header.destination().is_none() {
-        bail!("missing destination field");
+        return Err(Invalid::Dropped(anyhow!("missing destination field")));
     }
 
     // Ensure sender field is present. If it is not we add it using the unique name of the peer, as
     // most clients leave it out.
     match header.sender() {
         Some(sender) if *sender == *unique_name => Ok(msg),
-        Some(_) => bail!("failed to parse message: Invalid sender field"),
+        Some(_) => Err(Invalid::Dropped(anyhow!(
+            "failed to parse message: Invalid sender field"
+        ))),
         None => {
-            let new_msg = msg.with_sender(unique_name)?;
+            let new_msg = msg
+                .with_sender(unique_name)
+                .map_err(|e| Invalid::Dropped(e.into()))?;
             trace!("Added sender field to message: {:?}", new_msg);
 
             Ok(new_msg)
         }
     }
 }
+
+/// The interface that the specification reserves for the signal that a library raises locally.
+const LOCAL_INTERFACE: InterfaceName<'static> =
+    InterfaceName::from_static_str_unchecked("org.freedesktop.DBus.Local");
+
+/// The path that the specification reserves for the signal that a library raises locally.
+const LOCAL_PATH: ObjectPath<'static> =
+    ObjectPath::from_static_str_unchecked("/org/freedesktop/DBus/Local");

@@ -27,7 +27,7 @@ use crate::{
     fdo,
     match_rules::MatchRules,
     name_registry::{NameOwnerChanged, NameRegistry},
-    peer::{Caller, Monitor, Peer, PendingCalls, Recipient, Refusal, Stream, MAX_MESSAGE_FDS},
+    peer::{Caller, Invalid, Monitor, Peer, PendingCalls, Recipient, Refusal, Stream},
     user::{Charge, Users, MAX_OBJECTS},
 };
 
@@ -335,21 +335,20 @@ impl Peers {
             // here already.
             let mut next = Some(msg);
             let mut bytes = 0;
-            let mut too_many_fds = false;
+            let mut violation = None;
             let mut ended = false;
             while let Some(msg) = next.take() {
                 match msg {
-                    // Passing such a message on would fail, and get its recipients disconnected.
-                    Ok(msg) if msg.data().fds().len() > MAX_MESSAGE_FDS => {
-                        too_many_fds = true;
-
-                        break;
-                    }
                     Ok(msg) => {
                         bytes += msg.data().len();
                         batch.push(msg);
                     }
-                    Err(e) => debug!("{e}"),
+                    Err(Invalid::Dropped(e)) => debug!("{e}"),
+                    Err(invalid) => {
+                        violation = Some(invalid);
+
+                        break;
+                    }
                 }
                 if batch.len() == MAX_BATCH || bytes >= MAX_BATCH_BYTES {
                     break;
@@ -385,11 +384,8 @@ impl Peers {
             if let Some(serial) = barrier {
                 self.barrier_returned(serial);
             }
-            if too_many_fds {
-                warn!(
-                    "Disconnecting `{unique_name}`, as it sent a message with more than \
-                     {MAX_MESSAGE_FDS} file descriptors"
-                );
+            if let Some(violation) = violation {
+                warn!("Disconnecting `{unique_name}`, as it sent {violation}");
 
                 break false;
             }
