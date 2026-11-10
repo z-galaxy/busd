@@ -60,8 +60,8 @@ argument parsing via clap). Key modules:
   including monitor (eavesdropping) support.
 - **`name_registry.rs`** — ownership of well-known bus names.
 - **`match_rules.rs`** — match-rule parsing and signal delivery.
-- **`fdo/`** — the standard `org.freedesktop.DBus` interfaces (`dbus.rs`) and monitoring
-  (`monitoring.rs`).
+- **`fdo/`** — the standard `org.freedesktop.DBus` interfaces (`dbus.rs`), monitoring
+  (`monitoring.rs`) and statistics (`stats.rs`).
 - **`config/`** — bus configuration file parsing: `xml.rs` (the `.conf` format),
   `policy.rs` and `rule.rs` (access-control policy).
 - **`tracing_subscriber.rs`** — logging setup (behind the default `tracing-subscriber`

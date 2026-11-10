@@ -30,7 +30,7 @@ pub use handover::{ClientHandover, Handover, STOP_TIMEOUT};
 mod systemd;
 
 use crate::{
-    fdo::{self, DBus, Monitoring},
+    fdo::{self, DBus, Monitoring, Stats},
     peer::SEND_TIMEOUT,
     peers::Peers,
 };
@@ -169,6 +169,7 @@ impl Bus {
 
         let dbus = DBus::new(peers.clone(), guid.clone());
         let monitoring = Monitoring::new(peers.clone());
+        let stats = Stats::new(peers.clone());
 
         // Create a peer for ourselves.
         trace!("Creating self-dial connection.");
@@ -179,6 +180,7 @@ impl Bus {
             .name(fdo::BUS_NAME)
             .serve_at(fdo::DBus::PATH, dbus)
             .serve_at(fdo::Monitoring::PATH, monitoring)
+            .serve_at(fdo::Stats::PATH, stats)
             .build()
             .await?;
         let peer_stream = connection::Builder::authenticated_socket(peer_socket, guid.clone())

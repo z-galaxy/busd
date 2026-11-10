@@ -427,6 +427,7 @@ impl DBus {
 
 /// The interfaces of the `/org/freedesktop/DBus` object that the `Interfaces` property lists, which
 /// leave out the interfaces that every bus has, as the specification says.
-static INTERFACES: [InterfaceName<'static>; 1] = [InterfaceName::from_static_str_unchecked(
-    super::Monitoring::INTERFACE,
-)];
+static INTERFACES: [InterfaceName<'static>; 2] = [
+    InterfaceName::from_static_str_unchecked(super::Monitoring::INTERFACE),
+    InterfaceName::from_static_str_unchecked(super::Stats::INTERFACE),
+];

@@ -61,8 +61,9 @@ fn every_call_to_the_bus_among_calls() {
     });
 }
 
-/// The `Interfaces` property of the bus lists the `org.freedesktop.DBus.Monitoring` interface and
-/// nothing else, every interface it lists is one that the bus introspects, and `Features` is empty.
+/// The `Interfaces` property of the bus lists the `org.freedesktop.DBus.Monitoring` and
+/// `org.freedesktop.DBus.Debug.Stats` interfaces and nothing else, every interface it lists is one
+/// that the bus introspects, and `Features` is empty.
 #[test]
 #[timeout(30000)]
 fn properties() {
@@ -337,6 +338,10 @@ async fn every_call_to_the_bus_among_calls_client(address: String) -> anyhow::Re
         for method in ["ListNames", "ListActivatableNames", "ReloadConfig", "Dune"] {
             calls.push(call_bus(method, &())?);
         }
+        let stats = "org.freedesktop.DBus.Debug.Stats";
+        calls.push(call(stats, "GetStats", &())?);
+        calls.push(call(stats, "GetConnectionStats", &own_name)?);
+        calls.push(call(stats, "GetAllMatchRules", &())?);
         calls.push(call(
             "org.freedesktop.DBus.Properties",
             "GetAll",
@@ -397,7 +402,11 @@ async fn properties_client(address: String) -> anyhow::Result<()> {
     let interfaces = proxy.interfaces().await?;
     let names: Vec<&str> = interfaces.iter().map(|name| name.as_str()).collect();
     ensure!(
-        names == ["org.freedesktop.DBus.Monitoring"],
+        names
+            == [
+                "org.freedesktop.DBus.Monitoring",
+                "org.freedesktop.DBus.Debug.Stats"
+            ],
         "unexpected interfaces: {names:?}"
     );
     let features = proxy.features().await?;
