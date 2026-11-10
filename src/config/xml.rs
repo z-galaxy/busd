@@ -241,8 +241,8 @@ pub enum Element {
     Servicedir(PathBuf),
     Servicehelper(PathBuf),
     /// Requests a standard set of session service directories.
-    /// Its effect is similar to specifying a series of <servicedir/> elements for each of the data
-    /// directories, in the order given here.
+    /// Its effect is similar to specifying a series of `<servicedir/>` elements for each of the
+    /// data directories, in the order given here.
     StandardSessionServicedirs,
     /// Specifies the standard system-wide activation directories that should be searched for
     /// service files.

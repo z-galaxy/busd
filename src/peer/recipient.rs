@@ -33,7 +33,7 @@ use crate::{debug, warn};
 ///
 /// While the bus hands over to its next instance, it doesn't wait for room: zbus keeps what the
 /// socket doesn't take, which goes on with the hand-over of the connection, and the next instance
-/// writes that to the client first, with [`Recipient::flush`].
+/// writes that to the client first, with `Recipient::flush`.
 #[derive(Debug, Clone)]
 pub struct Recipient(Kind);
 
