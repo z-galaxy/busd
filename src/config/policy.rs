@@ -8,6 +8,9 @@ use super::{
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum Policy {
+    /// `<policy at_console="true">` or `<policy at_console="false">`, after the `bool`: the rules
+    /// for the peers of the users at the console, or for those of the other users.
+    Console(Vec<Rule>, bool),
     DefaultContext(Vec<Rule>),
     Group(Vec<Rule>, String),
     MandatoryContext(Vec<Rule>),
@@ -24,12 +27,15 @@ impl TryFrom<PolicyElement> for OptionalPolicy {
     fn try_from(value: PolicyElement) -> std::result::Result<Self, Self::Error> {
         match value {
             PolicyElement {
-                at_console: Some(_),
+                at_console: Some(at_console),
                 context: None,
                 group: None,
+                rules,
                 user: None,
-                ..
-            } => Ok(None),
+            } if at_console == "true" || at_console == "false" => Ok(Some(Policy::Console(
+                rules_try_from_rule_elements(rules)?,
+                at_console == "true",
+            ))),
             PolicyElement {
                 at_console: None,
                 context: Some(c),
