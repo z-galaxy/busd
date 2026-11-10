@@ -66,6 +66,11 @@ pub struct User {
 }
 
 impl User {
+    /// The uid of the user.
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
     fn objects(&self) -> MutexGuard<'_, Objects> {
         lock(&self.objects)
     }

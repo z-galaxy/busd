@@ -173,6 +173,11 @@ impl Peer {
         &self.caller
     }
 
+    /// The user of the peer.
+    pub fn user(&self) -> &User {
+        self.caller.user()
+    }
+
     /// Whether the peer called `Hello`.
     pub fn greeted(&self) -> bool {
         self.greeted

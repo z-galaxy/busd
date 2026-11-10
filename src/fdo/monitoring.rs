@@ -9,7 +9,7 @@ use zbus::{
 };
 use zruntime::spawn;
 
-use super::msg_sender;
+use super::{ensure_privileged, msg_sender};
 use crate::{fdo::DBus, match_rules::MatchRules, peers::Peers};
 
 #[derive(Debug)]
@@ -49,6 +49,7 @@ impl Monitoring {
             .upgrade()
             // Can it happen in any other situation than the bus shutting down?
             .ok_or_else(|| Error::Failed("Bus shutting down.".to_string()))?;
+        ensure_privileged(&peers, &hdr).await?;
         if !peers.make_monitor(&owner, match_rules).await {
             return Err(Error::NameHasNoOwner(format!("No such peer: {owner}")));
         }
