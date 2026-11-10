@@ -62,8 +62,11 @@ impl MatchRules {
         ret
     }
 
-    pub fn add(&mut self, rule: OwnedMatchRule) {
-        self.0.insert(rule);
+    /// Add `rule`.
+    ///
+    /// Whether the rule was not among the rules already: a rule that is there is not added twice.
+    pub fn add(&mut self, rule: OwnedMatchRule) -> bool {
+        self.0.insert(rule)
     }
 
     /// Remove the first rule that matches.
@@ -79,5 +82,15 @@ impl MatchRules {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The number of rules.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The rules, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = &OwnedMatchRule> {
+        self.0.iter()
     }
 }

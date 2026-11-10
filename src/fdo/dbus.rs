@@ -17,7 +17,7 @@ use zbus::{
 use zruntime::spawn;
 
 use super::msg_sender;
-use crate::{peer::Peer, peers::Peers};
+use crate::peers::Peers;
 
 #[derive(Debug)]
 pub struct DBus {
@@ -34,22 +34,6 @@ impl DBus {
             peers: Arc::downgrade(&peers),
             guid,
         }
-    }
-
-    /// Helper for D-Bus methods that call a function on a peer.
-    async fn call_mut_on_peer<F, R>(&self, func: F, hdr: message::Header<'_>) -> Result<R>
-    where
-        F: FnOnce(&mut Peer) -> Result<R>,
-    {
-        let name = msg_sender(&hdr);
-        let peers = self.peers()?;
-        let mut routing = peers.routing_mut().await;
-        let peer = routing
-            .peers
-            .get_mut(name.as_str())
-            .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
-
-        func(peer)
     }
 
     fn peers(&self) -> Result<Arc<Peers>> {
@@ -203,15 +187,10 @@ impl DBus {
         rule: OwnedMatchRule,
         #[zbus(header)] hdr: message::Header<'_>,
     ) -> Result<()> {
-        self.call_mut_on_peer(
-            move |peer| {
-                peer.add_match_rule(rule);
-
-                Ok(())
-            },
-            hdr,
-        )
-        .await
+        self.peers()?
+            .routing_mut()
+            .await
+            .add_match_rule(msg_sender(&hdr), rule)
     }
 
     /// Removes the first rule that matches.
@@ -220,8 +199,10 @@ impl DBus {
         rule: OwnedMatchRule,
         #[zbus(header)] hdr: message::Header<'_>,
     ) -> Result<()> {
-        self.call_mut_on_peer(move |peer| peer.remove_match_rule(rule), hdr)
+        self.peers()?
+            .routing_mut()
             .await
+            .remove_match_rule(msg_sender(&hdr), rule)
     }
 
     /// Returns auditing data used by Solaris ADT, in an unspecified binary format.
