@@ -118,6 +118,11 @@ impl NameRegistry {
                         unique_name: unique_name.clone(),
                         allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
                     };
+                    // It has the name now, so it queues for it no more: left in the queue, it
+                    // would get the name again later, even once it is gone.
+                    entry
+                        .waiting_list
+                        .retain(|waiting| waiting.unique_name != unique_name);
                     self.note_lost(&old_owner);
                     self.note_gained(&unique_name);
                     self.index(&old_owner, &name);
@@ -132,11 +137,21 @@ impl NameRegistry {
                         }),
                     )
                 } else if !flags.contains(RequestNameFlags::DO_NOT_QUEUE) {
-                    let owner = NameOwner {
-                        unique_name: OwnedUniqueName::from(unique_name.clone()),
-                        allow_replacement: flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
-                    };
-                    entry.waiting_list.push_back(owner);
+                    let allow_replacement = flags.contains(RequestNameFlags::ALLOW_REPLACEMENT);
+                    // A peer is in the queue once, however many times it asks: a second entry
+                    // would outlast the release of the first, and get the name for a peer that
+                    // let go of it, or that is gone.
+                    let queued = entry
+                        .waiting_list
+                        .iter_mut()
+                        .find(|waiting| waiting.unique_name == unique_name);
+                    match queued {
+                        Some(queued) => queued.allow_replacement = allow_replacement,
+                        None => entry.waiting_list.push_back(NameOwner {
+                            unique_name: OwnedUniqueName::from(unique_name.clone()),
+                            allow_replacement,
+                        }),
+                    }
                     self.index(&unique_name, &name);
 
                     (RequestNameReply::InQueue, None)
@@ -615,32 +630,62 @@ mod tests {
         });
     }
 
-    /// A name that passes on to the one that lets go of it, which queued for it before it took it
-    /// over, is one name of that owner, and never two.
+    /// A peer that queued for a name and then took it over is in the queue no more: the name that
+    /// it lets go of doesn't come back to it. The peer that it took the name from asked not to be
+    /// queued, so no one is left to get the name.
     #[test]
-    fn peak_of_an_owner_that_a_name_comes_back_to() {
+    fn taking_a_name_over_leaves_its_queue() {
         zruntime::block_on(async {
             let mut registry = NameRegistry::default();
             let replaceable = RequestNameFlags::ALLOW_REPLACEMENT;
-            request(&mut registry, "org.busd.One", ":busd.1", replaceable).await;
+            let first = replaceable | RequestNameFlags::DO_NOT_QUEUE;
+            request(&mut registry, "org.busd.One", ":busd.1", first).await;
             let (reply, _) = request(&mut registry, "org.busd.One", ":busd.2", replaceable).await;
             assert_eq!(reply, RequestNameReply::InQueue);
             let replace = RequestNameFlags::REPLACE_EXISTING;
             let (reply, _) = request(&mut registry, "org.busd.One", ":busd.2", replace).await;
             assert_eq!(reply, RequestNameReply::PrimaryOwner);
+            assert_eq!(queue(&registry, "org.busd.One"), [""; 0]);
 
             let owner = UniqueName::try_from(":busd.2").unwrap();
             let (_, changed) = registry
-                .release_name("org.busd.One".try_into().unwrap(), owner.clone())
+                .release_name("org.busd.One".try_into().unwrap(), owner)
                 .await;
-            let changed = changed.unwrap();
-            assert_eq!(changed.new_owner.as_deref(), Some(&owner));
+            assert_eq!(changed.unwrap().new_owner, None);
+            assert_eq!(registry.lookup(&"org.busd.One".try_into().unwrap()), None);
             assert_eq!(
                 (registry.peak_names(), registry.peak_names_per_owner()),
                 (1, 1)
             );
             let owned = registry.owned_by(":busd.2");
-            assert_eq!((owned.now, owned.peak), (1, 1));
+            assert_eq!((owned.now, owned.peak), (0, 1));
+        });
+    }
+
+    /// A peer that asks for a taken name more than once is in its queue once, with the flags of
+    /// its last request, so that a peer that is gone never gets the name.
+    #[test]
+    fn queueing_twice_is_queueing_once() {
+        zruntime::block_on(async {
+            let mut registry = NameRegistry::default();
+            let flags = RequestNameFlags::empty();
+            request(&mut registry, "org.busd.One", ":busd.1", flags).await;
+            for flags in [flags, RequestNameFlags::ALLOW_REPLACEMENT] {
+                let (reply, _) = request(&mut registry, "org.busd.One", ":busd.2", flags).await;
+                assert_eq!(reply, RequestNameReply::InQueue);
+            }
+            assert_eq!(queue(&registry, "org.busd.One"), [":busd.2"]);
+            let name = WellKnownName::try_from("org.busd.One").unwrap();
+            let queued = registry.waiting_list(name.clone()).unwrap().next().unwrap();
+            assert!(queued.allow_replacement());
+
+            // The peer goes, and then the owner lets go of the name: no one has it.
+            let gone = UniqueName::try_from(":busd.2").unwrap();
+            assert!(registry.release_all(gone).await.is_empty());
+            let owner = UniqueName::try_from(":busd.1").unwrap();
+            let (_, changed) = registry.release_name(name.clone(), owner).await;
+            assert_eq!(changed.unwrap().new_owner, None);
+            assert_eq!(registry.lookup(&name), None);
         });
     }
 
@@ -745,21 +790,20 @@ mod tests {
         });
     }
 
-    /// A name that passes on to the one that lets go of it, which queued for it before it took it
-    /// over, stays a name of that peer until the peer lets go of it once more.
+    /// A peer that queued for a name and then took it over has the name once, and no more once
+    /// it lets go of it.
     #[test]
-    fn names_of_a_peer_that_a_name_comes_back_to() {
+    fn names_of_a_peer_that_took_over_a_name_it_queued_for() {
         zruntime::block_on(async {
             let mut registry = NameRegistry::default();
             let replaceable = RequestNameFlags::ALLOW_REPLACEMENT;
             let replace = RequestNameFlags::REPLACE_EXISTING;
-            request(&mut registry, "org.busd.One", ":busd.1", replaceable).await;
+            let first = replaceable | RequestNameFlags::DO_NOT_QUEUE;
+            request(&mut registry, "org.busd.One", ":busd.1", first).await;
             request(&mut registry, "org.busd.One", ":busd.2", replaceable).await;
             request(&mut registry, "org.busd.One", ":busd.2", replace).await;
             assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.One"]);
 
-            release(&mut registry, "org.busd.One", ":busd.2").await;
-            assert_eq!(names_of(&registry, ":busd.2"), ["org.busd.One"]);
             release(&mut registry, "org.busd.One", ":busd.2").await;
             assert!(registry.names_of(":busd.2").is_empty());
         });
@@ -829,6 +873,15 @@ mod tests {
             .await;
 
         reply
+    }
+
+    /// The unique names of the peers that queue for `name` in `registry`, in order.
+    fn queue<'r>(registry: &'r NameRegistry, name: &str) -> Vec<&'r str> {
+        registry
+            .waiting_list(name.try_into().unwrap())
+            .unwrap()
+            .map(|waiting| waiting.unique_name().as_str())
+            .collect()
     }
 
     /// Request `name` for `owner`.
