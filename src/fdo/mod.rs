@@ -2,6 +2,8 @@ mod dbus;
 pub use dbus::*;
 mod monitoring;
 pub use monitoring::*;
+mod stats;
+pub use stats::*;
 use zbus::{message, names::UniqueName};
 
 use crate::peers::Peers;

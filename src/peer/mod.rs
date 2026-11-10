@@ -38,6 +38,8 @@ pub struct Peer {
     id: usize,
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
+    /// The most match rules that the peer had at a time, since this instance of the bus has it.
+    peak_match_rules: usize,
     /// The calls to the peer that wait for its reply.
     pending_calls: Arc<PendingCalls>,
     /// The peer, as the caller of the calls that wait for replies.
@@ -100,6 +102,7 @@ impl Peer {
             charge: Some(charge),
             unique_name,
             match_rules: MatchRules::default(),
+            peak_match_rules: 0,
             pending_calls: Arc::new(PendingCalls::new(user)),
             greeted: false,
             canceled_event: Event::new(),
@@ -132,6 +135,7 @@ impl Peer {
             charge: None,
             unique_name,
             match_rules: MatchRules::default(),
+            peak_match_rules: 0,
             pending_calls: Arc::new(PendingCalls::of_bus()),
             greeted: true,
             canceled_event: Event::new(),
@@ -209,8 +213,19 @@ impl Peer {
         }
     }
 
-    pub fn add_match_rule(&mut self, rule: OwnedMatchRule) {
-        self.match_rules.add(rule);
+    /// Add a match rule.
+    ///
+    /// Whether the peer did not have the rule already: see [`MatchRules::add`].
+    pub fn add_match_rule(&mut self, rule: OwnedMatchRule) -> bool {
+        let added = self.match_rules.add(rule);
+        self.peak_match_rules = self.peak_match_rules.max(self.match_rules.len());
+
+        added
+    }
+
+    /// The most match rules that the peer had at a time, since this instance of the bus has it.
+    pub fn peak_match_rules(&self) -> usize {
+        self.peak_match_rules
     }
 
     /// Remove the first rule that matches.
@@ -281,6 +296,7 @@ impl Peer {
             caller: Caller::new(unique_name.clone(), user.clone()),
             charge: Some(Charge::taken_over(&user, &user)),
             unique_name,
+            peak_match_rules: match_rules.len(),
             match_rules,
             pending_calls: Arc::new(PendingCalls::new(user)),
             greeted,
