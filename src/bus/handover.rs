@@ -250,7 +250,7 @@ pub(crate) struct NameState {
 
 /// The version of the encoding of the state: an instance of the bus that encodes its state
 /// otherwise doesn't take over from this one, nor this one from it.
-const VERSION: u32 = 3;
+const VERSION: u32 = 1;
 
 #[cfg(test)]
 mod tests {
