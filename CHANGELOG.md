@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.7.0 - 2026-11-13
+
+### ✨ Added
+- Serve the org.freedesktop.DBus.Debug.Stats interface. #453
+- Hand over to the next instance of busd through systemd's fdstore, under socket activation.
+- Hand the bus over to its next instance.
+- Tell systemd once the bus is ready.
+- Listen on the socket of systemd's socket activation.
+- Create a bus on a socket that listens already.
+
+### ♻️ Changed
+- Tell in peer::Stream which messages get their sender disconnected.
+- Pass what the task that serves a peer keeps of it in one struct.
+- Add a peer, and the bus itself, through one method.
+- Create the bus on its listener in a method of its own.
+- Put the public methods of Bus above its private helpers.
+
+### 📦 Dependencies
+- Update zbus to 6.3.0.
+- Update zruntime to v0.2.3 (#474).
+- Add zoter 0.1, for the hand-over through systemd's fdstore.
+
+### 📝 Documentation
+- Document the policies of the configuration.
+- Document how busd restarts through the fd store of systemd.
+- Say that the library is internal to busd. #440
+- Say in the README how busd runs under systemd.
+- Say what busd takes the net feature of rustix for.
+- Say that zbus keeps the credentials of each client.
+- Say in the README that busd is meant to serve as a system bus too.
+
+### 🐛 Fixed
+- Queue the owner that a name is taken over from.
+- Notify new name owners when a peer becomes a monitor.
+- Keep a peer in the queue of a name at most once.
+- List the Monitoring interface in the `Interfaces` property. #452
+- Color the logs only on a terminal.
+- Raise the soft limit of open file descriptors to the hard one.
+- Replace a socket file that no one listens on anymore.
+- Answer a call that its callee can't take, for its fds, with an error.
+- Pass the messages that go nowhere else on to the monitors.
+- Answer a call to a name that no peer has with an error. #393
+- Wait 10 s rather than 100 ms for a client to take a message.
+
+### ⚙️ Other
+- 🛂 Read the policy again on ReloadConfig.
+- 🛂 Enforce the policy of the configuration, but not its deprecated at_console policies. #79
+- 🛂 Keep the names that each peer owns or queues for.
+- 🛂 Add the policy that the bus is to enforce.
+- 🛂 Keep the policies and rules of the configuration that were dropped.
+- 📈 Count the connections, match rules and names of the bus.
+- 🚨 Fix the warnings of the documentation build.
+- 🛂 Let only privileged peers become monitors. #449
+- 🦺 Ignore an `<include>` of a file that is being read already. #195
+- 🔊 Log info, warnings and errors by default.
+- 🧵 Serve a monitor from the task that served its peer, on its stream.
+- 🧵 Clean up after a peer that becomes a monitor as it becomes one.
+- 🧵 Answer the calls to the bus in the order that they come in.
+- 🚩 Ask rustix for its std feature, which busd relies on.
+
+### ⚡️ Performance
+- Look the owners of names up without cloning them.
+- Add a script that builds busd with PGO. #200
+- Look the peers up by hash rather than in a tree. #389
+- Keep the peers, the monitors and the names behind one lock.
+- Keep the outbox of a peer from one batch to the next. #390
+
+### 🔥 Removed
+- Ignore `<auth>`, `<allow_anonymous>` and non-unix `<listen>`.
+- Drop the choice of authentication mechanism.
+- Drop support for the TCP transport. #433
+
+### 🔒️ Security
+- Refuse the name of the bus itself in RequestName and ReleaseName. #450
+- Disconnect a client that sends a message reserved for local use. #451
+- Limit the objects that the bus keeps for each user. #394
+
+### ✅ Testing
+- Benchmark how the bus hands its clients over to its next instance.
+- Check that a stalled handshake counts against the quota of its user.
+- Check that the bus tells the credentials of a stalled client at once.
+- Test that a message brings only the fds that its header declares.
+
 ## 0.6.1 - 2026-11-02
 
 ### 📝 Documentation
