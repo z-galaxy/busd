@@ -1651,8 +1651,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zoter"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d34853427c19816ddbaf0c4b2c4409156a9e27bd9f22d77cfad0803734fd12f"
+source = "git+https://github.com/z-galaxy/zoter?rev=7b3915f7deb4d13f9f3f54097578b0ad3964de0a#7b3915f7deb4d13f9f3f54097578b0ad3964de0a"
 dependencies = [
  "libc",
  "rustix",

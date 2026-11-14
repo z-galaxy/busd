@@ -154,3 +154,10 @@ debug = "full"
 [profile.bench]
 split-debuginfo = "off"
 strip = "none"
+
+# busd stores a hand-over whole, and takes one over whole, or fails, which zoter is yet to release:
+# until it does, busd builds on the revision of zoter that does so, and that zbus builds on too, as
+# Cargo patches it for both. This goes as busd takes that release from crates.io.
+[patch.crates-io.zoter]
+git = "https://github.com/z-galaxy/zoter"
+rev = "7b3915f7deb4d13f9f3f54097578b0ad3964de0a"

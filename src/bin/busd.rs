@@ -114,7 +114,7 @@ async fn run(
 
     // The store of systemd, which keeps what the bus hands over to its next instance. The next
     // instance raises its limit of open file descriptors as this one did, and takes what this one
-    // hands over under it, as the store takes this one to have it from now on.
+    // hands over under it, or nothing if that doesn't fit.
     #[cfg(target_os = "linux")]
     let mut store = zoter::Store::from_env(bus::STORE_KEY).unwrap_or_else(|e| {
         warn!("Ignoring `$NOTIFY_SOCKET`: {e}");

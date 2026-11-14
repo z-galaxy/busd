@@ -14,7 +14,7 @@ use std::{
     io::{self, IoSlice, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::{
-        fd::{AsFd, BorrowedFd, OwnedFd, RawFd},
+        fd::{AsFd, BorrowedFd, OwnedFd},
         unix::{
             net::{UnixListener, UnixStream},
             process::CommandExt,
@@ -249,20 +249,21 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     }
 }
 
-/// A bus that hands over as many clients as the next instance can take: the next instance takes
-/// their connection FDs out of the queue sockets, and opens their process FDs, under its hard limit
-/// of open FDs, so a bus with that limit low hands over fewer clients than it has, and the others
-/// get disconnected, losing their names.
+/// A next instance whose hard limit of open FDs is too low for the connection FDs that were handed
+/// over takes nothing over, rather than some of the clients: the first instance, which has no such
+/// limit, stores all of its clients, and the next one, which can't take their connection FDs out
+/// of the queue sockets, starts anyway on the listening socket that systemd passed it. It removes
+/// everything from the store, disconnects all of the clients of the previous instance, and serves
+/// new clients at the same address.
 #[test]
 #[timeout(60000)]
-fn hand_over_fits_the_fd_limit() {
+fn no_take_over_under_too_low_an_fd_limit() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
-    let low = Some(LOW_NOFILE);
 
-    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, low);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
     let clients: Vec<_> = (0..CLIENTS)
         .map(|i| {
@@ -272,21 +273,23 @@ fn hand_over_fits_the_fd_limit() {
         })
         .collect();
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(), FITTING_CLIENTS);
+    assert_eq!(systemd.check_stored(), CLIENTS);
 
     let removed = systemd.names();
-    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, low);
+    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(LOW_NOFILE));
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
+    assert!(socket.0.exists());
     let late = Client::connect(&address, None);
-    assert_eq!(served(&clients, &late), FITTING_CLIENTS);
+    assert_eq!(served(&clients, &late), 0);
+    assert_eq!(owner(&late, "org.freedesktop.DBus"), "org.freedesktop.DBus");
 }
 
 /// A bus that has no FD to spare, as it has as many open as its hard limit takes, still hands
 /// over: it keeps some free from the start for the state memfd, the queue socket and the pipe of
 /// the barrier, so it stores the state memfd, and the connection FDs of the clients whose client
-/// sockets it could duplicate and that fit under that limit. The next instance, under the same
-/// limit, serves the clients that were stored.
+/// sockets it could duplicate. The next instance, with a limit that they fit under, serves every
+/// client that was stored.
 #[test]
 #[timeout(60000)]
 fn hand_over_at_the_hard_fd_limit() {
@@ -295,8 +298,7 @@ fn hand_over_at_the_hard_fd_limit() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let hard = Some(HARD_NOFILE);
-    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, hard);
+    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(HARD_NOFILE));
     systemd.until_ready();
     // Clients connect until busd has hardly a file descriptor left.
     let mut clients = Vec::new();
@@ -313,7 +315,7 @@ fn hand_over_at_the_hard_fd_limit() {
     );
 
     let removed = systemd.names();
-    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, hard);
+    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(HIGH_NOFILE));
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
@@ -846,9 +848,8 @@ impl Systemd {
 
     /// Check that the store holds what a bus hands over, and give how many connection FDs that is.
     ///
-    /// That is its memfd first, so that a store too small for all of the stored FDs takes the
-    /// one that matters most, and then the queue sockets, which hold the connection FDs: the client
-    /// socket of each client, and its client-sent FDs.
+    /// That is its memfd first, and then the queue sockets, which hold the connection FDs: the
+    /// client socket of each client, and its client-sent FDs.
     fn check_stored(&mut self) -> usize {
         let names = self.manager.stored_names();
         let Some((state, queues)) = names.split_first() else {
@@ -901,22 +902,18 @@ const NAME: &str = "org.zbus.Fdstore";
 const UNIQUE_NAME_PREFIX: &str = ":busd.";
 /// How many file descriptors the service may store: `FileDescriptorStoreMax=` of its unit.
 const FDSTORE_MAX: usize = 16;
-/// A limit of open FDs under which the next instance takes the fitting clients and no more: the
-/// first of the passed FDs, the listening socket, the memfd and the queue sockets, as many as the
-/// store takes, and the spare FDs that busd keeps free, besides the clients, each of which takes
-/// its client socket and its process FD.
-const LOW_NOFILE: libc::rlim_t = (FIRST_FD as libc::rlim_t)
-    + 1
-    + FDSTORE_MAX as libc::rlim_t
-    + 32
-    + 2 * FITTING_CLIENTS as libc::rlim_t;
+/// A limit of open FDs that busd starts and serves under, but that the connection FDs of `CLIENTS`
+/// clients don't fit under, with the FDs that busd has open besides.
+const LOW_NOFILE: libc::rlim_t = 64;
+/// How many clients the test hands over to a next instance under `LOW_NOFILE`: one client socket
+/// each, as many as that limit takes, so that they can't all fit, while many of them would.
+const CLIENTS: usize = LOW_NOFILE as usize;
+/// The limit of open FDs of the bus that has hardly any to spare, and how many it has free.
 const HARD_NOFILE: libc::rlim_t = 64;
 const FREE_FDS: libc::rlim_t = 2;
-/// How many clients the test hands over, and how many of them fit under `LOW_NOFILE`.
-const CLIENTS: usize = 4;
-const FITTING_CLIENTS: usize = 2;
-/// The first of the passed FDs, `SD_LISTEN_FDS_START`.
-const FIRST_FD: RawFd = 3;
+/// A limit of open FDs that what a bus under `HARD_NOFILE` hands over fits under, with the process
+/// FD of each client.
+const HIGH_NOFILE: libc::rlim_t = 4 * HARD_NOFILE;
 /// How long the test waits for what should come soon, rather than hang if it never does.
 const WAIT: Duration = Duration::from_secs(10);
 /// The name of the unit of socket activation, which starts like the names of the stored FDs.
