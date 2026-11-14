@@ -1,8 +1,8 @@
 mod stream;
 pub use stream::*;
-use zruntime::{Event, EventListener};
 #[cfg(target_os = "linux")]
-use zruntime::{Shared, Task};
+use zruntime::{spawn, Shared, Task};
+use zruntime::{Event, EventListener};
 mod monitor;
 pub use monitor::*;
 mod recipient;
@@ -12,8 +12,12 @@ pub use pending_calls::*;
 
 use crate::trace;
 #[cfg(target_os = "linux")]
+use crate::warn;
+#[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(target_os = "linux")]
+use futures_util::future::join;
 use std::{sync::Arc, time::Duration};
 use zbus::{
     connection::{self, AuthMechanism},
@@ -148,7 +152,8 @@ impl Peer {
             unique_name,
             match_rules: MatchRules::default(),
             peak_match_rules: 0,
-            pending_calls: Arc::new(PendingCalls::of_bus()),
+            // The bus answers the calls to it itself, and keeps no records of them.
+            pending_calls: Arc::new(PendingCalls::new(user)),
             groups: Box::default(),
             policy: PeerPolicy::unrestricted(),
             greeted: true,
@@ -348,11 +353,11 @@ impl Peer {
     /// nor the hand-over of its connection, wait for it to take what the bus sends it from now on,
     /// as what it doesn't take goes on with the hand-over. That stops the write of what the
     /// instance of the bus that handed the peer over left unwritten, if it is still under way
-    /// ([`Peer::flush`]).
+    /// ([`Peer::flush`]). The bus itself pauses as its clients do.
     #[cfg(target_os = "linux")]
     pub(crate) fn pause(&mut self) {
         let prepared = self.conn.prepare_hand_over();
-        debug_assert!(prepared, "the connection of a client can't be handed over");
+        debug_assert!(prepared, "the connection of a peer can't be handed over");
         // The write waits for the peer to take it, for as long as the peer has to take a message,
         // and holds the turn to write meanwhile, which the sends to the peer and the hand-over of
         // its connection wait for. Dropping its task lets go of the turn, and leaves what it didn't
@@ -367,6 +372,30 @@ impl Peer {
     #[cfg(target_os = "linux")]
     pub(crate) fn flush(&mut self) {
         self.flushing = self.recipient.flush();
+    }
+
+    /// Write what the instance of the bus that handed over left unwritten on the connection of the
+    /// bus itself, of which this is the peer and `service` the other end, if anything, in a task
+    /// of its own, until the bus pauses the peer, to hand over in turn ([`Peer::pause`]), or lets
+    /// go of it: the calls to the bus that this end took and didn't pass on, and what the bus sent
+    /// and `service` didn't pass on. Each end writes that ahead of what it sends, but only once
+    /// it sends, or is told to here.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn flush_us(&mut self, service: &Connection) {
+        if self.conn.unwritten_len() == 0 && service.unwritten_len() == 0 {
+            return;
+        }
+        let (peer, service) = (self.conn.clone(), service.clone());
+        self.flushing = Some(spawn(async move {
+            let (to_bus, from_bus) = join(peer.flush(), service.flush()).await;
+            for (flushed, what) in [(to_bus, "the calls to the bus"), (from_bus, "the messages")] {
+                if let Err(e) = flushed {
+                    warn!(
+                        "Failed to pass {what} of the bus on, which it was handed over with: {e}"
+                    );
+                }
+            }
+        }));
     }
 
     /// The stream of the messages of the peer, if the task that served the peer gave it back, as
@@ -405,7 +434,7 @@ fn groups(creds: &ConnectionCredentials) -> Box<[u32]> {
 }
 
 /// The number of the bus, as a peer of its own.
-const BUS_ID: usize = 0;
+pub(crate) const BUS_ID: usize = 0;
 
 /// How many file descriptors a message may carry: as many as Linux passes in one write
 /// (`SCM_MAX_FD`), which is how zbus passes those of a message.

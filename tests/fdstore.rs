@@ -92,6 +92,74 @@ fn restart() {
     assert_eq!(systemd.check_stored(), 3);
 }
 
+/// The calls to the bus that are on their way as systemd stops it get their replies, each once, in
+/// the order of the calls: the instance that stops answers those that it took, and stores the
+/// others, with the replies that it didn't pass on, along with its state, as it hands over the
+/// connection on which it serves the D-Bus API. The next instance answers those calls, and passes
+/// those replies on, as it does what the client sent and the instance that stopped didn't read.
+#[test]
+#[timeout(60000)]
+fn restart_with_calls_to_the_bus_on_their_way() {
+    let _serial = serialize();
+    let socket = Removed(temp_path());
+    let address = socket.address();
+    let mut systemd = Systemd::activating(&socket.0);
+
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
+    systemd.until_ready();
+    let client = Client::connect(&address, None);
+    let mut messages = MessageStream::from(&client.connection);
+    let call = |member: &str, name: String| {
+        Message::method_call("/org/freedesktop/DBus", member)
+            .destination("org.freedesktop.DBus")
+            .interface("org.freedesktop.DBus")
+            .build(&name)
+            .unwrap()
+    };
+    // And one more, once the next instance runs, whose reply comes right after the others if none
+    // comes twice.
+    let calls: Vec<_> = (0..=CALLS_ON_THEIR_WAY)
+        .map(|i| call("NameHasOwner", format!("{NAME}{i}")))
+        .collect();
+    let (last, on_their_way) = calls.split_last().unwrap();
+    // The client takes the replies as they come, so that the bus never waits for it.
+    let replies = calls.len();
+    let answering = SharedRuntime::current()
+        .unwrap()
+        .spawn("replies", async move {
+            let mut answered = Vec::new();
+            while answered.len() < replies {
+                let msg = messages.next().await.unwrap().unwrap();
+                if msg.message_type() == message::Type::MethodReturn {
+                    answered.push(msg.header().reply_serial().unwrap());
+                }
+            }
+
+            answered
+        });
+    // The bus is told to stop while it answers the calls: once the socket took the last of them,
+    // which it only does once the bus read most of them.
+    zruntime::block_on(within(async {
+        for call in on_their_way {
+            client.connection.send(call).await.unwrap();
+        }
+    }));
+    hand_over(&mut first, &mut systemd, &socket);
+
+    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
+    systemd.until_ready();
+    let answered = zruntime::block_on(within(async {
+        client.connection.send(last).await.unwrap();
+
+        answering.await.unwrap()
+    }));
+    let expected: Vec<_> = calls
+        .iter()
+        .map(|call| call.primary_header().serial_num())
+        .collect();
+    assert_eq!(answered, expected);
+}
+
 /// File descriptors that a client sent ahead of the message that they are for, as the specification
 /// allows, which busd read but no message took by the time that it hands over, are stored with the
 /// socket of the client, and the next instance passes them on with that message.
@@ -914,6 +982,8 @@ const FREE_FDS: libc::rlim_t = 2;
 /// A limit of open FDs that what a bus under `HARD_NOFILE` hands over fits under, with the process
 /// FD of each client.
 const HIGH_NOFILE: libc::rlim_t = 4 * HARD_NOFILE;
+/// How many calls a client makes to a bus that is told to stop while it answers them.
+const CALLS_ON_THEIR_WAY: u32 = 5000;
 /// How long the test waits for what should come soon, rather than hang if it never does.
 const WAIT: Duration = Duration::from_secs(10);
 /// The name of the unit of socket activation, which starts like the names of the stored FDs.

@@ -60,8 +60,8 @@ impl DBus {
 // The bus answers the calls one at a time, in the order that they come in, rather than in a task of
 // its own for each, as the reference implementation of D-Bus and dbus-broker do: the calls that a
 // client makes one after the other get their replies, and have the bus send their signals, in that
-// order. On Linux, a call of the bus to itself, as a barrier, so comes back once the bus is done
-// with the calls before it: see `Peers::settle`.
+// order. On Linux, a bus that hands over so answers the calls that it took, and leaves the others,
+// in that order, to its next instance: see `Peers::settle`.
 //
 // So a method must never wait for anything that waits for the bus to take the calls after the one
 // that it answers, or the bus waits for ever. The calls on their way to the bus wait for it to take

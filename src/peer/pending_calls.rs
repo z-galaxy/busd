@@ -6,7 +6,6 @@ use std::{
 };
 
 use zbus::names::OwnedUniqueName;
-use zruntime::Event;
 
 use crate::user::{Charge, User};
 
@@ -21,19 +20,16 @@ use crate::user::{Charge, User};
 ///
 /// Each record is an object that the bus keeps for the user of the callee, on behalf of the user of
 /// the caller, as with dbus-broker, for as long as it is kept, so that a caller can't have the bus
-/// keep records without end, of calls to a peer that never answers. The records of the calls to the
-/// bus itself are no one's objects: see [`PendingCalls::of_bus`].
+/// keep records without end, of calls to a peer that never answers. The bus keeps no records of
+/// the calls to itself, which it answers itself, as they come in, as dbus-broker keeps none.
 ///
 /// The records of a peer are shared between the peer and the task that serves it, as the peer
 /// goes, when it becomes a monitor, before its task does.
 #[derive(Debug)]
 pub struct PendingCalls {
     calls: Mutex<Calls>,
-    /// The user of the peer, which the records are objects of; none for the bus itself.
-    user: Option<Arc<User>>,
-    /// Notified as the last record goes, for the records of the bus itself alone: see
-    /// [`PendingCalls::of_bus`].
-    emptied: Option<Event>,
+    /// The user of the peer, which the records are objects of.
+    user: Arc<User>,
 }
 
 impl PendingCalls {
@@ -41,23 +37,7 @@ impl PendingCalls {
     pub fn new(user: Arc<User>) -> Self {
         Self {
             calls: Mutex::default(),
-            user: Some(user),
-            emptied: None,
-        }
-    }
-
-    /// No calls yet, to the bus itself.
-    ///
-    /// The bus answers the calls to it itself, as they come in, and only records them for a
-    /// hand-over to wait for its answers, so their records are no one's objects, and the bus
-    /// refuses none of them for a quota: dbus-broker keeps no records of the calls to it at all.
-    /// Unlike those of a client, the records tell as the last of them goes, which the hand-over
-    /// waits for.
-    pub fn of_bus() -> Self {
-        Self {
-            calls: Mutex::default(),
-            user: None,
-            emptied: Some(Event::new()),
+            user,
         }
     }
 
@@ -73,12 +53,7 @@ impl PendingCalls {
         match self.calls().entry((caller_id, serial)) {
             Entry::Occupied(_) => Err(Refusal::SerialPending),
             Entry::Vacant(call) => {
-                let charge = match &self.user {
-                    Some(user) => {
-                        Some(Charge::new(user, &caller.user).ok_or(Refusal::QuotaExceeded)?)
-                    }
-                    None => None,
-                };
+                let charge = Charge::new(&self.user, &caller.user).ok_or(Refusal::QuotaExceeded)?;
                 call.insert(Call {
                     caller: caller.clone(),
                     _charge: charge,
@@ -92,33 +67,12 @@ impl PendingCalls {
     /// Take the record of the call of the caller whose number is `caller_id`, with `serial`, away,
     /// if there is one, in which case it's `true`.
     pub fn remove(&self, caller_id: usize, serial: NonZeroU32) -> bool {
-        let emptied = {
-            let mut calls = self.calls();
-            if calls.remove(&(caller_id, serial)).is_none() {
-                return false;
-            }
-
-            calls.is_empty()
-        };
-        if emptied {
-            self.notify_emptied();
-        }
-
-        true
+        self.calls().remove(&(caller_id, serial)).is_some()
     }
 
     /// Forget the calls of the caller whose number is `caller_id`, which goes.
     pub fn forget(&self, caller_id: usize) {
-        let emptied = {
-            let mut calls = self.calls();
-            let had_any = !calls.is_empty();
-            calls.retain(|(id, _), _| *id != caller_id);
-
-            had_any && calls.is_empty()
-        };
-        if emptied {
-            self.notify_emptied();
-        }
+        self.calls().retain(|(id, _), _| *id != caller_id);
     }
 
     /// Record the call of `caller`, whose number is `caller_id`, with `serial`, which another
@@ -131,10 +85,7 @@ impl PendingCalls {
         caller: &Arc<Caller>,
         serial: NonZeroU32,
     ) {
-        let charge = self
-            .user
-            .as_ref()
-            .map(|user| Charge::taken_over(user, &caller.user));
+        let charge = Charge::taken_over(&self.user, &caller.user);
         self.calls().insert(
             (caller_id, serial),
             Call {
@@ -158,58 +109,16 @@ impl PendingCalls {
         records.into_iter()
     }
 
-    /// Whether no call waits.
-    pub fn is_empty(&self) -> bool {
-        self.calls().is_empty()
-    }
-
     /// Take all of the records away: the caller and the serial of each call.
     pub fn take(&self) -> impl Iterator<Item = (OwnedUniqueName, NonZeroU32)> {
-        let calls = mem::take(&mut *self.calls());
-        if !calls.is_empty() {
-            self.notify_emptied();
-        }
-
-        calls
+        mem::take(&mut *self.calls())
             .into_iter()
             .map(|((_, serial), call)| (call.caller.unique_name.clone(), serial))
-    }
-
-    /// Wait for no call to wait, as a hand-over waits for the bus to have answered every call to
-    /// it.
-    ///
-    /// # Panics
-    ///
-    /// If these are the records of a client, which don't tell as their last one goes: only those of
-    /// the bus itself do ([`PendingCalls::of_bus`]).
-    #[cfg(target_os = "linux")]
-    pub(crate) async fn answered(&self) {
-        let emptied = self
-            .emptied
-            .as_ref()
-            .expect("the records of a client don't tell as their last one goes");
-        loop {
-            // The listener comes first, so that the last record going right after the check isn't
-            // missed.
-            let listener = emptied.listen();
-            if self.is_empty() {
-                return;
-            }
-            listener.await;
-        }
     }
 
     fn calls(&self) -> MutexGuard<'_, Calls> {
         // Nothing can panic while the lock is held.
         self.calls.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Tell those that wait for no call to wait that the last record went, where the records tell
-    /// that. Called clear of the lock, as the wakes are somebody else's code.
-    fn notify_emptied(&self) {
-        if let Some(emptied) = &self.emptied {
-            emptied.notify(usize::MAX);
-        }
     }
 }
 
@@ -256,7 +165,6 @@ type Calls = HashMap<(usize, NonZeroU32), Call, foldhash::fast::RandomState>;
 #[derive(Debug)]
 struct Call {
     caller: Arc<Caller>,
-    /// The record, as an object that the bus keeps for the user of the callee; none for a call to
-    /// the bus itself.
-    _charge: Option<Charge>,
+    /// The record, as an object that the bus keeps for the user of the callee.
+    _charge: Charge,
 }
