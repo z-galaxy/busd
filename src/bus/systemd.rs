@@ -33,17 +33,21 @@
 //! activation and what was stored, which it takes over from ([`Bus::for_systemd`]):
 #![doc = simple_mermaid::mermaid!("systemd/restart.mmd")]
 //!
-//! zoter lays the hand-over out in the store: a memfd, under `busd/state`, which holds the state
-//! of the bus and the record of the connection of each client, read in place, and sockets, under
-//! `busd/fds`, whose queues hold the connection FDs, some 70000 in each, as many as that takes.
-//! The state of the bus refers to each client by its number, which zoter gives back with its
-//! connection.
+//! zoter lays the hand-over out in the store: sockets, under `busd/fds`, whose queues hold the
+//! connection FDs, some 70000 in each, as many as that takes, and a memfd, under `busd/state`,
+//! stored last, which holds the state of the bus and the record of the connection of each client,
+//! read in place. The state of the bus refers to each client by its number, which zoter gives back
+//! with its connection.
 //!
-//! The next instance takes the connection FDs out once it raised its soft limit of open FDs to the
-//! hard one, so they have to fit under that, with the process FD of each client, which zoter sees
-//! to: the clients that don't fit get disconnected as the bus goes. A client-sent FD that is of the
-//! same open file description as another, as one that a client sent twice, goes as it is, unlike in
-//! the store, which keeps one FD of each.
+//! zoter stores a hand-over whole, or fails to, which leaves nothing for the next instance to take
+//! over. The next instance takes the connection FDs out once it raised its soft limit of open FDs
+//! to the hard one, so they have to fit under that, with the process FD of each client, which it
+//! opens as it serves the client on. zoter leaves a client whose connection FDs didn't all come,
+//! as those over that limit, out of the take-over, and the next instance disconnects one whose
+//! process FD it then can't open. It serves the others on, as far as its limit of open FDs lets
+//! it, and cleans up after those that it didn't take over as after any client that goes. A
+//! client-sent FD that is of the same open file description as another, as one that a client sent
+//! twice, goes as it is, unlike in the store, which keeps one FD of each.
 //!
 //! # Socket activation
 //!
@@ -75,15 +79,16 @@ impl Bus {
     /// of the service, `store`, if any.
     ///
     /// The bus listens on the listening socket of the socket activation, if systemd passed one,
-    /// whatever `address` says, and takes over there from the instance that handed over through
-    /// the store, as [`Bus::hand_over_to_systemd`] does, if one did. Taking over may fail, as when
-    /// the previous instance encoded its state otherwise: the clients that were handed over get
-    /// disconnected then, and the bus starts as if nothing was handed over. Without socket
-    /// activation, the bus listens at `address`, as [`Bus::for_address`] does, and drops what was
-    /// handed over, if anything, which disconnects the clients. busd listens on one socket, so
-    /// this fails if systemd passed more than one listening socket of socket activation. What was
-    /// stored is removed from the store first, so that whatever comes of it, the instances that
-    /// come after don't find it again.
+    /// whatever `address` says, and takes over there from the instance that handed over through the
+    /// store, as [`Bus::hand_over_to_systemd`] does, if one did. Taking over may fail, as when the
+    /// previous instance encoded its state otherwise: the clients that were handed over get
+    /// disconnected then, and the bus starts as if nothing was handed over. A client whose
+    /// connection FDs don't all fit under the limit of open FDs of this instance gets disconnected,
+    /// while the bus takes over the others. Without socket activation, the bus listens at
+    /// `address`, as [`Bus::for_address`] does, and drops what was handed over, if anything, which
+    /// disconnects the clients. busd listens on one socket, so this fails if systemd passed more
+    /// than one listening socket of socket activation. What was stored is removed from the store
+    /// first, so that whatever comes of it, the instances that come after don't find it again.
     ///
     /// The bus goes by `policy`, as [`Bus::set_policy`] sets it, and the clients that it takes over
     /// do from the start, as with [`Bus::take_over`].
@@ -141,13 +146,14 @@ impl Bus {
     ///
     /// The bus hands over as [`Bus::hand_over`] does, and stores what it hands over, for
     /// [`Bus::for_systemd`] to take over from on the restart: its state, and the connections of its
-    /// clients, each under the number of its client, with one FD more for each in the next
-    /// instance, its process FD. The clients that don't fit, under the limit of open FDs of the
-    /// next instance or in the store, get disconnected as the bus goes, with a warning. It fails if
-    /// the bus takes longer than 30 s to hand over, or if storing fails, which disconnects the
-    /// clients as the bus goes.
+    /// clients, each under the number of its client. It stores all of them or fails: it fails if
+    /// the bus takes longer than 30 s to hand over, or if storing fails, as when the FDs of the
+    /// hand-over don't fit in the store, which disconnects the clients as the bus goes. The next
+    /// instance needs to be able to open the connection FDs and the process FD of each client
+    /// under its limit of open FDs: it disconnects the clients whose FDs it can't open, and takes
+    /// the others over.
     pub async fn hand_over_to_systemd(self, store: Store) -> Result<()> {
-        let Some(mut to_store) = self.start_hand_over(store) else {
+        let Some(to_store) = self.start_hand_over(store) else {
             if let Err(e) = self.cleanup().await {
                 error!("Failed to clean up: {e}");
             }
@@ -160,7 +166,6 @@ impl Bus {
             .await
             .context("The bus took too long to hand over")??;
 
-        to_store.set_extra_fds_per_item(1);
         let state = handover.state.encode()?;
         let clients = handover
             .clients
@@ -270,12 +275,23 @@ impl Handover {
     /// state can be decoded.
     ///
     /// Each client gets its connection back from the record of its connection, read in place, and
-    /// from its connection FDs. One whose connection can't be restored, or whose connection FDs
-    /// are missing, is gone: the next instance cleans up after it as after any client that goes.
-    /// If the state can't be decoded, everything that was handed over closes, which disconnects
-    /// the clients.
+    /// from its connection FDs. One whose connection can't be restored, or that zoter left out, as
+    /// not all of its connection FDs came, is gone: the next instance cleans up after it as after
+    /// any client that goes. If the state can't be decoded, everything that was handed over
+    /// closes, which disconnects the clients.
     fn from_restored(mut restored: Restored) -> Result<Self> {
         let state = State::decode(restored.state())?;
+        let left_out = restored.left_out().len();
+        if left_out > 0 {
+            warn!(
+                "Leaving out {left_out} of the clients that were handed over, as not all of the \
+                 FDs of their connections came, as when the bus has too many open: raise the hard \
+                 limit of `LimitNOFILE=` of the service."
+            );
+            for id in restored.left_out() {
+                debug!("Leaving `:busd.{id}` out, as not all of the FDs of its connection came");
+            }
+        }
         let mut clients = Vec::new();
         for item in restored.take_items() {
             let Ok(id) = usize::try_from(item.id) else {

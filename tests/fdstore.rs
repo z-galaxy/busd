@@ -14,7 +14,7 @@ use std::{
     io::{self, IoSlice, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::{
-        fd::{AsFd, BorrowedFd, OwnedFd, RawFd},
+        fd::{AsFd, BorrowedFd, OwnedFd},
         unix::{
             net::{UnixListener, UnixStream},
             process::CommandExt,
@@ -249,44 +249,84 @@ fn restart_with_fds_of_one_file_sent_ahead() {
     }
 }
 
-/// A bus that hands over as many clients as the next instance can take: the next instance takes
-/// their connection FDs out of the queue sockets, and opens their process FDs, under its hard limit
-/// of open FDs, so a bus with that limit low hands over fewer clients than it has, and the others
-/// get disconnected, losing their names.
+/// A next instance whose hard limit of open FDs is too low for all of the connection FDs that were
+/// handed over takes over the clients whose connection FDs came whole, and leaves out the others,
+/// which get disconnected, their names released, while it serves on.
+///
+/// Two of the clients sent `AHEAD` FDs ahead, a heavy client each, and the limit takes the
+/// connection FDs of one of them but not of two. The order of the clients in the hand-over isn't
+/// fixed, so the one that comes first fits, whichever it is, and the other doesn't, nor do the
+/// plain clients after it. The FDs of a client that didn't come whole close, so the bus is far
+/// from its limit once it took over, and a late client connects as any other.
 #[test]
 #[timeout(60000)]
-fn hand_over_fits_the_fd_limit() {
+fn take_over_leaves_out_the_clients_that_do_not_fit_the_fd_limit() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
-    let low = Some(LOW_NOFILE);
+    let null = File::open("/dev/null").unwrap();
+    let fds: Vec<_> = (0..AHEAD).map(|_| null.as_fd()).collect();
 
-    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, low);
+    let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
-    let clients: Vec<_> = (0..CLIENTS)
+    let clients: Vec<_> = (0..PLAIN_CLIENTS)
         .map(|i| {
             let name = format!("{NAME}{i}");
 
             (Client::connect(&address, Some(&name)), name)
         })
         .collect();
+    let mut heavy: Vec<_> = (0..2)
+        .map(|i| {
+            let name = format!("{NAME}.Heavy{i}");
+            let mut client = FdClient::connect(&socket.0, &fds).unwrap();
+            client.request_name(&name).unwrap();
+
+            (client, name)
+        })
+        .collect();
+    for (_, name) in &heavy {
+        until_owned(&clients[0].0, name);
+    }
     hand_over(&mut first, &mut systemd, &socket);
-    assert_eq!(systemd.check_stored(), FITTING_CLIENTS);
+    assert_eq!(systemd.check_stored(), PLAIN_CLIENTS + 2 * (1 + AHEAD));
 
     let removed = systemd.names();
-    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, low);
+    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(ONE_HEAVY_NOFILE));
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
-    assert_eq!(served(&clients, &late), FITTING_CLIENTS);
+    // The plain clients are served, or disconnected and their names released, according to where
+    // they came in the hand-over.
+    served(&clients, &late);
+    let (whole, left_out): (Vec<_>, Vec<_>) = heavy
+        .iter_mut()
+        .partition(|(_, name)| try_owner(&late, name).is_ok());
+    assert_eq!(
+        (whole.len(), left_out.len()),
+        (1, 1),
+        "not exactly one heavy client was taken over"
+    );
+    // The one that was taken over has all of its FDs: the next one that it sent ahead goes on
+    // with its signal.
+    let mut messages = MessageStream::from(&late.connection);
+    let (taken_over, _) = whole.into_iter().next().unwrap();
+    taken_over.send_for_fd(&late.unique_name).unwrap();
+    let _ = received_fd(&mut messages);
+    // The other one is disconnected: its socket ends once it is drained of what the instance
+    // before sent it.
+    let (dropped, _) = left_out.into_iter().next().unwrap();
+    let mut sent = Vec::new();
+    dropped.0.read_to_end(&mut sent).unwrap();
+    assert_eq!(owner(&late, "org.freedesktop.DBus"), "org.freedesktop.DBus");
 }
 
 /// A bus that has no FD to spare, as it has as many open as its hard limit takes, still hands
 /// over: it keeps some free from the start for the state memfd, the queue socket and the pipe of
 /// the barrier, so it stores the state memfd, and the connection FDs of the clients whose client
-/// sockets it could duplicate and that fit under that limit. The next instance, under the same
-/// limit, serves the clients that were stored.
+/// sockets it could duplicate. The next instance, with a limit that they fit under, serves every
+/// client that was stored.
 #[test]
 #[timeout(60000)]
 fn hand_over_at_the_hard_fd_limit() {
@@ -295,8 +335,7 @@ fn hand_over_at_the_hard_fd_limit() {
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
-    let hard = Some(HARD_NOFILE);
-    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, hard);
+    let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(HARD_NOFILE));
     systemd.until_ready();
     // Clients connect until busd has hardly a file descriptor left.
     let mut clients = Vec::new();
@@ -313,7 +352,7 @@ fn hand_over_at_the_hard_fd_limit() {
     );
 
     let removed = systemd.names();
-    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, hard);
+    let _second = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(HIGH_NOFILE));
     systemd.until_ready();
     assert_eq!(systemd.take_removed(), removed);
     let late = Client::connect(&address, None);
@@ -512,6 +551,15 @@ fn try_owner(client: &Client, name: &str) -> zbus::Result<String> {
     }))
 }
 
+/// Wait until `client` sees that `name` has an owner.
+fn until_owned(client: &Client, name: &str) {
+    let deadline = Instant::now() + WAIT;
+    while try_owner(client, name).is_err() {
+        assert!(Instant::now() < deadline, "no one owns {name}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// How many of `clients`, each with the name that it owned, the bus serves on, as they and `late`,
 /// a client that connected since, ask it: each still owns its name, or else is disconnected, and
 /// its name is no one's.
@@ -630,6 +678,17 @@ impl FdClient {
         assert_eq!(fixed[1], 2, "the bus didn't reply to `Hello`");
 
         Ok(Self(stream))
+    }
+
+    /// Ask the bus for the name `name`, without waiting for the reply.
+    fn request_name(&mut self, name: &str) -> io::Result<()> {
+        let call = Message::method_call("/org/freedesktop/DBus", "RequestName")
+            .destination("org.freedesktop.DBus")
+            .interface("org.freedesktop.DBus")
+            .build(&(name, 0u32))
+            .unwrap();
+
+        self.0.write_all(call.data().bytes())
     }
 
     /// Send `destination` the signal that the next file descriptor that the client sent ahead is
@@ -846,12 +905,12 @@ impl Systemd {
 
     /// Check that the store holds what a bus hands over, and give how many connection FDs that is.
     ///
-    /// That is its memfd first, so that a store too small for all of the stored FDs takes the
-    /// one that matters most, and then the queue sockets, which hold the connection FDs: the client
-    /// socket of each client, and its client-sent FDs.
+    /// That is the queue sockets, which hold the connection FDs, the client socket of each client
+    /// and its client-sent FDs, and then its memfd, last, so that a hand-over that fails to be
+    /// stored leaves nothing that the next instance takes over.
     fn check_stored(&mut self) -> usize {
         let names = self.manager.stored_names();
-        let Some((state, queues)) = names.split_first() else {
+        let Some((state, queues)) = names.split_last() else {
             panic!("busd stored nothing");
         };
         assert_eq!(state, "busd/state", "busd stored {names:?}");
@@ -901,22 +960,18 @@ const NAME: &str = "org.zbus.Fdstore";
 const UNIQUE_NAME_PREFIX: &str = ":busd.";
 /// How many file descriptors the service may store: `FileDescriptorStoreMax=` of its unit.
 const FDSTORE_MAX: usize = 16;
-/// A limit of open FDs under which the next instance takes the fitting clients and no more: the
-/// first of the passed FDs, the listening socket, the memfd and the queue sockets, as many as the
-/// store takes, and the spare FDs that busd keeps free, besides the clients, each of which takes
-/// its client socket and its process FD.
-const LOW_NOFILE: libc::rlim_t = (FIRST_FD as libc::rlim_t)
-    + 1
-    + FDSTORE_MAX as libc::rlim_t
-    + 32
-    + 2 * FITTING_CLIENTS as libc::rlim_t;
+/// A limit of open FDs under which the next instance takes the connection FDs of one heavy client,
+/// its client socket and `AHEAD` client-sent FDs, with those of the `PLAIN_CLIENTS` and the FDs
+/// that busd has open besides, a few dozen, but not those of two heavy clients.
+const ONE_HEAVY_NOFILE: libc::rlim_t = (AHEAD + AHEAD / 2) as libc::rlim_t;
+/// How many clients with no client-sent FDs the test hands over besides the heavy ones.
+const PLAIN_CLIENTS: usize = 3;
+/// The limit of open FDs of the bus that has hardly any to spare, and how many it has free.
 const HARD_NOFILE: libc::rlim_t = 64;
 const FREE_FDS: libc::rlim_t = 2;
-/// How many clients the test hands over, and how many of them fit under `LOW_NOFILE`.
-const CLIENTS: usize = 4;
-const FITTING_CLIENTS: usize = 2;
-/// The first of the passed FDs, `SD_LISTEN_FDS_START`.
-const FIRST_FD: RawFd = 3;
+/// A limit of open FDs that what a bus under `HARD_NOFILE` hands over fits under, with the process
+/// FD of each client.
+const HIGH_NOFILE: libc::rlim_t = 4 * HARD_NOFILE;
 /// How long the test waits for what should come soon, rather than hang if it never does.
 const WAIT: Duration = Duration::from_secs(10);
 /// The name of the unit of socket activation, which starts like the names of the stored FDs.
