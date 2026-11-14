@@ -192,23 +192,40 @@ impl Peers {
         Ok(())
     }
 
-    /// Add the bus itself, which serves the D-Bus API on `conn`: what the bus sends on it comes out
-    /// of `msg_stream`.
+    /// Add the bus itself, which serves the D-Bus API on the connection of `us`, and return the
+    /// end of the connection on which it answers the calls to it.
     ///
-    /// It fails as [`Peer::new_us`] does.
-    pub async fn add_us(
-        self: &Arc<Self>,
-        msg_stream: zbus::MessageStream,
-        conn: Connection,
-    ) -> Result<()> {
-        *self.bus_conn() = Some(conn);
+    /// It fails as [`Peer::new_us`] does, and if that end fails to be built.
+    pub async fn add_us(self: &Arc<Self>, us: Us) -> Result<Connection> {
+        let mut routing = self.routing_mut().await;
+
+        self.insert_us(&mut routing, us).await
+    }
+
+    /// Add the bus itself to the peers of `routing`, as [`Peers::add_us`] does, under the lock of
+    /// `routing`, which the caller holds.
+    ///
+    /// The object server of the bus answers the calls that the bus was handed over with as soon as
+    /// its end of the connection is built, and the bus passes what it was handed over with on as
+    /// soon as it is added. The methods of the bus, and the task that serves it, wait for the lock
+    /// of `routing` for that, so neither goes by anything short of what the caller puts there
+    /// before it lets go of the lock.
+    async fn insert_us(self: &Arc<Self>, routing: &mut Routing, us: Us) -> Result<Connection> {
+        let Us { service, stream } = us;
         // The user of the process of the bus, as with dbus-broker.
         let user = self.users.user(self.uid);
-        let (peer, peer_stream) = Peer::new_us(msg_stream, user).await?;
+        let (peer, peer_stream) = Peer::new_us(stream, user).await?;
+        let conn = service.build().await?;
+        *self.bus_conn() = Some(conn.clone());
+        self.insert(routing, peer, peer_stream);
+        // Each end of the connection writes what the instance before this one left unwritten
+        // there, if anything, ahead of what it sends.
+        #[cfg(target_os = "linux")]
+        if let Some(peer) = routing.peers.get_mut(fdo::BUS_NAME) {
+            peer.flush_us(&conn);
+        }
 
-        self.insert(&mut *self.routing_mut().await, peer, peer_stream);
-
-        Ok(())
+        Ok(conn)
     }
 
     /// Let go of the connection on which the bus serves the D-Bus API, as the bus goes.
@@ -441,8 +458,6 @@ impl Peers {
             pending_calls,
             caller,
         } = peer;
-        #[cfg(target_os = "linux")]
-        let from_bus = *unique_name == fdo::BUS_NAME;
         let mut batch = Vec::new();
         let mut outbox = Outbox::default();
         // Whether the peer became a monitor, or the bus pauses to hand over, rather than the peer
@@ -488,14 +503,6 @@ impl Peers {
                 }
             }
 
-            // The replies to the barriers of a hand-over come back to the bus itself, which they
-            // end the wait of once the messages of the bus before them are on their way too.
-            #[cfg(target_os = "linux")]
-            let barrier = if from_bus {
-                handover::take_barriers(&mut batch)
-            } else {
-                None
-            };
             self.forward(
                 &unique_name,
                 id,
@@ -506,10 +513,6 @@ impl Peers {
             )
             .await?;
             batch.clear();
-            #[cfg(target_os = "linux")]
-            if let Some(serial) = barrier {
-                self.barrier_returned(serial);
-            }
             if let Some(violation) = violation {
                 warn!("Disconnecting `{unique_name}`, as it sent {violation}");
 
@@ -713,9 +716,9 @@ impl Peers {
     /// of its caller has as many of the objects of the user of the callee as it may, in which case
     /// the bus refuses it, with an error, as dbus-broker does. A reply, or an error, of `sender`
     /// only goes on to its destination if it answers one of the calls that wait on `sender`,
-    /// `pending_calls`. The calls to the bus are recorded too, so that a hand-over can wait for the
-    /// bus to answer them, but the bus never refuses them, nor counts them against any user, and
-    /// its own replies go on whatever they answer.
+    /// `pending_calls`. The calls to the bus itself are not recorded, as with dbus-broker: the bus
+    /// answers them itself, so it refuses none of them, and its own replies go on whatever they
+    /// answer.
     ///
     /// A call to a name that no peer has gets an error from the bus, as with dbus-broker, unless
     /// it expects no reply, and so does one with file descriptors to a callee that didn't negotiate
@@ -803,16 +806,15 @@ impl Peers {
                     };
                     let msg_type = msg.message_type();
                     // A reply takes the record of the call that it answers away. One of the bus,
-                    // which records the calls to it too, goes on whatever it answers.
-                    let answers_none =
-                        matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
-                            && !match (peer, header.reply_serial()) {
-                                (Some((_, peer)), Some(serial)) => {
-                                    pending_calls.remove(peer.id(), serial)
-                                }
-                                _ => false,
+                    // which keeps no records of the calls to it, goes on whatever it answers.
+                    let answers_none = !from_bus
+                        && matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
+                        && !match (peer, header.reply_serial()) {
+                            (Some((_, peer)), Some(serial)) => {
+                                pending_calls.remove(peer.id(), serial)
                             }
-                            && !from_bus;
+                            _ => false,
+                        };
                     let primary = msg.primary_header();
                     let flags = primary.flags();
                     let is_call = msg_type == message::Type::MethodCall;
@@ -841,7 +843,8 @@ impl Peers {
                             }
                         }
                         (Some((name, peer)), None) => {
-                            let refusal = if expects_reply {
+                            // The bus answers the calls to it itself, so they wait on no record.
+                            let refusal = if expects_reply && *name != fdo::BUS_NAME {
                                 peer.pending_calls()
                                     .add(sender_id, caller, primary.serial_num())
                                     .err()
@@ -849,10 +852,10 @@ impl Peers {
                                 None
                             };
                             match refusal {
-                                Some(refusal) if *name != fdo::BUS_NAME => {
+                                Some(refusal) => {
                                     rejected.push((msg.clone(), Rejection::from(refusal)))
                                 }
-                                _ => outbox.add(msgs, peer.id(), peer.recipient(), i),
+                                None => outbox.add(msgs, peer.id(), peer.recipient(), i),
                             }
                         }
                         (None, _) => {
@@ -1102,6 +1105,17 @@ impl Drop for Chore {
     }
 }
 
+/// The connection on which the bus serves the D-Bus API as a peer of its own, for the bus to be
+/// added to its peers ([`Peers::add_us`]): a new one, or the one that the instance of the bus
+/// before this one handed over, with what was on its way between the bus and its clients.
+#[derive(Debug)]
+pub struct Us {
+    /// The end on which the bus answers the calls to it, yet to be built.
+    pub service: connection::Builder<'static>,
+    /// The stream of the messages of the other end: what the bus sends comes out of it.
+    pub stream: MessageStream,
+}
+
 /// What the task that serves a peer keeps of the peer: see [`Peers::serve_peer`].
 struct Served {
     unique_name: OwnedUniqueName,
@@ -1163,12 +1177,6 @@ struct Chores {
     started: u64,
     /// How many clients the bus is setting the connections of up: their handshakes are under way.
     connecting: usize,
-    /// The serial of the last barrier that the bus made, and of the last one whose reply came
-    /// back.
-    #[cfg(target_os = "linux")]
-    barriers_sent: u32,
-    #[cfg(target_os = "linux")]
-    barrier: u32,
 }
 
 /// Why the policy keeps the message of `facts` from going from `sender` to `receiver`, if it does:

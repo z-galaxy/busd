@@ -12,17 +12,15 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures_util::future::{join_all, select, Either};
-use zbus::{
-    connection::Handover, message, names::OwnedUniqueName, Connection, Message, MessageStream,
-};
+use zbus::{connection::Handover, names::OwnedUniqueName, Connection, MessageStream};
 use zruntime::{spawn, SharedRuntime};
 
-use super::{Peers, Routing, Served};
+use super::{Peers, Routing, Served, Us};
 use crate::{
-    bus::handover::{ClientHandover, MonitorState, NameState, PeerState, Snapshot},
+    bus::handover::{ClientHandover, MonitorState, NameState, OwnHandover, PeerState, Snapshot},
     debug, fdo,
     name_registry::{NameOwner, NameRegistry},
-    peer::{Caller, HandedOver, Monitor, Peer, PendingCalls, Recipient, Stream},
+    peer::{Caller, HandedOver, Monitor, Peer, Recipient, Stream},
     warn,
 };
 
@@ -32,6 +30,11 @@ impl Peers {
     /// the stream of the messages back, and wait for that. The clients that connect from now on
     /// pause as soon as they are connected, and those in the middle of their handshakes have
     /// `timeout` to be done with them.
+    ///
+    /// The bus itself pauses as its clients do: it passes nothing more on of what it sends, nor
+    /// waits to send it, and takes no more calls once it settles ([`Peers::settle`]). What is on
+    /// its way between the bus and its clients from then on stays on the connection on which the
+    /// bus serves the D-Bus API, which is handed over with it ([`Peers::hand_over_us`]).
     ///
     /// No send to a client waits for the client to take what the bus sends it from now on: what a
     /// client doesn't take goes on with the hand-over of its connection, for the next instance to
@@ -46,7 +49,13 @@ impl Peers {
         {
             let mut routing = self.routing_mut().await;
             routing.handing_over = true;
-            for peer in routing.peers.values_mut().filter(|peer| !peer.is_bus()) {
+            // The bus keeps what its peer doesn't take of what it sends, as the task that serves
+            // that peer is to take no more of it.
+            if let Some(bus) = self.bus_conn().clone() {
+                let prepared = bus.prepare_hand_over();
+                debug_assert!(prepared, "the connection of the bus can't be handed over");
+            }
+            for peer in routing.peers.values_mut() {
                 peer.pause();
             }
             for monitor in routing.monitors.values_mut() {
@@ -107,27 +116,27 @@ impl Peers {
         }
     }
 
-    /// Wait for the bus to settle: to have answered every call that it got, and to have no chores
-    /// under way, with every message that the bus sent written to its recipient, or kept for the
-    /// next instance to write.
+    /// Wait for the bus to settle: to take no more calls, leaving those that it didn't take to its
+    /// next instance, to have answered those that it has under way, and to have no chores under
+    /// way, so that it sends nothing more.
     ///
     /// A hand-over waits for this once the bus is paused, so the bus only has its own work to
     /// finish, as nothing new comes in for it to do, but for what the clients whose connections
     /// ended meanwhile sent before that, which it takes, as [`Peers::serve_gone`] says: those that
     /// went, and those that the bus disconnected, as they didn't take what it sent them in time, or
     /// as a send to them failed, as one to a client that went does.
+    ///
+    /// It doesn't wait for what is on its way between the bus and its clients: the calls to the
+    /// bus that it didn't take, and what it sent and didn't pass on, go to the next instance on the
+    /// connection on which the bus serves the D-Bus API ([`Peers::hand_over_us`]).
     pub(crate) async fn settle(self: &Arc<Self>) -> Result<()> {
-        let bus_calls = self.bus_calls().await?;
+        // Only for as long as this waits: the bus is to let go of its connection as it goes.
+        let bus = self.bus_conn().clone().context("The bus isn't up")?;
+        // The bus takes no more calls from now on, so the chores that its methods left, such as
+        // the signals that follow a reply, are under way once it answered those under way.
+        bus.object_server().prepare_hand_over().await;
         loop {
             let started = self.chores_done().await;
-            // The calls of the interfaces that zbus adds to the bus, such as
-            // `org.freedesktop.DBus.Properties`, are answered by tasks of their own.
-            if !bus_calls.is_empty() {
-                bus_calls.answered().await;
-
-                continue;
-            }
-            self.barrier().await?;
             // Each client that went is served on as a chore, so the bus isn't settled until then.
             self.serve_gone().await;
             let settled = {
@@ -135,12 +144,38 @@ impl Peers {
 
                 chores.running == 0 && chores.started == started
             };
-            // A chore that started while the barrier was on its way may have sent messages after
-            // it.
-            if settled && bus_calls.is_empty() {
+            if settled {
                 return Ok(());
             }
         }
+    }
+
+    /// Hand the connection on which the bus serves the D-Bus API over, both ends of it, once the
+    /// bus settled: the end on which it answers the calls to it, with those that it didn't take,
+    /// and the end of its peer, with what the bus sent and the task that served that peer didn't
+    /// take, each with what it took to send and the other end didn't read.
+    ///
+    /// The end that answers goes first, so that nothing more comes out of it by the time that the
+    /// other one goes.
+    pub(crate) async fn hand_over_us(&self) -> Result<OwnHandover> {
+        let service = self.bus_conn().clone().context("The bus isn't up")?;
+        let mut stream = self
+            .routing_mut()
+            .await
+            .peers
+            .get_mut(fdo::BUS_NAME)
+            .and_then(|bus| bus.paused().take())
+            .context("The bus isn't paused")?;
+        let service = service
+            .hand_over()
+            .await
+            .context("Failed to hand the connection of the bus over")?;
+        let peer = stream
+            .hand_over()
+            .await
+            .context("Failed to hand the connection of the peer of the bus over")?;
+
+        Ok(OwnHandover { service, peer })
     }
 
     /// The peers, monitors and names, as the bus hands them over, and what it hands over of the
@@ -238,15 +273,6 @@ impl Peers {
         Ok((snapshot, handed_over))
     }
 
-    /// Note that the reply to the barrier with `serial` came back.
-    pub(super) fn barrier_returned(&self, serial: u32) {
-        {
-            let mut chores = self.chores();
-            chores.barrier = chores.barrier.max(serial);
-        }
-        self.chores_changed.notify(usize::MAX);
-    }
-
     /// Let go of the clients without disconnecting them, as the bus handed them over: nothing more
     /// goes to them from this instance of the bus.
     pub(crate) async fn retire(&self) {
@@ -277,12 +303,18 @@ impl Peers {
     /// client first, as the client takes it: a client that doesn't take it within `send_timeout`
     /// gets disconnected, as when a send to it times out. What is left of it once the bus pauses,
     /// to hand over in turn, goes on with that hand-over.
+    ///
+    /// The bus itself is added to its peers along with them, on the connection of `us`, unless it
+    /// is among them already: the end of that connection on which it answers the calls to it is
+    /// returned then. The calls to the bus that it was handed over with, and what the instance
+    /// before it sent and didn't pass on, so find the peers, monitors and names all back.
     pub(crate) async fn restore(
         self: &Arc<Self>,
         snapshot: Snapshot,
         mut clients: HashMap<usize, ClientHandover>,
         send_timeout: Duration,
-    ) -> Result<()> {
+        us: Option<Us>,
+    ) -> Result<Option<Connection>> {
         let Snapshot {
             peers,
             monitors,
@@ -338,8 +370,15 @@ impl Peers {
                 }
             }
         }
-        {
+        let service_conn = {
             let mut routing = self.routing_mut().await;
+            // The object server of the bus answers the calls that the bus was handed over with,
+            // and the task that serves the bus passes on what it was handed over with, only once
+            // they get this lock: once all that follows is in place.
+            let service_conn = match us {
+                Some(us) => Some(self.insert_us(&mut routing, us).await?),
+                None => None,
+            };
             for NameState { name, owners } in names {
                 let mut owners = owners
                     .into_iter()
@@ -385,7 +424,9 @@ impl Peers {
                 monitor.flush();
                 self.insert_monitor(&mut routing, monitor, stream);
             }
-        }
+
+            service_conn
+        };
         // The bus serves its clients from here on, so it goes on whatever comes.
         for (unique_name, records, names_changes) in gone {
             let waiting = records
@@ -404,7 +445,7 @@ impl Peers {
             );
         }
 
-        Ok(())
+        Ok(service_conn)
     }
 
     /// Add `monitor`, whose messages come out of `stream`, to the monitors of `routing`, and serve
@@ -435,53 +476,6 @@ impl Peers {
             }
             listener.await;
         }
-    }
-
-    /// The records of the calls to the bus that wait for its replies.
-    async fn bus_calls(&self) -> Result<Arc<PendingCalls>> {
-        self.routing()
-            .await
-            .peers
-            .get(fdo::BUS_NAME)
-            .map(|bus| bus.pending_calls().clone())
-            .context("The bus isn't up")
-    }
-
-    /// Wait for the bus to have answered every call that it got so far, and for its peers to have
-    /// got the messages that it sent until then.
-    ///
-    /// The bus answers the calls of its D-Bus interfaces one at a time, in the order that they come
-    /// in, and sends its replies, and its signals, on one connection, which its peer passes on in
-    /// that order. So the bus makes a call of its own, to itself, behind those of its peers, and
-    /// waits for the reply to come back out of its peer, which `serve_peer` doesn't pass on.
-    async fn barrier(&self) -> Result<()> {
-        let conn = self
-            .routing()
-            .await
-            .peers
-            .get(fdo::BUS_NAME)
-            .map(|bus| bus.conn().clone())
-            .context("The bus isn't up")?;
-        let serial = {
-            let mut chores = self.chores();
-            chores.barriers_sent += 1;
-
-            NonZeroU32::new(chores.barriers_sent).context("Too many barriers")?
-        };
-        let call = Message::method_call(fdo::DBus::PATH, "GetId")
-            .interface(fdo::DBus::INTERFACE)
-            .destination(fdo::BUS_NAME)
-            .sender(fdo::BUS_NAME)
-            .serial(serial)
-            .build(&())?;
-        let mut listener = self.chores_changed.listen();
-        conn.send(&call).await?;
-        while self.chores().barrier < serial.get() {
-            listener.await;
-            listener = self.chores_changed.listen();
-        }
-
-        Ok(())
     }
 
     /// Serve on the clients, peers and monitors, whose connections ended while the bus paused,
@@ -542,38 +536,13 @@ impl Peers {
     }
 }
 
-/// Take the replies to the barriers of a hand-over out of `batch`, a batch of messages of the bus,
-/// and the serial of the last call that they answer, if any.
-///
-/// The bus makes its barriers in the name of `org.freedesktop.DBus`, so they are the only replies
-/// of the bus that go to the bus itself.
-pub(super) fn take_barriers(batch: &mut Vec<Message>) -> Option<u32> {
-    let mut last = None;
-    batch.retain(|msg| {
-        let header = msg.header();
-        let barrier = matches!(
-            msg.message_type(),
-            message::Type::MethodReturn | message::Type::Error
-        ) && header
-            .destination()
-            .is_some_and(|destination| destination.as_str() == fdo::BUS_NAME);
-        if barrier {
-            last = header.reply_serial().map(NonZeroU32::get).max(last);
-        }
-
-        !barrier
-    });
-
-    last
-}
-
-/// Whether the task that served each client of `routing`, peer or monitor, gave the stream of its
-/// messages back, as the bus pauses.
+/// Whether the task that served each peer of `routing`, the bus itself included, and each monitor,
+/// gave the stream of its messages back, as the bus pauses.
 fn paused(routing: &mut Routing) -> bool {
     routing
         .peers
         .values_mut()
-        .all(|peer| peer.is_bus() || peer.paused().is_some())
+        .all(|peer| peer.paused().is_some())
         && routing
             .monitors
             .values_mut()
@@ -671,6 +640,7 @@ mod tests {
         net::Shutdown,
         num::NonZeroUsize,
         os::unix::net::UnixStream,
+        sync::atomic::{AtomicBool, Ordering},
         task::Poll,
     };
 
@@ -680,8 +650,14 @@ mod tests {
         distr::{Alphanumeric, SampleString},
         rng,
     };
-    use zbus::{connection, MatchRule};
-    use zruntime::unblock;
+    use zbus::{
+        connection::{self, socket::ChannelHandover},
+        message,
+        object_server::SignalEmitter,
+        MatchRule, Message, OwnedGuid,
+    };
+    use zoter::{Restore, Save};
+    use zruntime::{unblock, Event};
 
     use super::*;
     use crate::{
@@ -727,22 +703,13 @@ mod tests {
                 .map(|peer| peer.conn().clone())
                 .unwrap();
             conn.closed().await;
-            let (snapshot, clients) = peers.snapshot().await.unwrap();
+            let handed_over = hand_over(bus).await;
             assert!(
-                clients.iter().any(|client| client.id == 2),
+                handed_over.clients.iter().any(|client| client.id == 2),
                 "the client that closed its end was left out"
             );
-            retire(bus).await;
 
-            let next = Bus::for_address(Some(&address())).await.unwrap();
-            let clients = clients
-                .into_iter()
-                .map(|client| (client.id, client))
-                .collect();
-            next.peers()
-                .restore(snapshot, clients, SEND_TIMEOUT)
-                .await
-                .unwrap();
+            let _next = take_over(handed_over, Carry::AsItIs).await;
             let mut passed_on = false;
             loop {
                 let signal = signals.next().await.unwrap().unwrap();
@@ -826,18 +793,9 @@ mod tests {
             });
             let (settled, ()) = join(peers.settle(), x_goes).await;
             settled.unwrap();
-            let (snapshot, clients) = peers.snapshot().await.unwrap();
-            retire(bus).await;
+            let handed_over = hand_over(bus).await;
 
-            let next = Bus::for_address(Some(&address())).await.unwrap();
-            let clients = clients
-                .into_iter()
-                .map(|client| (client.id, client))
-                .collect();
-            next.peers()
-                .restore(snapshot, clients, SEND_TIMEOUT)
-                .await
-                .unwrap();
+            let _next = take_over(handed_over, Carry::AsItIs).await;
             let mut passed_on = Vec::new();
             let mut cleaned_up = Vec::new();
             while cleaned_up.len() < 2 {
@@ -859,6 +817,255 @@ mod tests {
                     _ => (),
                 }
             }
+        });
+    }
+
+    /// The bus isn't settled while it has a call under way, whether it answers the call itself or
+    /// in a task of its own, as zbus has those of the interfaces that it adds to the bus answered.
+    /// It settles once the call is answered, and doesn't pass the reply on: the next instance
+    /// does, once.
+    #[test]
+    #[timeout(30000)]
+    fn bus_settles_once_the_calls_under_way_are_answered() {
+        for inline in [false, true] {
+            zruntime::block_on(async {
+                let bus = Bus::for_address(Some(&address())).await.unwrap();
+                let peers = bus.peers().clone();
+                let gate = add_gated(&peers, inline).await;
+                let (caller, _socket) = connect(&bus, 1).await;
+
+                let mut calling = pin!(caller.call_method(
+                    Some(fdo::BUS_NAME),
+                    GATED_PATH,
+                    Some(GATED_INTERFACE),
+                    "Pass",
+                    &0u32,
+                ));
+                assert!(
+                    calling.as_mut().now_or_never().is_none(),
+                    "the call was answered before its method returned"
+                );
+                gate.reached().await;
+                peers.pause(STOP_TIMEOUT).await.unwrap();
+                let runtime = SharedRuntime::current().unwrap();
+                let mut settling = pin!(peers.settle());
+                let settled = runtime
+                    .timeout(Duration::from_millis(200), settling.as_mut())
+                    .await;
+                assert!(settled.is_err(), "the bus settled with a call under way");
+                gate.open();
+                settling.await.unwrap();
+                let settled = runtime
+                    .timeout(Duration::from_millis(200), calling.as_mut())
+                    .await;
+                assert!(settled.is_err(), "the bus passed the reply on once paused");
+
+                let handed_over = hand_over(bus).await;
+                let _next = take_over(handed_over, Carry::AsItIs).await;
+                calling.await.unwrap();
+            });
+        }
+    }
+
+    /// What is on its way between the bus and its clients as the bus hands over goes to the next
+    /// instance, on the connection on which the bus serves the D-Bus API, as it is or through its
+    /// record, as a bus that systemd restarts stores it: the calls that the bus didn't take, as it
+    /// was answering another one, and the reply and the signals that it sent once it paused, more
+    /// of each than the connection holds on its way, so that its ends keep some to write. The next
+    /// instance answers the calls, and passes the reply and the signals on, each once, in order.
+    #[test]
+    #[timeout(30000)]
+    fn what_is_on_its_way_to_and_from_the_bus_goes_to_the_next_instance() {
+        for carry in [Carry::AsItIs, Carry::Records] {
+            zruntime::block_on(what_is_on_its_way_goes_to_the_next_instance(carry));
+        }
+    }
+
+    /// Have a bus hand over with calls to it that it didn't take, and a reply and signals that it
+    /// sent once it paused, and check that the next instance, which gets the connection of the
+    /// bus as `carry` says, answers the calls and passes the rest on, each once, in order.
+    async fn what_is_on_its_way_goes_to_the_next_instance(carry: Carry) {
+        // More than the two ends of the connection of the bus hold between them.
+        const MANY: u32 = 150;
+
+        let bus = Bus::for_address(Some(&address())).await.unwrap();
+        let peers = bus.peers().clone();
+        // The bus answers the calls of the interface itself, one at a time, as those to
+        // `org.freedesktop.DBus`, so it takes no call while the method waits at the gate.
+        let gate = add_gated(&peers, true).await;
+        let (caller, _socket) = connect(&bus, 1).await;
+        let rule = MatchRule::builder()
+            .msg_type(message::Type::Signal)
+            .interface(GATED_INTERFACE)
+            .build()
+            .unwrap();
+        let call_bus = |member: &'static str| {
+            Message::method_call(fdo::DBus::PATH, member)
+                .interface(fdo::DBus::INTERFACE)
+                .destination(fdo::BUS_NAME)
+        };
+        caller
+            .call_method(
+                Some(fdo::BUS_NAME),
+                fdo::DBus::PATH,
+                Some(fdo::DBus::INTERFACE),
+                "AddMatch",
+                &rule.to_string(),
+            )
+            .await
+            .unwrap();
+        let mut messages = MessageStream::from(&caller);
+
+        let pass = Message::method_call(GATED_PATH, "Pass")
+            .interface(GATED_INTERFACE)
+            .destination(fdo::BUS_NAME)
+            .build(&MANY)
+            .unwrap();
+        caller.send(&pass).await.unwrap();
+        gate.reached().await;
+        // The bus forwarded the first call. The others get to the bus as those that it forwards
+        // do, the first of them before it pauses, and wait for it to be done with the first call.
+        let bus_peer = peers
+            .routing()
+            .await
+            .peers
+            .get(fdo::BUS_NAME)
+            .map(|bus| bus.conn().clone())
+            .unwrap();
+        let forwarded: Vec<_> = (0..MANY)
+            .map(|_| {
+                call_bus("GetId")
+                    .sender(caller.unique_name().unwrap())
+                    .build(&())
+                    .unwrap()
+            })
+            .collect();
+        bus_peer.send(&forwarded[0]).await.unwrap();
+        peers.pause(STOP_TIMEOUT).await.unwrap();
+        bus_peer.send_all(&forwarded[1..]).await.unwrap();
+        let (settled, ()) = join(peers.settle(), async { gate.open() }).await;
+        settled.unwrap();
+        let handed_over = hand_over(bus).await;
+        let own = &handed_over.own;
+        assert_ne!(
+            own.service.unread_len(),
+            0,
+            "the bus took the calls that it got while it answered another"
+        );
+        assert_ne!(
+            own.peer.unread_len(),
+            0,
+            "the bus passed on what it sent once it paused"
+        );
+        assert_ne!(
+            own.service.unwritten_len(),
+            0,
+            "the bus wrote more than its connection holds"
+        );
+        assert_ne!(
+            own.peer.unwritten_len(),
+            0,
+            "the peer of the bus wrote more than its connection holds"
+        );
+
+        let _next = take_over(handed_over, carry).await;
+        // The reply to the first call and the signals of its method, from the instance that handed
+        // over, and the replies to the other calls, from the next instance, in order, with nothing
+        // more sent to the bus, so that it writes what the two ends kept on its own.
+        let serial = |msg: &Message| msg.primary_header().serial_num();
+        let mut expected: Vec<_> = [&pass].into_iter().chain(&forwarded).map(serial).collect();
+        let mut answered = Vec::new();
+        let mut passed = Vec::new();
+        let mut collect = async |answers: usize, signals: usize| {
+            while answered.len() < answers || passed.len() < signals {
+                let msg = messages.next().await.unwrap().unwrap();
+                match msg.message_type() {
+                    message::Type::MethodReturn => {
+                        answered.push(msg.header().reply_serial().unwrap());
+                    }
+                    message::Type::Signal => {
+                        passed.push(msg.body().deserialize::<u32>().unwrap());
+                    }
+                    _ => (),
+                }
+            }
+        };
+        collect(expected.len(), MANY as usize).await;
+        // And nothing twice: the reply to a call made now, and a signal emitted now, come right
+        // after them.
+        let ping = call_bus("GetId").build(&()).unwrap();
+        caller.send(&ping).await.unwrap();
+        caller
+            .emit_signal(None::<()>, GATED_PATH, GATED_INTERFACE, "Passed", &MANY)
+            .await
+            .unwrap();
+        expected.push(serial(&ping));
+        collect(expected.len(), MANY as usize + 1).await;
+        assert_eq!(answered, expected, "{carry:?}");
+        assert_eq!(passed, (0..=MANY).collect::<Vec<_>>(), "{carry:?}");
+    }
+
+    /// A bus takes over from one that handed it no connection to serve the D-Bus API on, as a bus
+    /// of the version before this one, which made sure that nothing was on its way on that
+    /// connection as it stopped: it serves the D-Bus API on a new one, to the clients that it took
+    /// over as to any other.
+    #[test]
+    #[timeout(30000)]
+    fn bus_that_was_handed_no_connection_of_its_own_serves_on_a_new_one() {
+        zruntime::block_on(async {
+            let bus = Bus::for_address(Some(&address())).await.unwrap();
+            let peers = bus.peers().clone();
+            let (client, _socket) = connect(&bus, 1).await;
+            peers.pause(STOP_TIMEOUT).await.unwrap();
+            peers.settle().await.unwrap();
+            let handed_over = hand_over(bus).await;
+
+            let _next = take_over(handed_over, Carry::NotAtAll).await;
+            let has_owner: bool = client
+                .call_method(
+                    Some(fdo::BUS_NAME),
+                    fdo::DBus::PATH,
+                    Some(fdo::DBus::INTERFACE),
+                    "NameHasOwner",
+                    &client.unique_name().unwrap().as_str(),
+                )
+                .await
+                .unwrap()
+                .body()
+                .deserialize()
+                .unwrap();
+            assert!(has_owner, "the next instance doesn't know the client");
+        });
+    }
+
+    /// The connection on which a bus serves the D-Bus API gets to a next instance in another
+    /// process as its two ends together, off the channel that joined them, through one record: the
+    /// ends of two connections don't go together, and the two that do come back as they went.
+    #[test]
+    #[timeout(30000)]
+    fn connection_of_the_bus_goes_as_both_of_its_ends() {
+        zruntime::block_on(async {
+            let paused = || async {
+                let bus = Bus::for_address(Some(&address())).await.unwrap();
+                let peers = bus.peers().clone();
+                peers.pause(STOP_TIMEOUT).await.unwrap();
+                peers.settle().await.unwrap();
+
+                hand_over(bus).await.own
+            };
+            let (one, other) = (paused().await, paused().await);
+            assert!(ChannelHandover::new(one.service, other.peer).is_err());
+
+            let own = paused().await;
+            let channel = ChannelHandover::new(own.service, own.peer).unwrap();
+            let restored = stored(&channel);
+            assert_eq!(record_of(&restored), record_of(&channel));
+            let OwnHandover { service, peer } = OwnHandover::from(restored);
+            assert_eq!(
+                (service.unread_len(), peer.unread_len()),
+                (0, 0),
+                "a settled bus left something unread"
+            );
         });
     }
 
@@ -1088,6 +1295,192 @@ mod tests {
         );
     }
 
+    /// A gate that the method of [`Gated`] waits at, until the test opens it.
+    #[derive(Default)]
+    struct Gate {
+        reached: AtomicBool,
+        open: AtomicBool,
+        changed: Event,
+    }
+
+    impl Gate {
+        /// Wait at the gate until it is open, and tell that it was reached.
+        async fn pass(&self) {
+            self.reached.store(true, Ordering::SeqCst);
+            self.changed.notify(usize::MAX);
+            self.wait_for(&self.open).await;
+        }
+
+        /// Wait for a method to have reached the gate.
+        async fn reached(&self) {
+            self.wait_for(&self.reached).await;
+        }
+
+        fn open(&self) {
+            self.open.store(true, Ordering::SeqCst);
+            self.changed.notify(usize::MAX);
+        }
+
+        async fn wait_for(&self, flag: &AtomicBool) {
+            loop {
+                // The listener comes first, so that a change right after the check isn't missed.
+                let listener = self.changed.listen();
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                listener.await;
+            }
+        }
+    }
+
+    /// Defines an interface whose method waits at a gate, and emits signals once it is through:
+    /// in a task of its own for each call, as those of the interfaces that zbus adds to the bus
+    /// run, or not, as those of the interfaces of the bus itself run, as `spawn` says.
+    macro_rules! gated {
+        ($name:ident, $spawn:literal) => {
+            struct $name(Arc<Gate>);
+
+            #[zbus::interface(name = "org.busd.Test.Gated", spawn = $spawn)]
+            impl $name {
+                async fn pass(
+                    &self,
+                    signals: u32,
+                    #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+                ) -> zbus::fdo::Result<()> {
+                    self.0.pass().await;
+                    for n in 0..signals {
+                        Self::passed(&emitter, n).await?;
+                    }
+
+                    Ok(())
+                }
+
+                #[zbus(signal)]
+                async fn passed(emitter: &SignalEmitter<'_>, n: u32) -> zbus::Result<()>;
+            }
+        };
+    }
+
+    gated!(Gated, true);
+    gated!(InlineGated, false);
+
+    const GATED_PATH: &str = "/org/busd/Test/Gated";
+    const GATED_INTERFACE: &str = "org.busd.Test.Gated";
+
+    /// Add an interface whose method waits at a gate to the bus of `peers`, which answers its
+    /// calls itself if `inline`, and in tasks of their own otherwise, and return the gate.
+    async fn add_gated(peers: &Peers, inline: bool) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        let service = peers.bus_conn().clone().unwrap();
+        let server = service.object_server();
+        // What was there before, if anything.
+        let free = match inline {
+            false => server
+                .at(GATED_PATH, Gated(gate.clone()))
+                .await
+                .map(|was| was.is_none()),
+            true => server
+                .at(GATED_PATH, InlineGated(gate.clone()))
+                .await
+                .map(|was| was.is_none()),
+        };
+        assert!(free.unwrap(), "the bus has the interface already");
+
+        gate
+    }
+
+    /// What a bus hands over, as [`hand_over`] takes it out of the bus.
+    struct HandedOver {
+        guid: OwnedGuid,
+        snapshot: Snapshot,
+        clients: Vec<ClientHandover>,
+        own: OwnHandover,
+    }
+
+    /// How the connection on which a bus serves the D-Bus API gets to its next instance.
+    #[derive(Clone, Copy, Debug)]
+    enum Carry {
+        /// As it is, as to a next instance in the same process.
+        AsItIs,
+        /// Through the record of its two ends together, as to a next instance in another process.
+        Records,
+        /// Not at all, as from a bus of the version before this one, which handed none over.
+        NotAtAll,
+    }
+
+    /// Have `bus`, which is paused and settled, hand over, as [`Bus::hand_over`] does once it is:
+    /// its own connection, then those of its clients. It lets go of its clients without
+    /// disconnecting them, and of `bus` itself, as its process does as it exits.
+    async fn hand_over(bus: Bus) -> HandedOver {
+        let peers = bus.peers().clone();
+        let own = peers.hand_over_us().await.unwrap();
+        let (snapshot, clients) = peers.snapshot().await.unwrap();
+        let guid = bus.guid().clone();
+        peers.retire().await;
+
+        HandedOver {
+            guid,
+            snapshot,
+            clients,
+            own,
+        }
+    }
+
+    /// The peers of the next instance of the bus that handed `handed_over` over, which gets the
+    /// connection on which the bus serves the D-Bus API as `carry` says, and the end of that
+    /// connection on which it answers the calls to it.
+    async fn take_over(handed_over: HandedOver, carry: Carry) -> (Arc<Peers>, Connection) {
+        let HandedOver {
+            guid,
+            snapshot,
+            clients,
+            own,
+        } = handed_over;
+        let own = match carry {
+            Carry::AsItIs => Some(own),
+            Carry::Records => {
+                let channel = ChannelHandover::new(own.service, own.peer).unwrap();
+
+                Some(OwnHandover::from(stored(&channel)))
+            }
+            Carry::NotAtAll => None,
+        };
+        let peers = Peers::new();
+        let us = Bus::us(&peers, &guid, own).await.unwrap();
+        let clients = clients
+            .into_iter()
+            .map(|client| (client.id, client))
+            .collect();
+        let service = peers
+            .restore(snapshot, clients, SEND_TIMEOUT, Some(us))
+            .await
+            .unwrap()
+            .unwrap();
+
+        (peers, service)
+    }
+
+    /// `channel`, the two ends of the connection of a bus off their channel, as zoter gives them
+    /// back to a next instance in another process: restored from their record and their file
+    /// descriptors.
+    fn stored(channel: &ChannelHandover) -> ChannelHandover {
+        let fds = channel
+            .fds()
+            .into_iter()
+            .map(|fd| fd.try_clone_to_owned().unwrap())
+            .collect();
+
+        ChannelHandover::restore(&record_of(channel), fds).unwrap()
+    }
+
+    /// The record that `channel` saves.
+    fn record_of(channel: &ChannelHandover) -> Vec<u8> {
+        let mut record = vec![0; channel.saved_len().unwrap()];
+        channel.save(&mut record).unwrap();
+
+        record
+    }
+
     /// Wait until `ready`, which is checked again each time that the runtime has run the tasks that
     /// are ready to run.
     async fn until<F>(mut ready: F)
@@ -1103,12 +1496,6 @@ mod tests {
             Poll::Pending
         })
         .await
-    }
-
-    /// Let go of the clients of `bus` without disconnecting them, as it hands over, and of `bus`
-    /// itself, as its process does as it exits.
-    async fn retire(bus: Bus) {
-        bus.peers().retire().await;
     }
 
     /// A client of `bus`, numbered `id`, over a socket pair, and its end of the pair.
