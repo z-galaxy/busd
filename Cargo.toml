@@ -161,3 +161,12 @@ strip = "none"
 [patch.crates-io.zoter]
 git = "https://github.com/z-galaxy/zoter"
 rev = "7b3915f7deb4d13f9f3f54097578b0ad3964de0a"
+
+# busd hands the connection on which it serves the D-Bus API over to its next instance, with its
+# object server (`Connection::hand_over`, `ObjectServer::prepare_hand_over`), and both of its ends
+# as one item of the hand-over (`ChannelHandover`), which zbus is yet to release: until it does,
+# busd builds on the revision of zbus that adds them. This goes as busd takes that release from
+# crates.io.
+[patch.crates-io.zbus]
+git = "https://github.com/z-galaxy/zbus"
+rev = "13211b01a8bc850789ed236c4136b0ca0ed8b107"
