@@ -24,10 +24,16 @@ than other D-Bus brokers.
 
 ## Status
 
-Alpha. The essentials are in place, but busd is not ready for production use yet. It is meant to
-serve as a system bus as well as a session bus, and it enforces the [policies] of its
-configuration. What it still lacks to serve as a system bus is tracked by the [feature parity]
-issues, starting services on demand ([service activation]) among them.
+Alpha: busd is not ready for production use yet, but it is well past the essentials. It keeps up
+with [dbus-broker] ([Performance](#performance)), enforces the [policies] of its configuration,
+limits what the clients of each user may have it keep, and
+[restarts under systemd](#under-systemd) without disconnecting its clients.
+
+It is meant to serve as a system bus as well as a session bus. What it still lacks for that is
+tracked by the [feature parity] issues: above all starting services on demand
+([service activation]), then running as the `<user>` of the configuration, and SELinux and
+AppArmor support. Until then, it suits buses whose services are started by other means, such as
+those of tests and CI.
 
 ## Performance
 
