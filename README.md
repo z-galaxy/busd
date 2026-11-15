@@ -160,10 +160,11 @@ FileDescriptorStoreMax=16
 throughout, while those that connect meanwhile wait in the socket, which systemd keeps open. The
 store only keeps what busd hands over until the next instance takes it, which `systemctl restart`
 starts right away, while `systemctl stop` followed by `systemctl start` doesn't keep it. Without
-socket activation, busd doesn't hand over: it disconnects its clients as it stops. Lower the hard
-limit of `LimitNOFILE=` with a stop and a start, rather than a restart: busd fits what it hands
-over under its limit of open files, which the next instance raises its own to as it takes that out
-of the store, and the clients that don't fit under a lower one get disconnected.
+socket activation, busd doesn't hand over: it disconnects its clients as it stops. The next
+instance raises its limit of open files to the hard limit of `LimitNOFILE=` as it takes what busd
+handed over out of the store, and needs to be able to open all of it: if it can't, it takes nothing
+over, which disconnects all of the clients. So lower that limit with a stop and a start, rather than
+a restart.
 
 ### Profile-guided optimization
 
