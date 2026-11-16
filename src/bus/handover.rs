@@ -1,22 +1,16 @@
 //! The hand-over of a bus to its next instance, which serves its clients on from where it stopped,
 //! on the same connections.
 
-use std::{
-    collections::HashMap,
-    os::fd::{AsFd, OwnedFd},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, os::fd::OwnedFd, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use zbus::{
-    address::Transport,
     wire::{serialized, to_bytes, LE},
-    Address, OwnedGuid, Type,
+    OwnedGuid, Type,
 };
 
-use super::Bus;
+use super::{Bus, Listener};
 use crate::{
     info,
     peers::{
@@ -61,8 +55,8 @@ impl Bus {
     pub async fn hand_over(self) -> Result<Handover> {
         // The socket that the bus listens on is duplicated ahead of those of the clients, which a
         // lack of file descriptors only fails one at a time.
-        let listener = if self.bound {
-            Some(self.listener.as_fd().try_clone_to_owned()?)
+        let listener = if self.listener.is_bound() {
+            Some(self.listener.try_clone_to_owned()?)
         } else {
             None
         };
@@ -128,9 +122,9 @@ impl Bus {
             (None, Some(listener)) => (listener, true),
             (None, None) => bail!("Nothing to listen on: no socket was handed over or given."),
         };
-        let (listener, unix) = Self::listener(listener)?;
-        let address = Address::new(Transport::Unix(unix)).set_guid(state.guid.clone())?;
+        let listener = Listener::from_fd(listener, bound)?;
         let guid = state.guid;
+        let address = listener.address(&guid)?;
         let last_id = usize::try_from(state.last_id)?;
         let peers = Peers::new();
         // Before the bus has the clients of the hand-over, which it serves as soon as it has them.
@@ -147,7 +141,7 @@ impl Bus {
             names: state.names,
         };
         let service_conn = peers.restore(snapshot, clients, send_timeout, us).await?;
-        let mut bus = Self::with_peers(listener, address, guid, bound, peers, service_conn);
+        let mut bus = Self::with_peers(listener, address, guid, peers, service_conn);
         bus.next_id = last_id;
         bus.set_send_timeout(send_timeout);
 

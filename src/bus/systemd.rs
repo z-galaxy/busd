@@ -223,7 +223,7 @@ impl Bus {
                 return None;
             }
         };
-        if self.bound {
+        if self.listener.is_bound() {
             warn!(
                 "Not handing over to the next instance of the bus, as it listens on a socket of \
                  its own rather than on one of socket activation, which systemd would keep for \
