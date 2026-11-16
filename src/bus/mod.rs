@@ -48,16 +48,10 @@ use crate::{
 /// [zruntime]: https://docs.rs/zruntime
 #[derive(Debug)]
 pub struct Bus {
-    inner: Inner,
     listener: zruntime::net::unix::UnixListener<Shared>,
     /// Whether the bus bound the socket that it listens on itself, rather than take it from
     /// whoever passed it, such as systemd's socket activation, which then owns the socket's file.
     bound: bool,
-}
-
-// All (cheaply) cloneable fields of `Bus` go here.
-#[derive(Clone, Debug)]
-pub struct Inner {
     address: Address,
     peers: Peers,
     guid: OwnedGuid,
@@ -105,7 +99,7 @@ impl Bus {
     }
 
     pub fn address(&self) -> &Address {
-        &self.inner.address
+        &self.address
     }
 
     /// Set how long the bus waits for a client to take a message, before it disconnects the client.
@@ -113,7 +107,7 @@ impl Bus {
     /// It is [`SEND_TIMEOUT`] unless set otherwise, or given to `Bus::take_over`, and applies to
     /// the clients that connect from then on.
     pub fn set_send_timeout(&mut self, timeout: Duration) {
-        self.inner.send_timeout = timeout;
+        self.send_timeout = timeout;
     }
 
     /// Set how many objects the bus keeps for each user at most: its connections, and the calls to
@@ -127,7 +121,7 @@ impl Bus {
     /// [`Charge::new`]: crate::user::Charge::new
     /// [`MAX_OBJECTS`]: crate::user::MAX_OBJECTS
     pub fn set_max_objects_per_user(&mut self, max: usize) {
-        self.inner.peers.users().set_max_objects(max);
+        self.peers.users().set_max_objects(max);
     }
 
     /// Set the policy that the bus goes by: who may connect, own which names, and send and receive
@@ -137,7 +131,7 @@ impl Bus {
     /// `Bus::take_over`, and applies to the clients that connect from then on, and to those that
     /// the bus has.
     pub async fn set_policy(&mut self, policy: Arc<Policy>) {
-        self.inner.peers.set_policy(policy).await;
+        self.peers.set_policy(policy).await;
     }
 
     /// Have `ReloadConfig` set the policy that `read` returns, as [`Bus::set_policy`] does.
@@ -151,7 +145,7 @@ impl Bus {
     where
         F: Fn() -> Result<Policy> + Send + Sync + 'static,
     {
-        self.inner.peers.set_reload(read).await;
+        self.peers.set_reload(read).await;
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -165,7 +159,7 @@ impl Bus {
         if !self.bound {
             return Ok(());
         }
-        match self.inner.address.transport() {
+        match self.address.transport() {
             Transport::Unix(unix) => match unix.path() {
                 UnixSocket::File(path) => remove_file(path).await.map_err(Into::into),
                 _ => Ok(()),
@@ -175,11 +169,11 @@ impl Bus {
     }
 
     pub fn peers(&self) -> &Peers {
-        &self.inner.peers
+        &self.peers
     }
 
     pub fn guid(&self) -> &OwnedGuid {
-        &self.inner.guid
+        &self.guid
     }
 
     /// A bus that listens on `listener`, at `address`: `bound` says whether it bound the listener
@@ -223,15 +217,13 @@ impl Bus {
     ) -> Self {
         Self {
             listener,
-            inner: Inner {
-                address,
-                peers,
-                guid,
-                next_id: 0,
-                send_timeout: SEND_TIMEOUT,
-                _self_conn: service_conn,
-            },
             bound,
+            address,
+            peers,
+            guid,
+            next_id: 0,
+            send_timeout: SEND_TIMEOUT,
+            _self_conn: service_conn,
         }
     }
 
@@ -371,10 +363,12 @@ impl Bus {
 
     async fn accept_next(&mut self) -> Result<()> {
         let (stream, _) = self.listener.accept().await?;
-        debug!("Accepted connection on address `{}`", self.inner.address);
+        debug!("Accepted connection on address `{}`", self.address);
 
         let id = self.next_id();
-        let inner = self.inner.clone();
+        let peers = self.peers.clone();
+        let guid = self.guid.clone();
+        let send_timeout = self.send_timeout;
         spawn(async move {
             let res = async {
                 // zbus is given the standard library stream that the zruntime one wraps, and the
@@ -387,7 +381,7 @@ impl Bus {
                 let uid = creds.unix_user_id().context("The client has no user")?;
                 let gids = creds.unix_group_ids().map_or(&[][..], Vec::as_slice);
                 // Dropping the stream closes the connection.
-                if !inner.peers.may_connect(uid, gids).await {
+                if !peers.may_connect(uid, gids).await {
                     warn!(
                         "Refusing a client of the user {uid}, as the policy does not let it \
                          connect"
@@ -397,11 +391,7 @@ impl Bus {
                 }
                 let builder = connection::Builder::unix_stream(stream);
 
-                inner
-                    .peers
-                    .clone()
-                    .add(&inner.guid, id, builder, inner.send_timeout, uid)
-                    .await
+                peers.add(&guid, id, builder, send_timeout, uid).await
             };
             if let Err(e) = res.await {
                 warn!("Failed to establish connection: {}", e);
@@ -413,15 +403,15 @@ impl Bus {
     }
 
     fn next_id(&mut self) -> usize {
-        self.inner.next_id += 1;
+        self.next_id += 1;
 
-        self.inner.next_id
+        self.next_id
     }
 }
 
 impl Drop for Bus {
     fn drop(&mut self) {
-        self.inner.peers.remove_us();
+        self.peers.remove_us();
     }
 }
 

@@ -66,7 +66,7 @@ impl Bus {
         } else {
             None
         };
-        let peers = self.inner.peers.clone();
+        let peers = self.peers.clone();
         peers.pause(STOP_TIMEOUT).await?;
         peers.settle().await;
         // The bus's own connection goes first: if that fails, the bus still has its clients, and
@@ -74,8 +74,8 @@ impl Bus {
         let own = peers.hand_over_us().await?;
         let (snapshot, clients) = peers.snapshot().await?;
         let state = State {
-            guid: self.inner.guid.clone(),
-            last_id: self.inner.next_id as u64,
+            guid: self.guid.clone(),
+            last_id: self.next_id as u64,
             peers: snapshot.peers,
             monitors: snapshot.monitors,
             names: snapshot.names,
@@ -148,7 +148,7 @@ impl Bus {
         };
         let service_conn = peers.restore(snapshot, clients, send_timeout, us).await?;
         let mut bus = Self::with_peers(listener, address, guid, bound, peers, service_conn);
-        bus.inner.next_id = last_id;
+        bus.next_id = last_id;
         bus.set_send_timeout(send_timeout);
 
         Ok(bus)
