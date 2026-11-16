@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::collections::HashMap;
 
 use zbus::{
     fdo::{Error, Result},
@@ -12,12 +9,12 @@ use zbus::{
 
 use crate::{
     fdo::BUS_NAME,
-    peers::{ConnectionCounts, Counts, Peers},
+    peers::{ConnectionCounts, Counts, Peers, WeakPeers},
 };
 
 #[derive(Debug)]
 pub struct Stats {
-    peers: Weak<Peers>,
+    peers: WeakPeers,
     /// The number of the last call of `GetStats`.
     serial: u32,
     /// The number of the last call of `GetConnectionStats` that the bus answered, which counts
@@ -29,16 +26,16 @@ impl Stats {
     pub const PATH: &'static str = "/org/freedesktop/DBus";
     pub const INTERFACE: &'static str = "org.freedesktop.DBus.Debug.Stats";
 
-    pub fn new(peers: Arc<Peers>) -> Self {
+    pub fn new(peers: &Peers) -> Self {
         Self {
-            peers: Arc::downgrade(&peers),
+            peers: peers.downgrade(),
             serial: 0,
             connection_serial: 0,
         }
     }
 
     /// The peers of the bus, unless the bus is shutting down.
-    fn peers(&self) -> Result<Arc<Peers>> {
+    fn peers(&self) -> Result<Peers> {
         self.peers
             .upgrade()
             // Can it happen in any other situation than the bus shutting down?

@@ -59,7 +59,7 @@ pub struct Bus {
 #[derive(Clone, Debug)]
 pub struct Inner {
     address: Address,
-    peers: Arc<Peers>,
+    peers: Peers,
     guid: OwnedGuid,
     next_id: usize,
     send_timeout: Duration,
@@ -174,7 +174,7 @@ impl Bus {
         }
     }
 
-    pub fn peers(&self) -> &Arc<Peers> {
+    pub fn peers(&self) -> &Peers {
         &self.inner.peers
     }
 
@@ -218,7 +218,7 @@ impl Bus {
         address: Address,
         guid: OwnedGuid,
         bound: bool,
-        peers: Arc<Peers>,
+        peers: Peers,
         service_conn: Connection,
     ) -> Self {
         Self {
@@ -242,7 +242,7 @@ impl Bus {
     ///
     /// The bus talks to itself over a channel, which is in this process alone.
     pub(crate) async fn us(
-        peers: &Arc<Peers>,
+        peers: &Peers,
         guid: &OwnedGuid,
         #[cfg(target_os = "linux")] own: Option<OwnHandover>,
     ) -> Result<Us> {
@@ -267,9 +267,9 @@ impl Bus {
         let stream = peer.build_message_stream().await?;
         let service = service
             .name(fdo::BUS_NAME)
-            .serve_at(fdo::DBus::PATH, DBus::new(peers.clone(), guid.clone()))
-            .serve_at(fdo::Monitoring::PATH, Monitoring::new(peers.clone()))
-            .serve_at(fdo::Stats::PATH, Stats::new(peers.clone()));
+            .serve_at(fdo::DBus::PATH, DBus::new(peers, guid.clone()))
+            .serve_at(fdo::Monitoring::PATH, Monitoring::new(peers))
+            .serve_at(fdo::Stats::PATH, Stats::new(peers));
 
         Ok(Us { service, stream })
     }

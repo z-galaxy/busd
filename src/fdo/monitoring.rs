@@ -1,5 +1,3 @@
-use std::sync::{Arc, Weak};
-
 use crate::{debug, warn};
 use zbus::{
     fdo::{Error, Result},
@@ -8,20 +6,24 @@ use zbus::{
 };
 
 use super::{ensure_privileged, msg_sender};
-use crate::{fdo::DBus, match_rules::MatchRules, peers::Peers};
+use crate::{
+    fdo::DBus,
+    match_rules::MatchRules,
+    peers::{Peers, WeakPeers},
+};
 
 #[derive(Debug)]
 pub struct Monitoring {
-    peers: Weak<Peers>,
+    peers: WeakPeers,
 }
 
 impl Monitoring {
     pub const PATH: &'static str = "/org/freedesktop/DBus";
     pub const INTERFACE: &'static str = "org.freedesktop.DBus.Monitoring";
 
-    pub fn new(peers: Arc<Peers>) -> Self {
+    pub fn new(peers: &Peers) -> Self {
         Self {
-            peers: Arc::downgrade(&peers),
+            peers: peers.downgrade(),
         }
     }
 }

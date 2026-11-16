@@ -71,8 +71,8 @@ impl Peers {
             if Instant::now() < deadline {
                 // The listener comes first, so that a handshake that ends right after the check
                 // isn't missed.
-                let handshake_ended = self.chores.listen();
-                if self.chores.handshakes() > 0 {
+                let handshake_ended = self.inner.chores.listen();
+                if self.inner.chores.handshakes() > 0 {
                     // Until the deadline at most, past which the handshakes still under way hold
                     // the pause up no more.
                     let _ = runtime.timeout_at(deadline, handshake_ended).await;
@@ -82,13 +82,13 @@ impl Peers {
             }
             // The listener comes first, so that a client that pauses, or goes, right after the
             // check isn't missed.
-            let paused_changed = self.paused_changed.listen();
+            let paused_changed = self.inner.paused_changed.listen();
             {
                 // Under the lock that adding a client takes, so that none comes in between.
                 let mut routing = self.routing_mut().await;
                 if paused(&mut routing) {
                     routing.sealed = true;
-                    self.sealed.notify(usize::MAX);
+                    self.inner.sealed.notify(usize::MAX);
 
                     return Ok(());
                 }
@@ -106,7 +106,7 @@ impl Peers {
         let sealed = async {
             loop {
                 // The listener comes first, so that a seal right after the check isn't missed.
-                let listener = self.sealed.listen();
+                let listener = self.inner.sealed.listen();
                 if self.routing().await.sealed {
                     return;
                 }
@@ -135,12 +135,12 @@ impl Peers {
     /// bus has under way, and for the signals that follow their replies. Neither waits for what is
     /// on its way between the bus and its clients: the calls to the bus that it didn't take, and
     /// what it sent and didn't pass on, go to the next instance on that connection.
-    pub(crate) async fn settle(self: &Arc<Self>) {
+    pub(crate) async fn settle(&self) {
         loop {
-            let started = self.chores.done().await;
+            let started = self.inner.chores.done().await;
             // Each client that went is served on as a chore, so the bus isn't settled until then.
             self.serve_gone().await;
-            if self.chores.settled_since(started) {
+            if self.inner.chores.settled_since(started) {
                 return;
             }
         }
@@ -309,7 +309,7 @@ impl Peers {
     /// bus that it was handed over with, and what the instance before it sent and didn't pass on,
     /// so find the peers, monitors and names all back.
     pub(crate) async fn restore(
-        self: &Arc<Self>,
+        &self,
         snapshot: Snapshot,
         mut clients: HashMap<usize, ClientHandover>,
         send_timeout: Duration,
@@ -340,7 +340,7 @@ impl Peers {
                 greeted: state.greeted,
                 match_rules: state.match_rules,
             };
-            match Peer::handed_over(client, send_timeout, &self.users).await {
+            match Peer::handed_over(client, send_timeout, &self.inner.users).await {
                 Ok((peer, stream)) => restored.push((peer, stream, records)),
                 Err(e) => {
                     warn!("Disconnecting `{unique_name}`, as serving it failed: {e}");
@@ -360,7 +360,7 @@ impl Peers {
                 greeted: true,
                 match_rules: Default::default(),
             };
-            match Peer::handed_over(client, send_timeout, &self.users).await {
+            match Peer::handed_over(client, send_timeout, &self.inner.users).await {
                 Ok((peer, stream)) => {
                     let monitor = peer.become_monitor(state.match_rules);
                     restored_monitors.push((monitor, stream.into_inner()));
@@ -447,12 +447,7 @@ impl Peers {
 
     /// Add `monitor`, whose messages come out of `stream`, to the monitors of `routing`, and serve
     /// it until it goes.
-    fn insert_monitor(
-        self: &Arc<Self>,
-        routing: &mut Routing,
-        monitor: Monitor,
-        stream: MessageStream,
-    ) {
+    fn insert_monitor(&self, routing: &mut Routing, monitor: Monitor, stream: MessageStream) {
         let unique_name = monitor.unique_name().clone();
         let listener = monitor.listen_cancellation();
         routing.monitors.insert(unique_name.clone(), monitor);
@@ -472,7 +467,7 @@ impl Peers {
     /// this finds it gone, as the send fails. So the bus serves the clients whose connections
     /// ended here, while their recipients are still its clients, whatever their connections ended
     /// on, and leaves only those that go after that to the hand-over.
-    async fn serve_gone(self: &Arc<Self>) {
+    async fn serve_gone(&self) {
         let mut guard = self.routing_mut().await;
         let routing = &mut *guard;
         for peer in routing.peers.values_mut() {

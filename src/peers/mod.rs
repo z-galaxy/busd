@@ -1,7 +1,7 @@
 use std::{
     fmt,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::Duration,
 };
 
@@ -58,55 +58,54 @@ pub use stats::{ConnectionCounts, Counts};
 /// sends the batch to all of its recipients at once, so that those that don't read hold it up for
 /// as long as the slowest of them, rather than for as long as all of them together, and goes on to
 /// the next batch once each recipient has taken its messages or been disconnected.
-#[derive(Debug)]
+///
+/// A handle: cheap to clone, and all clones refer to the same peers.
+#[derive(Clone, Debug)]
 pub struct Peers {
-    routing: RwLock<Routing>,
-    /// The connection on which the bus serves the D-Bus API, from when the bus is among its peers
-    /// until the bus goes.
-    bus_conn: Mutex<Option<Connection>>,
-    /// The users of the peers, and of the bus itself.
-    users: Users,
-    /// The uid of the user that the bus itself runs as.
-    uid: u32,
-    /// How the bus reads its policy again, if it was told how: see [`Peers::set_reload`]. A reload
-    /// holds it until the bus goes by what it read, so that reloads take turns.
-    reload: lock::Mutex<Option<Reload>>,
-    /// What the bus does on its own, besides forwarding the messages of its peers.
-    chores: Chores,
-    /// Notified once the bus takes no more clients, as it is done pausing: see [`Peers::add`].
-    #[cfg(target_os = "linux")]
-    sealed: Event,
-    /// Notified as the task that serves a client gives the stream of its messages back, as the bus
-    /// pauses, and as a client goes, which a pause waits for: see [`Peers::pause`].
-    #[cfg(target_os = "linux")]
-    paused_changed: Event,
+    inner: Arc<Inner>,
+}
+
+/// A [`Peers`] that doesn't keep the peers alive. Objects that the peers themselves keep alive use
+/// it, such as the interfaces through which the bus serves the D-Bus API.
+#[derive(Clone, Debug)]
+pub struct WeakPeers {
+    inner: Weak<Inner>,
 }
 
 impl Peers {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            routing: RwLock::new(Routing::default()),
-            bus_conn: Mutex::new(None),
-            users: Users::new(MAX_OBJECTS),
-            uid: rustix::process::getuid().as_raw(),
-            reload: lock::Mutex::new(None),
-            chores: Chores::default(),
-            #[cfg(target_os = "linux")]
-            sealed: Event::new(),
-            #[cfg(target_os = "linux")]
-            paused_changed: Event::new(),
-        })
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                routing: RwLock::new(Routing::default()),
+                bus_conn: Mutex::new(None),
+                users: Users::new(MAX_OBJECTS),
+                uid: rustix::process::getuid().as_raw(),
+                reload: lock::Mutex::new(None),
+                chores: Chores::default(),
+                #[cfg(target_os = "linux")]
+                sealed: Event::new(),
+                #[cfg(target_os = "linux")]
+                paused_changed: Event::new(),
+            }),
+        }
+    }
+
+    /// A handle that doesn't keep the peers alive.
+    pub fn downgrade(&self) -> WeakPeers {
+        WeakPeers {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// Note a chore of the bus, under way until the returned guard is dropped. See
     /// [`Chores::start`].
     pub(crate) fn chore(&self) -> Chore {
-        self.chores.start()
+        self.inner.chores.start()
     }
 
     /// The users of the peers, and of the bus itself.
     pub fn users(&self) -> &Users {
-        &self.users
+        &self.inner.users
     }
 
     /// Have the bus go by `policy` from now on: for the clients that connect, and for the peers
@@ -125,7 +124,7 @@ impl Peers {
     where
         F: Fn() -> Result<Policy> + Send + Sync + 'static,
     {
-        *self.reload.lock().await = Some(Reload(Arc::new(read)));
+        *self.inner.reload.lock().await = Some(Reload(Arc::new(read)));
     }
 
     /// Read the policy of the bus again, as [`Peers::set_reload`] told how to, and have the bus go
@@ -136,7 +135,7 @@ impl Peers {
     /// goes on by the policy that it has.
     pub async fn reload(&self) -> Option<Result<()>> {
         // Held until the bus goes by what was read, so that reloads take turns.
-        let reload = self.reload.lock().await;
+        let reload = self.inner.reload.lock().await;
         let Reload(read) = reload.clone()?;
         let policy = match unblock(move || read()).await {
             Ok(policy) => policy,
@@ -161,17 +160,17 @@ impl Peers {
     /// gets disconnected then, before it has a name: the bus hands over the clients that it paused,
     /// and only those.
     pub async fn add(
-        self: &Arc<Self>,
+        &self,
         guid: &OwnedGuid,
         id: usize,
         builder: connection::Builder<'_>,
         send_timeout: Duration,
         uid: u32,
     ) -> Result<()> {
-        let user = self.users.user(uid);
+        let user = self.inner.users.user(uid);
         let charge = Charge::new(&user, &user)
             .ok_or_else(|| anyhow!("the bus keeps as many objects for the user {uid} as it may"))?;
-        let _connecting = self.chores.connecting();
+        let _connecting = self.inner.chores.connecting();
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
@@ -209,7 +208,7 @@ impl Peers {
     /// end of the connection on which it answers the calls to it.
     ///
     /// It fails as [`Peer::new_us`] does, and if that end fails to be built.
-    pub async fn add_us(self: &Arc<Self>, us: Us) -> Result<Connection> {
+    pub async fn add_us(&self, us: Us) -> Result<Connection> {
         let mut routing = self.routing_mut().await;
 
         self.insert_us(&mut routing, us).await
@@ -223,10 +222,10 @@ impl Peers {
     /// soon as it is added. The methods of the bus, and the task that serves it, wait for the lock
     /// of `routing` for that, so neither goes by anything short of what the caller puts there
     /// before it lets go of the lock.
-    async fn insert_us(self: &Arc<Self>, routing: &mut Routing, us: Us) -> Result<Connection> {
+    async fn insert_us(&self, routing: &mut Routing, us: Us) -> Result<Connection> {
         let Us { service, stream } = us;
         // The user of the process of the bus, as with dbus-broker.
-        let user = self.users.user(self.uid);
+        let user = self.inner.users.user(self.inner.uid);
         let (peer, peer_stream) = Peer::new_us(stream, user).await?;
         let conn = service.build().await?;
         *self.bus_conn() = Some(conn.clone());
@@ -252,12 +251,12 @@ impl Peers {
 
     /// What the bus routes messages by, to read.
     pub async fn routing(&self) -> impl Deref<Target = Routing> + '_ {
-        self.routing.read().await
+        self.inner.routing.read().await
     }
 
     /// What the bus routes messages by, to change.
     pub async fn routing_mut(&self) -> impl DerefMut<Target = Routing> + '_ {
-        self.routing.write().await
+        self.inner.routing.write().await
     }
 
     /// Whether the peer `name` is privileged: of root, or of the user that the bus itself runs as,
@@ -266,14 +265,10 @@ impl Peers {
         let routing = self.routing().await;
         let uid = routing.peers.get(name.as_str())?.user().uid();
 
-        Some(uid == 0 || uid == self.uid)
+        Some(uid == 0 || uid == self.inner.uid)
     }
 
-    pub async fn make_monitor(
-        self: &Arc<Self>,
-        peer_name: &UniqueName<'_>,
-        match_rules: MatchRules,
-    ) -> bool {
+    pub async fn make_monitor(&self, peer_name: &UniqueName<'_>, match_rules: MatchRules) -> bool {
         let mut routing = self.routing_mut().await;
         let Some(peer) = routing.remove_peer(peer_name.as_str()) else {
             return false;
@@ -347,7 +342,7 @@ impl Peers {
     ///
     /// A peer added while the bus pauses to hand over pauses right away: the bus takes none of its
     /// messages.
-    fn insert(self: &Arc<Self>, routing: &mut Routing, peer: Peer, peer_stream: Stream) {
+    fn insert(&self, routing: &mut Routing, peer: Peer, peer_stream: Stream) {
         let unique_name = peer.unique_name().clone();
         if routing.peers.contains_key(&unique_name) {
             panic!("Unique name `{unique_name}` re-used. We're in deep trouble if this happens");
@@ -382,7 +377,23 @@ impl Peers {
 
     fn bus_conn(&self) -> MutexGuard<'_, Option<Connection>> {
         // Nothing can panic while the lock is held.
-        self.bus_conn.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner
+            .bus_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Default for Peers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WeakPeers {
+    /// The peers, or `None` if they are gone.
+    pub fn upgrade(&self) -> Option<Peers> {
+        self.inner.upgrade().map(|inner| Peers { inner })
     }
 }
 
@@ -395,6 +406,31 @@ pub struct Us {
     pub service: connection::Builder<'static>,
     /// The stream of the messages of the other end: what the bus sends comes out of it.
     pub stream: MessageStream,
+}
+
+/// The state that the [`Peers`] handles share.
+#[derive(Debug)]
+struct Inner {
+    routing: RwLock<Routing>,
+    /// The connection on which the bus serves the D-Bus API, from when the bus is among its peers
+    /// until the bus goes.
+    bus_conn: Mutex<Option<Connection>>,
+    /// The users of the peers, and of the bus itself.
+    users: Users,
+    /// The uid of the user that the bus itself runs as.
+    uid: u32,
+    /// How the bus reads its policy again, if it was told how: see [`Peers::set_reload`]. A reload
+    /// holds it until the bus goes by what it read, so that reloads take turns.
+    reload: lock::Mutex<Option<Reload>>,
+    /// What the bus does on its own, besides forwarding the messages of its peers.
+    chores: Chores,
+    /// Notified once the bus takes no more clients, as it is done pausing: see [`Peers::add`].
+    #[cfg(target_os = "linux")]
+    sealed: Event,
+    /// Notified as the task that serves a client gives the stream of its messages back, as the bus
+    /// pauses, and as a client goes, which a pause waits for: see [`Peers::pause`].
+    #[cfg(target_os = "linux")]
+    paused_changed: Event,
 }
 
 /// How the bus reads its policy again: see [`Peers::set_reload`].

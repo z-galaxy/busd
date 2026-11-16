@@ -1,4 +1,4 @@
-use std::{env::temp_dir, pin::pin, sync::Arc, time::Duration};
+use std::{env::temp_dir, pin::pin, time::Duration};
 
 use busd::bus::Bus;
 use futures_util::future::{select, Either};
@@ -24,7 +24,7 @@ fn shutdown() {
         let path = temp_dir().join(s);
         let address = format!("unix:path={}", path.display());
         let mut bus = Bus::for_address(Some(&address)).await.unwrap();
-        let peers = Arc::downgrade(bus.peers());
+        let peers = bus.peers().downgrade();
         let stop = Event::new();
         let stopped = stop.listen();
 

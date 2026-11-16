@@ -693,7 +693,7 @@ async fn stock_system_configuration_(bus: TestBus) -> anyhow::Result<()> {
 /// A bus that a test runs against.
 struct TestBus {
     address: String,
-    peers: Arc<Peers>,
+    peers: Peers,
     guid: OwnedGuid,
 }
 
@@ -714,7 +714,7 @@ impl TestBus {
 
 /// A client of the bus numbered `id`, of the user of `uid`, whatever the user that runs the test.
 async fn connect_as(
-    peers: &Arc<Peers>,
+    peers: &Peers,
     guid: &OwnedGuid,
     id: usize,
     uid: u32,

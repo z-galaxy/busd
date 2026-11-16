@@ -143,7 +143,7 @@ fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
         // a time, and `join` polls this each time that it is polled, so this runs as soon as
         // the bus waits for that chore, before the chore runs.
         let x_goes = poll_fn(|_| {
-            let taken = peers.routing.try_write().is_some_and(|mut routing| {
+            let taken = peers.inner.routing.try_write().is_some_and(|mut routing| {
                 routing
                     .peers
                     .get_mut(y_name.as_str())
@@ -550,6 +550,7 @@ fn pause_ends_once_the_clients_paused() {
         );
         until(|| {
             peers
+                .inner
                 .routing
                 .try_write()
                 .is_some_and(|mut routing| paused(&mut routing))
@@ -725,16 +726,16 @@ async fn goes_while_the_bus_pauses(monitor: bool) {
     // The bus is done with what it sent as the client connected, and became a monitor, and,
     // once the runtime ran what was ready, the task that serves the client waits for the client
     // to send something.
-    peers.chores.done().await;
+    peers.inner.chores.done().await;
     let mut yielded = false;
     until(|| mem::replace(&mut yielded, true)).await;
 
     {
         // The task that serves the client, which goes, waits for this to remove the client.
-        let _reading = peers.routing.try_read().unwrap();
+        let _reading = peers.inner.routing.try_read().unwrap();
         socket.shutdown(Shutdown::Both).unwrap();
         // A writer that waits for the lock, the task, keeps new readers out.
-        until(|| peers.routing.try_read().is_none()).await;
+        until(|| peers.inner.routing.try_read().is_none()).await;
     }
     // The pause takes the lock, which is free, ahead of the task, which only runs again once
     // this yields: the pause doesn't find the client gone.
@@ -744,7 +745,7 @@ async fn goes_while_the_bus_pauses(monitor: bool) {
         "the bus was done pausing before the client went"
     );
     until(|| {
-        peers.routing.try_write().is_some_and(|routing| {
+        peers.inner.routing.try_write().is_some_and(|routing| {
             !routing.peers.contains_key(&name) && !routing.monitors.contains_key(&name)
         })
     })
@@ -918,7 +919,7 @@ async fn hand_over(bus: Bus) -> HandedOver {
 /// The peers of the next instance of the bus that handed `handed_over` over, which gets the
 /// connection on which the bus serves the D-Bus API as `carry` says, and the end of that
 /// connection on which it answers the calls to it.
-async fn take_over(handed_over: HandedOver, carry: Carry) -> (Arc<Peers>, Connection) {
+async fn take_over(handed_over: HandedOver, carry: Carry) -> (Peers, Connection) {
     let HandedOver {
         guid,
         snapshot,

@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{info, warn};
 use zbus::{
@@ -16,11 +13,11 @@ use zbus::{
 };
 
 use super::msg_sender;
-use crate::peers::Peers;
+use crate::peers::{Peers, WeakPeers};
 
 #[derive(Debug)]
 pub struct DBus {
-    peers: Weak<Peers>,
+    peers: WeakPeers,
     guid: OwnedGuid,
 }
 
@@ -28,14 +25,14 @@ impl DBus {
     pub const PATH: &'static str = "/org/freedesktop/DBus";
     pub const INTERFACE: &'static str = "org.freedesktop.DBus";
 
-    pub fn new(peers: Arc<Peers>, guid: OwnedGuid) -> Self {
+    pub fn new(peers: &Peers, guid: OwnedGuid) -> Self {
         Self {
-            peers: Arc::downgrade(&peers),
+            peers: peers.downgrade(),
             guid,
         }
     }
 
-    fn peers(&self) -> Result<Arc<Peers>> {
+    fn peers(&self) -> Result<Peers> {
         self.peers
             .upgrade()
             // Can it happen in any other situation than the bus shutting down?

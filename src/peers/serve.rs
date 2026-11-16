@@ -23,7 +23,7 @@ impl Peers {
     /// Serve `peer`, whose messages come out of `peer_stream`, until it goes, and then the monitor
     /// that it becomes, if it becomes one.
     pub(super) async fn serve_peer(
-        self: Arc<Self>,
+        self,
         mut peer_stream: Stream,
         mut cancellation_listener: EventListener,
         peer: Served,
@@ -124,14 +124,14 @@ impl Peers {
                 }
                 // A pause waits for the monitor no more.
                 #[cfg(target_os = "linux")]
-                self.paused_changed.notify(usize::MAX);
+                self.inner.paused_changed.notify(usize::MAX);
 
                 return Ok(());
             }
         }
         // A pause waits for the peer no more.
         #[cfg(target_os = "linux")]
-        self.paused_changed.notify(usize::MAX);
+        self.inner.paused_changed.notify(usize::MAX);
 
         self.clean_up(&unique_name, id, pending_calls.take().collect())
             .await
@@ -140,12 +140,7 @@ impl Peers {
     /// Go on with the peer `unique_name`, numbered `id`, whose messages come out of `stream`, now
     /// that the task that served it was canceled: serve the monitor that it became, unless the bus
     /// pauses to hand over, which takes the stream back.
-    async fn serve_on(
-        self: Arc<Self>,
-        stream: MessageStream,
-        unique_name: OwnedUniqueName,
-        id: usize,
-    ) {
+    async fn serve_on(self, stream: MessageStream, unique_name: OwnedUniqueName, id: usize) {
         let Some((stream, listener)) = self.monitor_to_serve(stream, &unique_name, id).await else {
             return;
         };
@@ -169,7 +164,7 @@ impl Peers {
         #[cfg(target_os = "linux")]
         if let Some(peer) = routing.peers.get_mut(unique_name) {
             *peer.paused() = Some(stream);
-            self.paused_changed.notify(usize::MAX);
+            self.inner.paused_changed.notify(usize::MAX);
 
             return None;
         }
@@ -182,7 +177,7 @@ impl Peers {
         #[cfg(target_os = "linux")]
         if routing.handing_over {
             *monitor.paused() = Some(stream);
-            self.paused_changed.notify(usize::MAX);
+            self.inner.paused_changed.notify(usize::MAX);
 
             return None;
         }
@@ -195,7 +190,7 @@ impl Peers {
     ///
     /// A monitor is to send nothing, so it gets disconnected as soon as it sends anything.
     pub(super) async fn serve_monitor(
-        self: Arc<Self>,
+        self,
         mut stream: MessageStream,
         cancellation_listener: EventListener,
         unique_name: OwnedUniqueName,
@@ -210,7 +205,7 @@ impl Peers {
             #[cfg(target_os = "linux")]
             if let Some(monitor) = self.routing_mut().await.monitors.get_mut(&unique_name) {
                 *monitor.paused() = Some(stream);
-                self.paused_changed.notify(usize::MAX);
+                self.inner.paused_changed.notify(usize::MAX);
             }
 
             return;
@@ -225,7 +220,7 @@ impl Peers {
         self.routing_mut().await.monitors.remove(&unique_name);
         // A pause waits for the monitor no more.
         #[cfg(target_os = "linux")]
-        self.paused_changed.notify(usize::MAX);
+        self.inner.paused_changed.notify(usize::MAX);
         debug!("Monitor {} disconnected", unique_name);
     }
 

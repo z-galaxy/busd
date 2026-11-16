@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    env::temp_dir,
-    os::unix::net::UnixStream,
-    pin::pin,
-    sync::{Arc, Once},
-};
+use std::{collections::HashMap, env::temp_dir, os::unix::net::UnixStream, pin::pin, sync::Once};
 
 use anyhow::{ensure, Context};
 use busd::{bus::Bus, peer::SEND_TIMEOUT, peers::Peers};
@@ -145,7 +139,7 @@ fn unprivileged() {
 #[instrument(skip(peers, guid))]
 async fn unprivileged_clients(
     address: &str,
-    peers: &Arc<Peers>,
+    peers: &Peers,
     guid: &OwnedGuid,
 ) -> anyhow::Result<()> {
     // A client of a user that is neither root nor the user of the bus.
@@ -213,7 +207,7 @@ async fn unprivileged_clients(
 
 /// A client of the bus numbered `id`, of the user of `uid`, whatever the user that runs the test.
 async fn connect_as(
-    peers: &Arc<Peers>,
+    peers: &Peers,
     guid: &OwnedGuid,
     id: usize,
     uid: u32,
