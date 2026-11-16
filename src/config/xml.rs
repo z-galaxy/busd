@@ -11,7 +11,12 @@ use crate::{debug, error, warn};
 use anyhow::{Error, Result};
 use serde::Deserialize;
 
-use super::{BusType, MessageType};
+use super::{
+    rule::{
+        Access, ConnectOperation, NameOwnership, Operation, ReceiveOperation, Rule, SendOperation,
+    },
+    BusType, MessageType, Name, Policy,
+};
 
 /// The bus configuration.
 ///
@@ -296,6 +301,57 @@ pub struct PolicyElement {
     pub user: Option<String>,
 }
 
+impl PolicyElement {
+    /// The policy that the element represents, or `None` if the policy is left out.
+    pub(super) fn into_policy(self) -> Result<Option<Policy>> {
+        match self {
+            // Ignore the rules of the unsupported `at_console` context, but keep a placeholder for
+            // the policy. Otherwise, a configuration of a bus other than a system bus that has
+            // only such policies would fall back to the open policy.
+            PolicyElement {
+                at_console: Some(_),
+                context: None,
+                group: None,
+                user: None,
+                ..
+            } => {
+                warn!(
+                    "Ignoring the rules of an `at_console` policy, which the bus doesn't support"
+                );
+
+                Ok(Some(Policy::Unsupported))
+            }
+            PolicyElement {
+                at_console: None,
+                context: Some(c),
+                group: None,
+                rules,
+                user: None,
+            } => Ok(Some(match c {
+                PolicyContext::Default => Policy::DefaultContext(rules_of(rules)?),
+                PolicyContext::Mandatory => Policy::MandatoryContext(rules_of(rules)?),
+            })),
+            PolicyElement {
+                at_console: None,
+                context: None,
+                group: Some(group),
+                rules,
+                user: None,
+            } => Ok(Some(Policy::Group(rules_of(rules)?, group))),
+            PolicyElement {
+                at_console: None,
+                context: None,
+                group: None,
+                rules,
+                user: Some(user),
+            } => Ok(Some(Policy::User(rules_of(rules)?, user))),
+            _ => Err(Error::msg(format!(
+                "policy contains conflicting attributes: {self:?}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct RuleAttributes {
     #[serde(rename = "@max_fds")]
@@ -363,10 +419,203 @@ pub enum RuleElement {
     Deny(RuleAttributes),
 }
 
+impl RuleElement {
+    /// The rule that the element represents, or `None` if the rule is left out.
+    pub(super) fn into_rule(self) -> Result<Option<Rule>> {
+        match self {
+            RuleElement::Allow(RuleAttributes {
+                group: Some(_),
+                user: Some(_),
+                ..
+            })
+            | RuleElement::Deny(RuleAttributes {
+                group: Some(_),
+                user: Some(_),
+                ..
+            }) => Err(Error::msg(format!(
+                "`group` cannot be combined with `user` in the same rule: {self:?}"
+            ))),
+            RuleElement::Allow(RuleAttributes {
+                own: Some(_),
+                own_prefix: Some(_),
+                ..
+            })
+            | RuleElement::Deny(RuleAttributes {
+                own: Some(_),
+                own_prefix: Some(_),
+                ..
+            }) => Err(Error::msg(format!(
+                "`own_prefix` cannot be combined with `own` in the same rule: {self:?}"
+            ))),
+            RuleElement::Allow(RuleAttributes {
+                send_destination: Some(_),
+                send_destination_prefix: Some(_),
+                ..
+            })
+            | RuleElement::Deny(RuleAttributes {
+                send_destination: Some(_),
+                send_destination_prefix: Some(_),
+                ..
+            }) => Err(Error::msg(format!(
+                "`send_destination_prefix` cannot be combined with `send_destination` in the same rule: {self:?}"
+            ))),
+            RuleElement::Allow(attrs) => Ok(attrs.into_operation()?.map(|operation| Rule {
+                access: Access::Allow,
+                operation,
+            })),
+            RuleElement::Deny(RuleAttributes {
+                eavesdrop: Some(true),
+                ..
+            }) => {
+                // Such a rule only concerns eavesdropping, which the bus does not do.
+                Ok(None)
+            }
+            RuleElement::Deny(attrs) => Ok(attrs.into_operation()?.map(|operation| Rule {
+                access: Access::Deny,
+                operation,
+            })),
+        }
+    }
+}
+
+impl RuleAttributes {
+    /// The operation that the attributes represent, or `None` if the rule is left out.
+    fn into_operation(self) -> Result<Option<Operation>> {
+        let has_connect = self.group.is_some() || self.user.is_some();
+        let has_own = self.own.is_some() || self.own_prefix.is_some();
+        // The `*_requested_reply` attributes make a send or receive rule, but are ignored
+        // otherwise: they only concern replies, which the policy of the bus does not apply to.
+        let has_send = self.send_broadcast.is_some()
+            || self.send_destination.is_some()
+            || self.send_destination_prefix.is_some()
+            || self.send_error.is_some()
+            || self.send_interface.is_some()
+            || self.send_member.is_some()
+            || self.send_path.is_some()
+            || self.send_requested_reply.is_some()
+            || self.send_type.is_some();
+        let has_receive = self.receive_error.is_some()
+            || self.receive_interface.is_some()
+            || self.receive_member.is_some()
+            || self.receive_path.is_some()
+            || self.receive_sender.is_some()
+            || self.receive_requested_reply.is_some()
+            || self.receive_type.is_some();
+
+        let operations_count: i8 = vec![has_connect, has_own, has_receive, has_send]
+            .into_iter()
+            .map(i8::from)
+            .sum();
+
+        if operations_count > 1 {
+            return Err(Error::msg(format!("do not mix rule attributes for connect, own, receive, and/or send attributes in the same rule: {self:?}")));
+        }
+
+        if has_connect {
+            Ok(Some(Operation::Connect(self.into_connect())))
+        } else if has_own {
+            Ok(Some(Operation::Own(self.into_own())))
+        } else if has_receive {
+            Ok(Some(Operation::Receive(self.into_receive())))
+        } else if has_send {
+            Ok(Some(Operation::Send(self.into_send())))
+        } else if self.eavesdrop.is_some() {
+            // `eavesdrop` is ignored, so a rule that has nothing else is a receive rule for every
+            // message: `<allow eavesdrop="true"/>` is how the stock session.conf lets everyone
+            // receive everything.
+            Ok(Some(Operation::Receive(self.into_receive())))
+        } else {
+            Err(Error::msg(format!("rule must specify supported attributes for connect, own, receive, or send operations: {self:?}")))
+        }
+    }
+
+    fn into_connect(self) -> ConnectOperation {
+        ConnectOperation {
+            group: self.group,
+            user: self.user,
+        }
+    }
+
+    fn into_own(self) -> NameOwnership {
+        let own = match self {
+            RuleAttributes {
+                own: Some(some),
+                own_prefix: None,
+                ..
+            } if some == "*" => Some(Name::Any),
+            RuleAttributes {
+                own: Some(some),
+                own_prefix: None,
+                ..
+            } => Some(Name::Exact(some)),
+            RuleAttributes {
+                own: None,
+                own_prefix: Some(some),
+                ..
+            } => Some(Name::Prefix(some)),
+            _ => None,
+        };
+        NameOwnership { own }
+    }
+
+    fn into_receive(self) -> ReceiveOperation {
+        ReceiveOperation {
+            error: self.receive_error,
+            interface: self.receive_interface,
+            max_fds: self.max_fds,
+            member: self.receive_member,
+            min_fds: self.min_fds,
+            path: self.receive_path,
+            sender: self.receive_sender,
+            r#type: self.receive_type,
+        }
+    }
+
+    fn into_send(self) -> SendOperation {
+        let destination = match self {
+            RuleAttributes {
+                send_destination: Some(some),
+                send_destination_prefix: None,
+                ..
+            } if some == "*" => Some(Name::Any),
+            RuleAttributes {
+                send_destination: Some(some),
+                send_destination_prefix: None,
+                ..
+            } => Some(Name::Exact(some)),
+            RuleAttributes {
+                send_destination: None,
+                send_destination_prefix: Some(some),
+                ..
+            } => Some(Name::Prefix(some)),
+            _ => None,
+        };
+        SendOperation {
+            broadcast: self.send_broadcast,
+            destination,
+            error: self.send_error,
+            interface: self.send_interface,
+            max_fds: self.max_fds,
+            member: self.send_member,
+            min_fds: self.min_fds,
+            path: self.send_path,
+            r#type: self.send_type,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct TypeElement {
     #[serde(rename = "$text")]
     pub r#type: BusType,
+}
+
+/// The rules of `elements`, without those that are left out.
+fn rules_of(elements: Vec<RuleElement>) -> Result<Vec<Rule>> {
+    elements
+        .into_iter()
+        .filter_map(|element| element.into_rule().transpose())
+        .collect()
 }
 
 fn resolve_include_path(base_path: impl AsRef<Path>, include_path: impl AsRef<Path>) -> PathBuf {

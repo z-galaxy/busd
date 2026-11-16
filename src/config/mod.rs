@@ -6,7 +6,6 @@ use std::{
 
 use crate::warn;
 use anyhow::{Error, Result};
-use policy::OptionalPolicy;
 use serde::Deserialize;
 use zbus::{address::Transport, Address};
 
@@ -26,7 +25,7 @@ use xml::{Document, Element, TypeElement};
 /// We plan to add support for other formats (e.g JSON) in the future.
 ///
 /// [XML configuration files]: https://dbus.freedesktop.org/doc/dbus-daemon.1.html#configuration_file
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Config {
     /// If `true`, the bus daemon becomes a real daemon (forks into the background, etc.).
     pub fork: bool,
@@ -40,8 +39,6 @@ pub struct Config {
     /// parameters/options. The bus only listens on unix sockets, so it ignores the other
     /// addresses.
     // TODO: warn when multiple `<listen>` elements are defined, as we only support one
-    // TODO: consider implementing `Deserialize` over in zbus crate, then removing this "skip..."
-    #[serde(default, skip_deserializing)]
     pub listen: Option<Address>,
 
     /// The bus daemon will write its pid to the specified file.
@@ -52,7 +49,6 @@ pub struct Config {
     /// Adds a directory to search for .service files,
     /// which tell the dbus-daemon how to start a program to provide a particular well-known bus
     /// name.
-    #[serde(default)]
     pub servicedirs: Vec<PathBuf>,
 
     /// Specifies the setuid helper that is used to launch system daemons with an alternate user.
@@ -102,7 +98,7 @@ impl TryFrom<Document> for Config {
                 }
                 Element::Pidfile(p) => config.pidfile = Some(p),
                 Element::Policy(pe) => {
-                    if let Some(p) = OptionalPolicy::try_from(pe)? {
+                    if let Some(p) = pe.into_policy()? {
                         config.policies.push(p);
                     }
                 }
@@ -185,10 +181,8 @@ pub enum MessageType {
     Error,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Name {
-    #[serde(rename = "*")]
     Any,
     Exact(String),
     Prefix(String),
