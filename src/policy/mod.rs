@@ -369,14 +369,14 @@ impl<'m> Facts<'m> {
 /// Add `rule`, of `rank`, to `set`, or to `connect` if it is a connect rule, unless it is left
 /// out.
 fn add_rule(
-    (access, operation): &config::rule::Rule,
+    rule: &config::Rule,
     rank: Rank,
     set: &mut RuleSet,
     connect: &mut Vec<ConnectRule>,
     ids: &Ids,
 ) {
-    let allow = *access == Access::Allow;
-    match operation {
+    let allow = rule.access == Access::Allow;
+    match &rule.operation {
         Operation::Connect(target) => {
             if !matches!(rank.context, Context::Default | Context::Mandatory) {
                 warn!(

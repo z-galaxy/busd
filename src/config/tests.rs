@@ -132,44 +132,44 @@ fn config_parse_with_overlapped_lists_ok() {
             listen: Some(Address::from_str("unix:path=/tmp/foo").expect("should parse address")),
             policies: vec![
                 Policy::DefaultContext(vec![
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Deny,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
+                    },
                 ]),
                 Policy::DefaultContext(vec![
-                    (
-                        Access::Deny,
-                        Operation::Own(NameOwnership {
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Deny,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
+                    },
                 ]),
             ],
             ..Default::default()
@@ -248,38 +248,38 @@ fn config_parse_with_policies_ok() {
         Config {
             policies: vec![
                 Policy::DefaultContext(vec![
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Exact(String::from("org.freedesktop.DBus")))
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Prefix(String::from("org.freedesktop")))
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Connect(ConnectOperation {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Connect(ConnectOperation {
                             group: Some(String::from("wheel")),
                             user: None,
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Connect(ConnectOperation {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Connect(ConnectOperation {
                             group: None,
                             user: Some(String::from("root")),
                         })
-                    ),
+                    },
                 ]),
                 Policy::User(
                     vec![
-                        (
-                            Access::Allow,
-                            Operation::Send(SendOperation {
+                        Rule {
+                            access: Access::Allow,
+                            operation: Operation::Send(SendOperation {
                                 broadcast: Some(true),
                                 destination: Some(Name::Exact(String::from(
                                     "org.freedesktop.DBus"
@@ -292,10 +292,10 @@ fn config_parse_with_policies_ok() {
                                 path: Some(String::from("/org/freedesktop")),
                                 r#type: Some(MessageType::Signal),
                             })
-                        ),
-                        (
-                            Access::Allow,
-                            Operation::Receive(ReceiveOperation {
+                        },
+                        Rule {
+                            access: Access::Allow,
+                            operation: Operation::Receive(ReceiveOperation {
                                 error: Some(String::from("something bad")),
                                 interface: Some(String::from("org.freedesktop.systemd1.Activator")),
                                 max_fds: Some(128),
@@ -305,15 +305,15 @@ fn config_parse_with_policies_ok() {
                                 sender: Some(String::from("org.freedesktop.DBus")),
                                 r#type: Some(MessageType::Signal),
                             })
-                        )
+                        }
                     ],
                     String::from("root")
                 ),
                 Policy::Group(
                     vec![
-                        (
-                            Access::Allow,
-                            Operation::Send(SendOperation {
+                        Rule {
+                            access: Access::Allow,
+                            operation: Operation::Send(SendOperation {
                                 broadcast: None,
                                 destination: Some(Name::Prefix(String::from("org.freedesktop"))),
                                 error: None,
@@ -324,11 +324,11 @@ fn config_parse_with_policies_ok() {
                                 path: None,
                                 r#type: None
                             })
-                        ),
+                        },
                         // `<allow send_member=...` should be dropped
-                        (
-                            Access::Allow,
-                            Operation::Receive(ReceiveOperation {
+                        Rule {
+                            access: Access::Allow,
+                            operation: Operation::Receive(ReceiveOperation {
                                 sender: Some(String::from("org.freedesktop.Avahi")),
                                 error: None,
                                 interface: None,
@@ -338,13 +338,13 @@ fn config_parse_with_policies_ok() {
                                 path: None,
                                 r#type: None
                             })
-                        ),
+                        },
                     ],
                     String::from("network")
                 ),
-                Policy::MandatoryContext(vec![(
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                Policy::MandatoryContext(vec![Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("net.connman.iwd"))),
                         error: None,
@@ -355,7 +355,7 @@ fn config_parse_with_policies_ok() {
                         path: None,
                         r#type: None
                     })
-                ),]),
+                },]),
             ],
             ..Default::default()
         }
@@ -404,9 +404,7 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
         Config {
             policies: vec![
                 Policy::DefaultContext(vec![
-                    (
-                        Access::Allow,
-                        // `eavesdrop="true"` is dropped, keep other attributes
+                    Rule { access: Access::Allow, operation: // `eavesdrop="true"` is dropped, keep other attributes
                         Operation::Send(SendOperation {
                             broadcast: None,
                             destination: Some(Name::Any),
@@ -417,12 +415,11 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
                             min_fds: None,
                             path: None,
                             r#type: None
-                        })
-                    ),
+                        }) },
                     // `<allow eavesdrop="true"/>` is a receive rule with no restriction
-                    (
-                        Access::Allow,
-                        Operation::Receive(ReceiveOperation {
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Receive(ReceiveOperation {
                             error: None,
                             interface: None,
                             max_fds: None,
@@ -432,12 +429,12 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
                             sender: None,
                             r#type: None
                         })
-                    ),
+                    },
                     // `<deny eavesdrop="true"/>` is dropped: it only concerns eavesdropping
                     // `send_requested_reply` is dropped, keep other attributes
-                    (
-                        Access::Deny,
-                        Operation::Send(SendOperation {
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Send(SendOperation {
                             broadcast: None,
                             destination: None,
                             error: None,
@@ -448,10 +445,10 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
                             path: None,
                             r#type: Some(MessageType::MethodReturn)
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Send(SendOperation {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Send(SendOperation {
                             broadcast: None,
                             destination: None,
                             error: None,
@@ -462,11 +459,11 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
                             path: None,
                             r#type: Some(MessageType::MethodReturn)
                         })
-                    ),
+                    },
                     // `receive_requested_reply` is dropped, keep other attributes
-                    (
-                        Access::Deny,
-                        Operation::Receive(ReceiveOperation {
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Receive(ReceiveOperation {
                             error: None,
                             interface: None,
                             max_fds: None,
@@ -476,10 +473,10 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
                             sender: None,
                             r#type: Some(MessageType::Error)
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Receive(ReceiveOperation {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Receive(ReceiveOperation {
                             error: None,
                             interface: None,
                             max_fds: None,
@@ -489,7 +486,7 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
                             sender: None,
                             r#type: Some(MessageType::Error)
                         })
-                    ),
+                    },
                 ]),
                 Policy::Unsupported,
             ],

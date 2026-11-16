@@ -188,7 +188,10 @@ impl TryFrom<RuleElement> for OptionalRule {
                 "`send_destination_prefix` cannot be combined with `send_destination` in the same rule: {value:?}"
             ))),
             RuleElement::Allow(attrs) => match OptionalOperation::try_from(attrs)? {
-                Some(some) => Ok(Some((Access::Allow, some))),
+                Some(operation) => Ok(Some(Rule {
+                    access: Access::Allow,
+                    operation,
+                })),
                 None => Ok(None),
             },
             RuleElement::Deny(RuleAttributes {
@@ -199,14 +202,22 @@ impl TryFrom<RuleElement> for OptionalRule {
                 Ok(None)
             }
             RuleElement::Deny(attrs) => match OptionalOperation::try_from(attrs)? {
-                Some(some) => Ok(Some((Access::Deny, some))),
+                Some(operation) => Ok(Some(Rule {
+                    access: Access::Deny,
+                    operation,
+                })),
                 None => Ok(None),
             },
         }
     }
 }
 
-pub type Rule = (Access, Operation);
+/// An `<allow>` or `<deny>` rule of a `<policy>`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Rule {
+    pub access: Access,
+    pub operation: Operation,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum Access {

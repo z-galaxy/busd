@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr};
 
 use busd::config::{
     Access, BusType, Config, ConnectOperation, MessageType, Name, NameOwnership, Operation, Policy,
-    ReceiveOperation, SendOperation,
+    ReceiveOperation, Rule, SendOperation,
 };
 use zbus::Address;
 
@@ -17,32 +17,32 @@ fn config_read_file_with_includes_ok() {
             listen: Some(Address::from_str("unix:path=/tmp/a").expect("should parse address")),
             policies: vec![
                 Policy::DefaultContext(vec![
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Deny,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
+                    },
                 ]),
                 Policy::MandatoryContext(vec![
-                    (
-                        Access::Deny,
-                        Operation::Own(NameOwnership {
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
+                    },
                 ],),
             ],
             ..Default::default()
@@ -58,9 +58,9 @@ fn config_read_file_example_session_disable_stats_conf_ok() {
     assert_eq!(
         got,
         Config {
-            policies: vec![Policy::DefaultContext(vec![(
-                Access::Deny,
-                Operation::Send(SendOperation {
+            policies: vec![Policy::DefaultContext(vec![Rule {
+                access: Access::Deny,
+                operation: Operation::Send(SendOperation {
                     broadcast: None,
                     destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                     error: None,
@@ -70,8 +70,8 @@ fn config_read_file_example_session_disable_stats_conf_ok() {
                     min_fds: None,
                     path: None,
                     r#type: None
-                }),
-            ),]),],
+                })
+            },]),],
             ..Default::default()
         }
     );
@@ -86,9 +86,9 @@ fn config_read_file_example_system_enable_stats_conf_ok() {
         got,
         Config {
             policies: vec![Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -98,8 +98,8 @@ fn config_read_file_example_system_enable_stats_conf_ok() {
                         min_fds: None,
                         path: None,
                         r#type: None
-                    }),
-                )],
+                    })
+                }],
                 String::from("USERNAME"),
             ),],
             ..Default::default()
@@ -125,9 +125,9 @@ fn config_read_file_session_conf_ok() {
             ),
             keep_umask: true,
             policies: vec![Policy::DefaultContext(vec![
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Any),
                         error: None,
@@ -137,12 +137,12 @@ fn config_read_file_session_conf_ok() {
                         min_fds: None,
                         path: None,
                         r#type: None,
-                    }),
-                ),
+                    })
+                },
                 // `<allow eavesdrop="true"/>` is a receive rule with no restriction.
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         error: None,
                         interface: None,
                         max_fds: None,
@@ -151,14 +151,14 @@ fn config_read_file_session_conf_ok() {
                         path: None,
                         sender: None,
                         r#type: None,
-                    }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Own(NameOwnership {
+                    })
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Own(NameOwnership {
                         own: Some(Name::Any),
-                    }),
-                ),
+                    })
+                },
             ]),],
             r#type: Some(BusType::Session),
             ..Default::default()
@@ -177,22 +177,22 @@ fn config_read_file_system_conf_ok() {
         pidfile: Some(PathBuf::from("@DBUS_SYSTEM_PID_FILE@")),
         policies: vec![
             Policy::DefaultContext(vec![
-                (
-                    Access::Allow,
-                    Operation::Connect(ConnectOperation {
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Connect(ConnectOperation {
                         group: None,
                         user: Some(String::from("*")),
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Own(NameOwnership {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Own(NameOwnership {
                         own: Some(Name::Any),
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: None,
                         error: None,
@@ -203,10 +203,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: Some(MessageType::MethodCall),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: None,
                         error: None,
@@ -217,10 +217,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: Some(MessageType::Signal),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: None,
                         error: None,
@@ -231,10 +231,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: Some(MessageType::MethodReturn),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: None,
                         error: None,
@@ -245,10 +245,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: Some(MessageType::Error),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         error: None,
                         interface: None,
                         max_fds: None,
@@ -258,10 +258,10 @@ fn config_read_file_system_conf_ok() {
                         sender: None,
                         r#type: Some(MessageType::MethodCall),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         error: None,
                         interface: None,
                         max_fds: None,
@@ -271,10 +271,10 @@ fn config_read_file_system_conf_ok() {
                         sender: None,
                         r#type: Some(MessageType::MethodReturn),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         error: None,
                         interface: None,
                         max_fds: None,
@@ -284,10 +284,10 @@ fn config_read_file_system_conf_ok() {
                         sender: None,
                         r#type: Some(MessageType::Error),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         error: None,
                         interface: None,
                         max_fds: None,
@@ -297,10 +297,10 @@ fn config_read_file_system_conf_ok() {
                         sender: None,
                         r#type: Some(MessageType::Signal),
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -311,10 +311,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -325,10 +325,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -339,10 +339,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -353,10 +353,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -367,10 +367,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -381,10 +381,10 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -395,12 +395,12 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                ),
+                },
             ]),
             Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -411,13 +411,13 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                )],
+                }],
                 String::from("root"),
             ),
             Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -428,13 +428,13 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                )],
+                }],
                 String::from("root"),
             ),
             Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         error: None,
@@ -445,7 +445,7 @@ fn config_read_file_system_conf_ok() {
                         path: None,
                         r#type: None,
                     }),
-                )],
+                }],
                 String::from("root"),
             ),
         ],
@@ -559,18 +559,18 @@ fn config_read_file_with_file_included_twice_ok() {
         .expect("should read and parse XML input");
 
     let mandatory = Policy::MandatoryContext(vec![
-        (
-            Access::Deny,
-            Operation::Own(NameOwnership {
+        Rule {
+            access: Access::Deny,
+            operation: Operation::Own(NameOwnership {
                 own: Some(Name::Any),
             }),
-        ),
-        (
-            Access::Allow,
-            Operation::Own(NameOwnership {
+        },
+        Rule {
+            access: Access::Allow,
+            operation: Operation::Own(NameOwnership {
                 own: Some(Name::Any),
             }),
-        ),
+        },
     ]);
     assert_eq!(
         got,
@@ -583,10 +583,10 @@ fn config_read_file_with_file_included_twice_ok() {
 
 /// A default-context policy that allows owning `name`.
 fn allow_own(name: &str) -> Policy {
-    Policy::DefaultContext(vec![(
-        Access::Allow,
-        Operation::Own(NameOwnership {
+    Policy::DefaultContext(vec![Rule {
+        access: Access::Allow,
+        operation: Operation::Own(NameOwnership {
             own: Some(Name::Exact(String::from(name))),
         }),
-    )])
+    }])
 }

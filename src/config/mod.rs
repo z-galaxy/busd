@@ -16,7 +16,7 @@ mod xml;
 
 pub use policy::Policy;
 pub use rule::{
-    Access, ConnectOperation, NameOwnership, Operation, ReceiveOperation, SendOperation,
+    Access, ConnectOperation, NameOwnership, Operation, ReceiveOperation, Rule, SendOperation,
 };
 use xml::{Document, Element, TypeElement};
 
