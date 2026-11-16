@@ -31,7 +31,7 @@ use crate::{
 mod chores;
 mod forward;
 #[cfg(target_os = "linux")]
-mod handover;
+pub(crate) mod handover;
 mod outbox;
 mod routing;
 mod serve;

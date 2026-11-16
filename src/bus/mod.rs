@@ -25,7 +25,9 @@ use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
 #[cfg(target_os = "linux")]
 pub(crate) mod handover;
 #[cfg(target_os = "linux")]
-pub use handover::{ClientHandover, Handover, OwnHandover, STOP_TIMEOUT};
+pub use crate::peers::handover::{ClientHandover, OwnHandover};
+#[cfg(target_os = "linux")]
+pub use handover::{Handover, STOP_TIMEOUT};
 #[cfg(target_os = "linux")]
 mod systemd;
 #[cfg(target_os = "linux")]

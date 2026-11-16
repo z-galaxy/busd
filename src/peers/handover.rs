@@ -12,13 +12,18 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures_util::future::{join_all, select, Either};
-use zbus::{connection::Handover, names::OwnedUniqueName, Connection, MessageStream};
+use serde::{Deserialize, Serialize};
+use zbus::{
+    connection::Handover,
+    names::{OwnedUniqueName, OwnedWellKnownName},
+    Connection, MessageStream, Type,
+};
 use zruntime::{spawn, SharedRuntime};
 
 use super::{Peers, Routing, Served, Us};
 use crate::{
-    bus::handover::{ClientHandover, MonitorState, NameState, OwnHandover, PeerState, Snapshot},
     debug, fdo,
+    match_rules::MatchRules,
     name_registry::{NameOwner, NameRegistry},
     peer::{Caller, HandedOver, Monitor, Peer, Recipient, Stream},
     warn,
@@ -531,6 +536,71 @@ impl Peers {
             .detach();
         }
     }
+}
+
+/// What a bus hands over of a client, besides what the state of the bus holds of it: its
+/// connection.
+#[derive(Debug)]
+pub struct ClientHandover {
+    /// The number of the client, which its unique name carries.
+    pub id: usize,
+    /// The hand-over of the connection of the client: its socket, with what zbus read of the
+    /// client and the bus didn't take, and the file descriptors that came with that, which the
+    /// next instance passes on.
+    pub connection: Handover,
+}
+
+/// The hand-over of the connection on which a bus serves the D-Bus API: both of its ends.
+///
+/// The bus serves the API as a peer of its own, over a channel in its process. It answers the
+/// calls to it on one end. Its peer has the other end, and the bus forwards the messages of that
+/// peer as it does those of any client. Whatever is on its way between the two ends as the bus
+/// hands over goes with them: the calls to the bus that it didn't take, and the replies and
+/// signals that it sent and didn't pass on to its clients.
+#[derive(Debug)]
+pub struct OwnHandover {
+    /// The end on which the bus answers the calls to it.
+    pub(crate) service: Handover,
+    /// The other end, which the peer of the bus has.
+    pub(crate) peer: Handover,
+}
+
+/// The peers, monitors and names of a bus, as it hands them over.
+#[derive(Debug)]
+pub(crate) struct Snapshot {
+    pub(crate) peers: Vec<PeerState>,
+    pub(crate) monitors: Vec<MonitorState>,
+    pub(crate) names: Vec<NameState>,
+}
+
+/// A peer, as the bus hands it over.
+#[derive(Debug, Deserialize, Serialize, Type)]
+pub(crate) struct PeerState {
+    /// The number of the peer, which its unique name carries.
+    pub(crate) id: u64,
+    /// Whether the peer called `Hello`.
+    pub(crate) greeted: bool,
+    pub(crate) match_rules: MatchRules,
+    /// The calls to the peer that wait for its reply: the number of the caller, its unique name,
+    /// and the serial of the call.
+    pub(crate) pending_calls: Vec<(u64, OwnedUniqueName, u32)>,
+}
+
+/// A monitor, as the bus hands it over.
+#[derive(Debug, Deserialize, Serialize, Type)]
+pub(crate) struct MonitorState {
+    /// The number of the peer that became the monitor.
+    pub(crate) id: u64,
+    pub(crate) match_rules: MatchRules,
+}
+
+/// A well-known name, as the bus hands it over: its owner first, then those that queue for it, in
+/// order, each with whether it lets another take the name over from it, and whether it doesn't
+/// queue for the name once that happens.
+#[derive(Debug, Deserialize, Serialize, Type)]
+pub(crate) struct NameState {
+    pub(crate) name: OwnedWellKnownName,
+    pub(crate) owners: Vec<(OwnedUniqueName, bool, bool)>,
 }
 
 /// Whether the task that served each peer of `routing`, the bus itself included, and each monitor,

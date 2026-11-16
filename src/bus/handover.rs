@@ -12,14 +12,19 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use zbus::{
     address::Transport,
-    connection,
-    names::{OwnedUniqueName, OwnedWellKnownName},
     wire::{serialized, to_bytes, LE},
     Address, OwnedGuid, Type,
 };
 
 use super::Bus;
-use crate::{info, match_rules::MatchRules, peers::Peers, policy::Policy};
+use crate::{
+    info,
+    peers::{
+        handover::{ClientHandover, MonitorState, NameState, OwnHandover, PeerState, Snapshot},
+        Peers,
+    },
+    policy::Policy,
+};
 
 impl Bus {
     /// Stop the bus where its next instance can take over from it, and hand it over.
@@ -172,33 +177,6 @@ pub struct Handover {
     pub(crate) own: Option<OwnHandover>,
 }
 
-/// The hand-over of the connection on which a bus serves the D-Bus API: both of its ends.
-///
-/// The bus serves the API as a peer of its own, over a channel in its process. It answers the
-/// calls to it on one end. Its peer has the other end, and the bus forwards the messages of that
-/// peer as it does those of any client. Whatever is on its way between the two ends as the bus
-/// hands over goes with them: the calls to the bus that it didn't take, and the replies and
-/// signals that it sent and didn't pass on to its clients.
-#[derive(Debug)]
-pub struct OwnHandover {
-    /// The end on which the bus answers the calls to it.
-    pub(crate) service: connection::Handover,
-    /// The other end, which the peer of the bus has.
-    pub(crate) peer: connection::Handover,
-}
-
-/// What a bus hands over of a client, besides what the state of the bus holds of it: its
-/// connection.
-#[derive(Debug)]
-pub struct ClientHandover {
-    /// The number of the client, which its unique name carries.
-    pub id: usize,
-    /// The hand-over of the connection of the client: its socket, with what zbus read of the
-    /// client and the bus didn't take, and the file descriptors that came with that, which the
-    /// next instance passes on.
-    pub connection: connection::Handover,
-}
-
 /// How long a client in the middle of its handshake has to finish that as the bus hands over,
 /// before the bus lets go of it, which disconnects it.
 ///
@@ -207,14 +185,6 @@ pub struct ClientHandover {
 /// Nor does it wait for its clients to take what it sends them: what a client doesn't take goes on
 /// with the hand-over of its connection.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// The peers, monitors and names of a bus, as it hands them over.
-#[derive(Debug)]
-pub(crate) struct Snapshot {
-    pub(crate) peers: Vec<PeerState>,
-    pub(crate) monitors: Vec<MonitorState>,
-    pub(crate) names: Vec<NameState>,
-}
 
 /// The state of a bus, as it hands it over.
 #[derive(Debug, Deserialize, Serialize, Type)]
@@ -258,36 +228,6 @@ impl State {
     }
 }
 
-/// A peer, as the bus hands it over.
-#[derive(Debug, Deserialize, Serialize, Type)]
-pub(crate) struct PeerState {
-    /// The number of the peer, which its unique name carries.
-    pub(crate) id: u64,
-    /// Whether the peer called `Hello`.
-    pub(crate) greeted: bool,
-    pub(crate) match_rules: MatchRules,
-    /// The calls to the peer that wait for its reply: the number of the caller, its unique name,
-    /// and the serial of the call.
-    pub(crate) pending_calls: Vec<(u64, OwnedUniqueName, u32)>,
-}
-
-/// A monitor, as the bus hands it over.
-#[derive(Debug, Deserialize, Serialize, Type)]
-pub(crate) struct MonitorState {
-    /// The number of the peer that became the monitor.
-    pub(crate) id: u64,
-    pub(crate) match_rules: MatchRules,
-}
-
-/// A well-known name, as the bus hands it over: its owner first, then those that queue for it, in
-/// order, each with whether it lets another take the name over from it, and whether it doesn't
-/// queue for the name once that happens.
-#[derive(Debug, Deserialize, Serialize, Type)]
-pub(crate) struct NameState {
-    pub(crate) name: OwnedWellKnownName,
-    pub(crate) owners: Vec<(OwnedUniqueName, bool, bool)>,
-}
-
 /// The version of the state. A bus takes over from a bus of the same version, or of the version
 /// before it, and from no other.
 const VERSION: u32 = 2;
@@ -299,9 +239,13 @@ const VERSION_WITHOUT_OWN: u32 = 1;
 
 #[cfg(test)]
 mod tests {
-    use zbus::{names::OwnedUniqueName, OwnedMatchRule};
+    use zbus::{
+        names::{OwnedUniqueName, OwnedWellKnownName},
+        OwnedMatchRule,
+    };
 
     use super::*;
+    use crate::match_rules::MatchRules;
 
     #[test]
     fn state() {
