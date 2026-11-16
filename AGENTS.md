@@ -63,8 +63,13 @@ argument parsing via clap). Key modules:
   The module docs of `bus/systemd.rs` describe the hand-over, with a diagram of a restart
   (`bus/systemd/restart.mmd`, in mermaid), and name the many kinds of FDs that it takes. The
   tests and the benchmark restart busd through zoter's fake service manager.
-- **`peer/`, `peers.rs`** — per-connection peer state and the set of connected peers,
-  including monitor (eavesdropping) support.
+- **`peer/`** — per-connection peer state, including monitor (eavesdropping) support.
+- **`peers/`** — the set of connected peers. `routing.rs` holds the peers, the monitors and
+  the name registry behind one lock. `serve.rs` is the task that reads a peer's messages,
+  `forward.rs` picks the recipients of each message, and `outbox.rs` collects what a batch
+  sends to each recipient. `chores.rs` counts the bus's own work, which a hand-over waits for,
+  `stats.rs` gathers the statistics, and `handover.rs` builds and restores the state that goes
+  to the next instance.
 - **`name_registry.rs`** — ownership of well-known bus names.
 - **`match_rules.rs`** — match-rule parsing and signal delivery.
 - **`fdo/`** — the standard `org.freedesktop.DBus` interfaces (`dbus.rs`), monitoring
