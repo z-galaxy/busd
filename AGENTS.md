@@ -56,6 +56,10 @@ argument parsing via clap). Key modules:
   readiness notifications, and restarts through systemd's file descriptor store, which hand the
   clients over to the next instance. The protocols of systemd, and the layout of a hand-over in
   the store, are [zoter]'s; zbus's hand-over of each connection is an item of zoter's hand-over.
+  The bus hands over the connection on which it serves the D-Bus API as well, both ends of it,
+  with what is on its way between the bus and its clients, so it waits for nothing to get through
+  before it stops: the two go together as one item too, the first, which the next instance takes
+  nothing over without.
   The module docs of `bus/systemd.rs` describe the hand-over, with a diagram of a restart
   (`bus/systemd/restart.mmd`, in mermaid), and name the many kinds of FDs that it takes. The
   tests and the benchmark restart busd through zoter's fake service manager.

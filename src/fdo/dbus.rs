@@ -14,7 +14,6 @@ use zbus::{
     object_server::{ResponseDispatchNotifier, SignalEmitter},
     Optional, OwnedGuid, OwnedMatchRule,
 };
-use zruntime::spawn;
 
 use super::msg_sender;
 use crate::peers::Peers;
@@ -60,8 +59,8 @@ impl DBus {
 // The bus answers the calls one at a time, in the order that they come in, rather than in a task of
 // its own for each, as the reference implementation of D-Bus and dbus-broker do: the calls that a
 // client makes one after the other get their replies, and have the bus send their signals, in that
-// order. On Linux, a call of the bus to itself, as a barrier, so comes back once the bus is done
-// with the calls before it: see `Peers::settle`.
+// order. On Linux, a bus that hands over so answers the calls that it took, and leaves the others,
+// in that order, to its next instance: see `Peers::hand_over_us`.
 //
 // So a method must never wait for anything that waits for the bus to take the calls after the one
 // that it answers, or the bus waits for ever. The calls on their way to the bus wait for it to take
@@ -90,16 +89,14 @@ impl DBus {
             .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
         peer.hello().await?;
 
-        // Notify name change in a separate task because we want:
+        // Notify name change once the response is sent because we want:
         // 1. `Hello` to return ASAP and hence client connection to be esablished.
         // 2. The `Hello` response to arrive before the `NameAcquired` signal.
+        // The signals are part of the call, so a hand-over of the bus waits for them.
         let unique_name = peer.unique_name().clone();
-        let (response, listener) = ResponseDispatchNotifier::new(unique_name.clone());
+        let response = unique_name.clone();
         let ctxt = emitter.to_owned();
-        let chore = peers.chore();
-        spawn(async move {
-            let _chore = chore;
-            listener.await;
+        let notify = async move {
             let owner = UniqueName::from(unique_name);
 
             if let Err(e) = Self::name_owner_changed(
@@ -117,10 +114,13 @@ impl DBus {
             if let Err(e) = Self::name_acquired(&ctxt, owner.into()).await {
                 warn!("Failed to send `NameAcquired` signal: {}", e);
             }
-        })
-        .detach();
+        };
 
-        Ok(response)
+        Ok(ResponseDispatchNotifier::followed_by(
+            response,
+            emitter.connection(),
+            notify,
+        ))
     }
 
     /// Ask the message bus to assign the given name to the method caller.

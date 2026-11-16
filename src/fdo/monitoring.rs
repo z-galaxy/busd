@@ -6,7 +6,6 @@ use zbus::{
     interface, message,
     object_server::{ResponseDispatchNotifier, SignalEmitter},
 };
-use zruntime::spawn;
 
 use super::{ensure_privileged, msg_sender};
 use crate::{fdo::DBus, match_rules::MatchRules, peers::Peers};
@@ -56,13 +55,9 @@ impl Monitoring {
 
         // We want to emit the name change signals **after** the `BecomeMonitor` method returns.
         // Otherwise, some clients (e.g `busctl monitor`) can get confused.
-        let (response, listener) = ResponseDispatchNotifier::new(());
+        let conn = ctxt.connection().clone();
         let ctxt = ctxt.to_owned();
-        let chore = peers.chore();
-        spawn(async move {
-            let _chore = chore;
-            listener.await;
-
+        let notify = async move {
             let names_changes = peers
                 .routing_mut()
                 .await
@@ -91,9 +86,8 @@ impl Monitoring {
             if let Err(e) = DBus::name_lost(&ctxt, owner.into()).await {
                 warn!("Failed to send `NameLost` signal: {}", e);
             }
-        })
-        .detach();
+        };
 
-        Ok(response)
+        Ok(ResponseDispatchNotifier::followed_by((), &conn, notify))
     }
 }

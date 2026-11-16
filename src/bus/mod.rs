@@ -16,7 +16,7 @@ use zbus::{
         transport::{Unix, UnixSocket},
         Transport,
     },
-    connection,
+    connection::{self, socket::Channel},
     fdo::ConnectionCredentials,
     Address, Connection, Guid, OwnedGuid,
 };
@@ -25,7 +25,7 @@ use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
 #[cfg(target_os = "linux")]
 pub(crate) mod handover;
 #[cfg(target_os = "linux")]
-pub use handover::{ClientHandover, Handover, STOP_TIMEOUT};
+pub use handover::{ClientHandover, Handover, OwnHandover, STOP_TIMEOUT};
 #[cfg(target_os = "linux")]
 mod systemd;
 #[cfg(target_os = "linux")]
@@ -34,7 +34,7 @@ pub use systemd::STORE_KEY;
 use crate::{
     fdo::{self, DBus, Monitoring, Stats},
     peer::SEND_TIMEOUT,
-    peers::Peers,
+    peers::{Peers, Us},
     policy::Policy,
 };
 
@@ -189,32 +189,37 @@ impl Bus {
         bound: bool,
     ) -> Result<Self> {
         let peers = Peers::new();
-
-        let dbus = DBus::new(peers.clone(), guid.clone());
-        let monitoring = Monitoring::new(peers.clone());
-        let stats = Stats::new(peers.clone());
-
-        // Create a peer for ourselves.
-        trace!("Creating self-dial connection.");
-        let (client_socket, peer_socket) = zbus::connection::socket::Channel::pair();
-        let service_conn = connection::Builder::authenticated_socket(client_socket, guid.clone())
-            .p2p()
-            .unique_name(fdo::BUS_NAME)
-            .name(fdo::BUS_NAME)
-            .serve_at(fdo::DBus::PATH, dbus)
-            .serve_at(fdo::Monitoring::PATH, monitoring)
-            .serve_at(fdo::Stats::PATH, stats)
-            .build()
-            .await?;
-        let peer_stream = connection::Builder::authenticated_socket(peer_socket, guid.clone())
-            .p2p()
-            .build_message_stream()
-            .await?;
-
-        peers.add_us(peer_stream, service_conn.clone()).await?;
+        let us = Self::us(
+            &peers,
+            &guid,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .await?;
+        let service_conn = peers.add_us(us).await?;
         trace!("Self-dial connection created.");
 
-        Ok(Self {
+        Ok(Self::with_peers(
+            listener,
+            address,
+            guid,
+            bound,
+            peers,
+            service_conn,
+        ))
+    }
+
+    /// A bus that listens on `listener`, at `address`, with `peers`, the bus itself among them, on
+    /// `service_conn`: `bound` says whether it bound the listener itself.
+    fn with_peers(
+        listener: zruntime::net::unix::UnixListener<Shared>,
+        address: Address,
+        guid: OwnedGuid,
+        bound: bool,
+        peers: Arc<Peers>,
+        service_conn: Connection,
+    ) -> Self {
+        Self {
             listener,
             inner: Inner {
                 address,
@@ -225,7 +230,46 @@ impl Bus {
                 _self_conn: service_conn,
             },
             bound,
-        })
+        }
+    }
+
+    /// The connection on which a bus of `guid` serves the D-Bus API to `peers`, as a peer of its
+    /// own, for the bus to be added to them: a new one, or the one that `own` hands over, with the
+    /// calls to the bus that the instance before this one didn't answer, and what it sent and
+    /// didn't pass on.
+    ///
+    /// The bus talks to itself over a channel, which is in this process alone.
+    pub(crate) async fn us(
+        peers: &Arc<Peers>,
+        guid: &OwnedGuid,
+        #[cfg(target_os = "linux")] own: Option<OwnHandover>,
+    ) -> Result<Us> {
+        trace!("Creating self-dial connection.");
+        #[cfg(target_os = "linux")]
+        let handed_over = own.map(|OwnHandover { service, peer }| {
+            let take_over = connection::Builder::take_over;
+
+            (take_over(service), take_over(peer))
+        });
+        #[cfg(not(target_os = "linux"))]
+        let handed_over = None;
+        let (service, peer) = handed_over.unwrap_or_else(|| {
+            let (service, peer) = Channel::pair();
+            let end = |socket| connection::Builder::authenticated_socket(socket, guid.clone());
+
+            (
+                end(service).p2p().unique_name(fdo::BUS_NAME),
+                end(peer).p2p(),
+            )
+        });
+        let stream = peer.build_message_stream().await?;
+        let service = service
+            .name(fdo::BUS_NAME)
+            .serve_at(fdo::DBus::PATH, DBus::new(peers.clone(), guid.clone()))
+            .serve_at(fdo::Monitoring::PATH, Monitoring::new(peers.clone()))
+            .serve_at(fdo::Stats::PATH, Stats::new(peers.clone()));
+
+        Ok(Us { service, stream })
     }
 
     /// The listener on `listener`, a socket that listens already, and the socket that clients
