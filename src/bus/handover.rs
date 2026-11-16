@@ -341,6 +341,58 @@ mod tests {
         assert!(error.to_string().contains(&expected), "{error}");
     }
 
+    /// A bus and the instance that takes over from it share only the bytes of the state, and the
+    /// two may run different versions of busd. A state of this version encodes to these bytes and
+    /// decodes from them, however the types that hold it change. Changing the encoding requires a
+    /// new version.
+    #[test]
+    fn encoding_of_the_state_is_pinned() {
+        let name = |id: u32| OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
+        // At most one rule per peer, because a peer's rules are in no particular order.
+        let rules = |rule: &str| {
+            let mut rules = MatchRules::default();
+            rules.add(OwnedMatchRule::try_from(rule).unwrap());
+
+            rules
+        };
+        let state = State {
+            guid: zbus::Guid::from_static_str("0123456789abcdef0123456789abcdef")
+                .unwrap()
+                .into(),
+            last_id: 3,
+            peers: vec![
+                PeerState {
+                    id: 1,
+                    greeted: true,
+                    match_rules: rules("type='signal',sender='org.zbus.Test'"),
+                    pending_calls: vec![(2, name(2), 7)],
+                },
+                PeerState {
+                    id: 2,
+                    greeted: false,
+                    match_rules: MatchRules::default(),
+                    pending_calls: Vec::new(),
+                },
+            ],
+            monitors: vec![MonitorState {
+                id: 3,
+                match_rules: rules("type='method_call'"),
+            }],
+            names: vec![NameState {
+                name: OwnedWellKnownName::try_from("org.zbus.Test").unwrap(),
+                owners: vec![(name(1), false, true), (name(2), true, false)],
+            }],
+        };
+
+        let encoded = state.encode().unwrap();
+        let hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, ENCODED);
+
+        let (decoded, with_own) = State::decode(&encoded).unwrap();
+        assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
+        assert!(with_own);
+    }
+
     /// A bus takes over from a state of the version before this one. That version came without
     /// the connection on which the bus serves the D-Bus API, as its bus made sure that nothing was
     /// on its way there.
@@ -387,4 +439,16 @@ mod tests {
             assert!(State::decode(&spoiled).is_err(), "{spoiled:?}");
         }
     }
+
+    /// The state of `encoding_of_the_state_is_pinned`, encoded by version 2, in hexadecimal.
+    const ENCODED: &str = concat!(
+        "02000000000000002000000030313233343536373839616263646566303132333435363738396162",
+        "63646566000000000300000000000000700000000000000001000000000000000100000029000000",
+        "24000000747970653d277369676e616c272c73656e6465723d276f72672e7a6275732e5465737427",
+        "00000000180000000200000000000000070000003a627573642e3200070000000200000000000000",
+        "00000000000000000000000000000000230000000000000003000000000000001700000012000000",
+        "747970653d276d6574686f645f63616c6c270000440000000d0000006f72672e7a6275732e546573",
+        "740000002c000000070000003a627573642e3100000000000100000000000000070000003a627573",
+        "642e32000100000000000000",
+    );
 }
