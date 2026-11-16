@@ -27,7 +27,7 @@ impl Peers {
                 not_greeted += 1;
             }
         }
-        let connecting = self.chores().connecting;
+        let connecting = self.chores.handshakes();
         let match_rules = routing.match_rule_counts;
 
         Counts {

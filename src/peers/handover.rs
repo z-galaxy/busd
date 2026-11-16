@@ -71,8 +71,8 @@ impl Peers {
             if Instant::now() < deadline {
                 // The listener comes first, so that a handshake that ends right after the check
                 // isn't missed.
-                let handshake_ended = self.chores_changed.listen();
-                if self.chores().connecting > 0 {
+                let handshake_ended = self.chores.listen();
+                if self.chores.handshakes() > 0 {
                     // Until the deadline at most, past which the handshakes still under way hold
                     // the pause up no more.
                     let _ = runtime.timeout_at(deadline, handshake_ended).await;
@@ -137,15 +137,10 @@ impl Peers {
     /// what it sent and didn't pass on, go to the next instance on that connection.
     pub(crate) async fn settle(self: &Arc<Self>) {
         loop {
-            let started = self.chores_done().await;
+            let started = self.chores.done().await;
             // Each client that went is served on as a chore, so the bus isn't settled until then.
             self.serve_gone().await;
-            let settled = {
-                let chores = self.chores();
-
-                chores.running == 0 && chores.started == started
-            };
-            if settled {
+            if self.chores.settled_since(started) {
                 return;
             }
         }
@@ -462,22 +457,6 @@ impl Peers {
         let listener = monitor.listen_cancellation();
         routing.monitors.insert(unique_name.clone(), monitor);
         spawn(self.clone().serve_monitor(stream, listener, unique_name)).detach();
-    }
-
-    /// Wait for no chore of the bus to be under way, and how many have started by then.
-    async fn chores_done(&self) -> u64 {
-        loop {
-            let listener = self.chores_changed.listen();
-            let started = {
-                let chores = self.chores();
-
-                (chores.running == 0).then_some(chores.started)
-            };
-            if let Some(started) = started {
-                return started;
-            }
-            listener.await;
-        }
     }
 
     /// Serve on the clients, peers and monitors, whose connections ended while the bus paused,

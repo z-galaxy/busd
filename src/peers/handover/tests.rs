@@ -725,7 +725,7 @@ async fn goes_while_the_bus_pauses(monitor: bool) {
     // The bus is done with what it sent as the client connected, and became a monitor, and,
     // once the runtime ran what was ready, the task that serves the client waits for the client
     // to send something.
-    peers.chores_done().await;
+    peers.chores.done().await;
     let mut yielded = false;
     until(|| mem::replace(&mut yielded, true)).await;
 

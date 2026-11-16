@@ -11,9 +11,11 @@ use zbus::{
     names::{BusName, UniqueName},
     Connection, Message, MessageStream, Optional, OwnedGuid,
 };
+#[cfg(target_os = "linux")]
+use zruntime::Event;
 use zruntime::{
     lock::{self, RwLock},
-    spawn, unblock, Event,
+    spawn, unblock,
 };
 
 #[cfg(target_os = "linux")]
@@ -37,7 +39,7 @@ mod routing;
 mod serve;
 mod stats;
 
-use chores::{Chores, Connecting};
+use chores::{Chore, Chores};
 use forward::no_reply;
 pub use routing::Routing;
 use serve::Served;
@@ -70,9 +72,7 @@ pub struct Peers {
     /// holds it until the bus goes by what it read, so that reloads take turns.
     reload: lock::Mutex<Option<Reload>>,
     /// What the bus does on its own, besides forwarding the messages of its peers.
-    chores: Mutex<Chores>,
-    /// Notified on each change of `chores`.
-    chores_changed: Event,
+    chores: Chores,
     /// Notified once the bus takes no more clients, as it is done pausing: see [`Peers::add`].
     #[cfg(target_os = "linux")]
     sealed: Event,
@@ -90,13 +90,18 @@ impl Peers {
             users: Users::new(MAX_OBJECTS),
             uid: rustix::process::getuid().as_raw(),
             reload: lock::Mutex::new(None),
-            chores: Mutex::new(Chores::default()),
-            chores_changed: Event::new(),
+            chores: Chores::default(),
             #[cfg(target_os = "linux")]
             sealed: Event::new(),
             #[cfg(target_os = "linux")]
             paused_changed: Event::new(),
         })
+    }
+
+    /// Note a chore of the bus, under way until the returned guard is dropped. See
+    /// [`Chores::start`].
+    pub(crate) fn chore(&self) -> Chore {
+        self.chores.start()
     }
 
     /// The users of the peers, and of the bus itself.
@@ -166,7 +171,7 @@ impl Peers {
         let user = self.users.user(uid);
         let charge = Charge::new(&user, &user)
             .ok_or_else(|| anyhow!("the bus keeps as many objects for the user {uid} as it may"))?;
-        let _connecting = Connecting::new(self);
+        let _connecting = self.chores.connecting();
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
