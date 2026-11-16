@@ -91,10 +91,10 @@ foldhash = "0.2.0"
 simple-mermaid = "0.2.0"
 
 # Restarts through the file descriptor store of systemd, with the clients connected throughout.
-# zbus takes it from crates.io too, so Cargo builds one zoter for both, and the hand-overs of zbus
-# are items of its hand-overs.
+# zbus builds on it too, and Cargo builds one zoter for both, so the hand-overs of zbus are items
+# of its hand-overs.
 [target.'cfg(target_os = "linux")'.dependencies.zoter]
-version = "0.1.0"
+version = "0.2.0"
 default-features = false
 
 [features]
@@ -133,7 +133,7 @@ libc = "0.2.191"
 
 # The tests and the benchmark restart busd through the fake service manager of zoter.
 [target.'cfg(target_os = "linux")'.dev-dependencies.zoter]
-version = "0.1.0"
+version = "0.2.0"
 default-features = false
 features = ["testing"]
 
@@ -154,3 +154,23 @@ debug = "full"
 [profile.bench]
 split-debuginfo = "off"
 strip = "none"
+
+# busd stores a hand-over whole, and takes one over whole, or fails, which zoter does from 0.2.0
+# on, a version that it is yet to release: until it does, busd builds on the revision of zoter
+# that has it. That has to be the revision that zbus takes zoter from, for Cargo to build one
+# zoter for both. This goes as busd takes that release from crates.io.
+[patch.crates-io.zoter]
+git = "https://github.com/z-galaxy/zoter"
+rev = "fd146b63bbdf7771e9548aceab8623ee0a102b39"
+
+# The zbus on crates.io builds on zoter 0.1, and busd stores the hand-overs of zbus in those of the
+# zoter that it builds on itself, so the two have to build on one. busd also hands the connection
+# on which it serves the D-Bus API over to its next instance, with its object server
+# (`Connection::hand_over`), has the signals that follow its replies be part of their calls, for
+# that hand-over to wait for them (`ResponseDispatchNotifier::followed_by`), and hands both ends of
+# that connection over as one item of the hand-over (`ChannelHandover`). zbus is yet to release
+# those: until it does, busd builds on the revision of zbus that has them. This goes as busd takes
+# that release from crates.io.
+[patch.crates-io.zbus]
+git = "https://github.com/z-galaxy/zbus"
+rev = "3a05c2121cf0c363177d5ade259d50b38470eaa2"
