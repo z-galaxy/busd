@@ -28,8 +28,10 @@ pub(super) struct Outbox {
 impl Outbox {
     /// Add the message at `i` in `batch` to the share of `recipient`, whose number is `id`.
     ///
-    /// The number of a peer is that of [`Peer::id`], which a monitor keeps from the peer that it
-    /// was, so no two recipients share one.
+    /// A peer's number is its client's number, [`Client::id`]. A monitor keeps the number of the
+    /// peer that it was, so no two recipients share a number.
+    ///
+    /// [`Client::id`]: crate::peer::Client::id
     pub(super) fn add(&mut self, batch: &[Message], id: usize, recipient: &Recipient, i: usize) {
         if i > 0 {
             for (at, (id, ..)) in self.sends.iter().enumerate().skip(self.index.len()) {

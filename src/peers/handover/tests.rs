@@ -65,7 +65,7 @@ fn last_signal_of_a_client_that_closes_its_end_is_handed_over() {
             .await
             .peers
             .get(sender_name.as_str())
-            .map(|peer| peer.conn().clone())
+            .map(|peer| peer.client().conn().clone())
             .unwrap();
         conn.closed().await;
         let handed_over = hand_over(bus).await;
@@ -135,7 +135,7 @@ fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
             .await
             .peers
             .get(y_name.as_str())
-            .map(|peer| peer.conn().clone())
+            .map(|peer| peer.client().conn().clone())
             .unwrap();
         y_conn.closed().await;
         // `x` goes once the bus took the stream of `y` back, to serve it on, and before the
@@ -147,7 +147,7 @@ fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
                 routing
                     .peers
                     .get_mut(y_name.as_str())
-                    .is_none_or(|y| y.paused().is_none())
+                    .is_none_or(|y| y.client_mut().paused().is_none())
             });
             if !taken {
                 return Poll::Pending;
@@ -272,7 +272,7 @@ fn signal_that_follows_a_reply_goes_to_the_next_instance() {
             .await
             .peers
             .get(fdo::BUS_NAME)
-            .map(|bus| bus.conn().clone())
+            .map(|bus| bus.client().conn().clone())
             .unwrap();
         let follow_call = Message::method_call(FOLLOWING_PATH, "Follow")
             .interface(FOLLOWING_INTERFACE)
@@ -391,7 +391,7 @@ async fn what_is_on_its_way_goes_to_the_next_instance(carry: Carry) {
         .await
         .peers
         .get(fdo::BUS_NAME)
-        .map(|bus| bus.conn().clone())
+        .map(|bus| bus.client().conn().clone())
         .unwrap();
     let forwarded: Vec<_> = (0..MANY)
         .map(|_| {
@@ -676,7 +676,12 @@ fn client_that_the_bus_disconnects_as_its_hand_over_waits_is_left_out() {
             .await
             .peers
             .get(name.as_str())
-            .map(|peer| (peer.conn().clone(), peer.recipient().clone()))
+            .map(|peer| {
+                (
+                    peer.client().conn().clone(),
+                    peer.client().recipient().clone(),
+                )
+            })
             .unwrap();
         // The connection keeps what the socket of the receiver doesn't take, and a flush holds
         // the connection as it waits for the receiver to take that.

@@ -25,7 +25,7 @@ use crate::{
     debug, fdo,
     match_rules::MatchRules,
     name_registry::{NameOwner, NameRegistry},
-    peer::{Caller, HandedOver, Monitor, Peer, Recipient, Stream},
+    peer::{unique_name, Caller, Client, HandedOver, Monitor, Peer, Recipient, Stream},
     warn,
 };
 
@@ -41,13 +41,14 @@ impl Peers {
     /// the D-Bus API over ([`Peers::hand_over_us`]). What is on its way between the bus and its
     /// clients from then on stays on that connection, which is handed over with it.
     ///
-    /// No send to a client waits for the client to take what the bus sends it from now on: what a
-    /// client doesn't take goes on with the hand-over of its connection, for the next instance to
-    /// write to the client first. The bus stops writing a client what the instance before it left
-    /// unwritten, too, if it still is ([`Peer::flush`]), which the sends to the client, and the
-    /// hand-over of its connection, would wait for otherwise. So a client that doesn't read holds
-    /// no hand-over up. Once the bus is paused, it takes no more clients: one whose handshake is
-    /// still under way by then gets disconnected at once, as [`Peers::add`] says.
+    /// From now on, no send to a client waits for the client to take what the bus sends it. What a
+    /// client doesn't take goes along with the hand-over of its connection, and the next instance
+    /// writes it to the client first. The bus also stops writing to a client what the previous
+    /// instance left unwritten, if that write is still under way ([`Client::flush`]). Otherwise,
+    /// the sends to the client and the hand-over of its connection would wait for that write. So a
+    /// client that doesn't read holds up no hand-over. Once the bus is paused, it takes no more
+    /// clients: if a client's handshake is still under way by then, the bus disconnects it at
+    /// once, as [`Peers::add`] says.
     pub(crate) async fn pause(&self, timeout: Duration) -> Result<()> {
         let runtime = SharedRuntime::current()?;
         let deadline = Instant::now() + timeout;
@@ -60,11 +61,8 @@ impl Peers {
                 let prepared = bus.prepare_hand_over();
                 debug_assert!(prepared, "the connection of the bus can't be handed over");
             }
-            for peer in routing.peers.values_mut() {
-                peer.pause();
-            }
-            for monitor in routing.monitors.values_mut() {
-                monitor.pause();
+            for client in routing.clients_mut() {
+                client.pause();
             }
         }
         loop {
@@ -164,7 +162,7 @@ impl Peers {
             .await
             .peers
             .get_mut(fdo::BUS_NAME)
-            .and_then(|bus| bus.paused().take())
+            .and_then(|bus| bus.client_mut().paused().take())
             .context("The bus isn't paused")?;
         let service = service
             .hand_over()
@@ -200,35 +198,24 @@ impl Peers {
             let routing = &mut *routing;
             for peer in routing.peers.values_mut().filter(|peer| !peer.is_bus()) {
                 let state = PeerState {
-                    id: peer.id() as u64,
+                    id: peer.client().id() as u64,
                     greeted: peer.greeted(),
-                    match_rules: peer.match_rules().clone(),
+                    match_rules: peer.client().match_rules().clone(),
                     pending_calls: peer
                         .pending_calls()
                         .records()
                         .map(|(caller_id, caller, serial)| (caller_id as u64, caller, serial.get()))
                         .collect(),
                 };
-                clients.push(Client {
-                    id: peer.id(),
-                    conn: peer.conn().clone(),
-                    recipient: peer.recipient().clone(),
-                    stream: peer.paused().take(),
-                    state: ClientState::Peer(state),
-                });
+                clients.push(Outgoing::new(peer.client_mut(), ClientState::Peer(state)));
             }
             for monitor in routing.monitors.values_mut() {
+                let client = monitor.client_mut();
                 let state = MonitorState {
-                    id: monitor.id() as u64,
-                    match_rules: monitor.match_rules().clone(),
+                    id: client.id() as u64,
+                    match_rules: client.match_rules().clone(),
                 };
-                clients.push(Client {
-                    id: monitor.id(),
-                    conn: monitor.conn().clone(),
-                    recipient: monitor.recipient().clone(),
-                    stream: monitor.paused().take(),
-                    state: ClientState::Monitor(state),
-                });
+                clients.push(Outgoing::new(client, ClientState::Monitor(state)));
             }
 
             routing
@@ -280,11 +267,8 @@ impl Peers {
         // that go now.
         self.remove_us();
         let mut routing = self.routing_mut().await;
-        for peer in routing.peers.values() {
-            peer.recipient().hand_over();
-        }
-        for monitor in routing.monitors.values() {
-            monitor.recipient().hand_over();
+        for client in routing.clients_mut() {
+            client.recipient().hand_over();
         }
         routing.peers.clear();
         routing.monitors.clear();
@@ -326,7 +310,7 @@ impl Peers {
         let mut gone = Vec::new();
         for state in peers {
             let id = usize::try_from(state.id)?;
-            let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}"))?;
+            let unique_name = unique_name(id);
             let records = pending_call_records(state.pending_calls)?;
             let Some(client) = clients.remove(&id) else {
                 debug!("Peer `{unique_name}` went while the bus handed over");
@@ -366,7 +350,8 @@ impl Peers {
                     restored_monitors.push((monitor, stream.into_inner()));
                 }
                 Err(e) => {
-                    warn!("Disconnecting the monitor `:busd.{id}`, as serving it failed: {e}")
+                    let unique_name = unique_name(id);
+                    warn!("Disconnecting the monitor `{unique_name}`, as serving it failed: {e}")
                 }
             }
         }
@@ -398,11 +383,11 @@ impl Peers {
             let callers: HashMap<usize, Arc<Caller>> = routing
                 .peers
                 .values()
-                .map(|peer| (peer.id(), peer.caller().clone()))
+                .map(|peer| (peer.client().id(), peer.caller().clone()))
                 .chain(
                     restored
                         .iter()
-                        .map(|(peer, _, _)| (peer.id(), peer.caller().clone())),
+                        .map(|(peer, _, _)| (peer.client().id(), peer.caller().clone())),
                 )
                 .collect();
             for (mut peer, stream, records) in restored {
@@ -414,11 +399,11 @@ impl Peers {
                 }
                 // zbus writes what is left ahead of anything else that the bus sends the client
                 // meanwhile.
-                peer.flush();
+                peer.client_mut().flush();
                 self.insert(&mut routing, peer, stream);
             }
             for (mut monitor, stream) in restored_monitors {
-                monitor.flush();
+                monitor.client_mut().flush();
                 self.insert_monitor(&mut routing, monitor, stream);
             }
 
@@ -448,8 +433,8 @@ impl Peers {
     /// Add `monitor`, whose messages come out of `stream`, to the monitors of `routing`, and serve
     /// it until it goes.
     fn insert_monitor(&self, routing: &mut Routing, monitor: Monitor, stream: MessageStream) {
-        let unique_name = monitor.unique_name().clone();
-        let listener = monitor.listen_cancellation();
+        let unique_name = monitor.client().unique_name().clone();
+        let listener = monitor.client().listen_cancellation();
         routing.monitors.insert(unique_name.clone(), monitor);
         spawn(self.clone().serve_monitor(stream, listener, unique_name)).detach();
     }
@@ -471,44 +456,45 @@ impl Peers {
         let mut guard = self.routing_mut().await;
         let routing = &mut *guard;
         for peer in routing.peers.values_mut() {
-            if !peer.conn().is_closed() {
-                continue;
-            }
-            let Some(stream) = peer.paused().take() else {
+            let Some(stream) = gone(peer.client_mut()) else {
                 continue;
             };
             let stream = Stream::for_peer(peer, stream);
-            let serving =
-                self.clone()
-                    .serve_peer(stream, peer.listen_cancellation(), Served::new(peer));
-            let chore = self.chore();
-            spawn(async move {
-                let _chore = chore;
-
-                serving.await
-            })
-            .detach();
+            let serving = self.clone().serve_peer(
+                stream,
+                peer.client().listen_cancellation(),
+                Served::new(peer),
+            );
+            self.spawn_chore(serving);
         }
         for monitor in routing.monitors.values_mut() {
-            if !monitor.conn().is_closed() {
-                continue;
-            }
-            let Some(stream) = monitor.paused().take() else {
+            let Some(stream) = gone(monitor.client_mut()) else {
                 continue;
             };
+            let client = monitor.client();
             let serving = self.clone().serve_monitor(
                 stream,
-                monitor.listen_cancellation(),
-                monitor.unique_name().clone(),
+                client.listen_cancellation(),
+                client.unique_name().clone(),
             );
-            let chore = self.chore();
-            spawn(async move {
-                let _chore = chore;
-
-                serving.await
-            })
-            .detach();
+            self.spawn_chore(serving);
         }
+    }
+
+    /// Run `future` in a task of its own, as a chore of the bus, until it is done.
+    #[track_caller]
+    fn spawn_chore<F>(&self, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let chore = self.chore();
+        spawn(async move {
+            let _chore = chore;
+
+            future.await
+        })
+        .detach();
     }
 }
 
@@ -581,17 +567,22 @@ pub(crate) struct NameState {
 /// gave the stream of its messages back, as the bus pauses.
 fn paused(routing: &mut Routing) -> bool {
     routing
-        .peers
-        .values_mut()
-        .all(|peer| peer.paused().is_some())
-        && routing
-            .monitors
-            .values_mut()
-            .all(|monitor| monitor.paused().is_some())
+        .clients_mut()
+        .all(|client| client.paused().is_some())
 }
 
-/// A client, as the bus hands it over: see [`Peers::snapshot`].
-struct Client {
+/// The message stream of `client`, if the client's connection ended while the bus paused and the
+/// task that served the client gave the stream back.
+fn gone(client: &mut Client) -> Option<MessageStream> {
+    if !client.conn().is_closed() {
+        return None;
+    }
+
+    client.paused().take()
+}
+
+/// A client that the bus is handing over. See [`Peers::snapshot`].
+struct Outgoing {
     /// The number of the client.
     id: usize,
     conn: Connection,
@@ -601,7 +592,19 @@ struct Client {
     state: ClientState,
 }
 
-impl Client {
+impl Outgoing {
+    /// `client` as the bus hands it over, with `state`, the part of the bus's state that concerns
+    /// the client.
+    fn new(client: &mut Client, state: ClientState) -> Self {
+        Self {
+            id: client.id(),
+            conn: client.conn().clone(),
+            recipient: client.recipient().clone(),
+            stream: client.paused().take(),
+            state,
+        }
+    }
+
     /// Hand the connection of the client over, through the stream of its messages, within the time
     /// that the client has to take a message: none if that fails, or takes longer.
     ///

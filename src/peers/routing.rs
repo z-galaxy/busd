@@ -8,6 +8,8 @@ use zbus::{
     OwnedMatchRule,
 };
 
+#[cfg(target_os = "linux")]
+use crate::peer::Client;
 use crate::{
     name_registry::NameRegistry,
     peer::{Monitor, Peer},
@@ -57,7 +59,7 @@ impl Routing {
             .get_mut(name.as_str())
             .ok_or_else(|| zbus::fdo::Error::NameHasNoOwner(format!("No such peer: {name}")))?;
         if peer.add_match_rule(rule) {
-            let rules = peer.match_rules().len();
+            let rules = peer.client().match_rules().len();
             self.match_rule_counts.add(1, rules);
         }
 
@@ -80,13 +82,21 @@ impl Routing {
         Ok(())
     }
 
+    /// The clients of the bus: its peers, the bus itself among them, and its monitors.
+    #[cfg(target_os = "linux")]
+    pub(super) fn clients_mut(&mut self) -> impl Iterator<Item = &mut Client> {
+        let peers = self.peers.values_mut().map(Peer::client_mut);
+
+        peers.chain(self.monitors.values_mut().map(Monitor::client_mut))
+    }
+
     /// Add `peer` under `name`, along with the match rules that it has already, and give it what
     /// the policy has for it, unless it is the bus itself.
     pub(super) fn insert_peer(&mut self, name: OwnedUniqueName, mut peer: Peer) {
         if !peer.is_bus() {
             peer.set_policy(self.policy.for_peer(peer.user().uid(), peer.groups()));
         }
-        let rules = peer.match_rules().len();
+        let rules = peer.client().match_rules().len();
         self.match_rule_counts.add(rules, rules);
         self.peers.insert(name, peer);
     }
@@ -94,7 +104,7 @@ impl Routing {
     /// Remove the peer `name`, along with its match rules.
     pub(super) fn remove_peer(&mut self, name: &str) -> Option<Peer> {
         let peer = self.peers.remove(name)?;
-        let rules = peer.match_rules().len();
+        let rules = peer.client().match_rules().len();
         self.match_rule_counts.total = self.match_rule_counts.total.saturating_sub(rules);
 
         Some(peer)

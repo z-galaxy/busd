@@ -59,7 +59,7 @@ impl Peers {
 
         Some(ConnectionCounts {
             unique_name: unique_name.clone(),
-            match_rules: peer.match_rules().len(),
+            match_rules: peer.client().match_rules().len(),
             peak_match_rules: peer.peak_match_rules(),
             bus_names: owned.now,
             peak_bus_names: owned.peak,
@@ -79,7 +79,12 @@ impl Peers {
             .peers
             .iter()
             .filter(|(name, _)| **name != fdo::BUS_NAME)
-            .map(|(name, peer)| (name.clone(), peer.match_rules().iter().cloned().collect()))
+            .map(|(name, peer)| {
+                (
+                    name.clone(),
+                    peer.client().match_rules().iter().cloned().collect(),
+                )
+            })
             .collect()
     }
 }

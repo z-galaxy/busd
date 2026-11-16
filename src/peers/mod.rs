@@ -194,7 +194,7 @@ impl Peers {
         if routing.sealed {
             debug!(
                 "Disconnecting `{}`, as its handshake ended too late for it to be handed over",
-                peer.unique_name()
+                peer.client().unique_name()
             );
 
             return Ok(());
@@ -278,15 +278,15 @@ impl Peers {
         // the peer, which only gets to it later, so that the bus has sent all that the peer's
         // change of role takes by the time it answered.
         for other in routing.peers.values() {
-            other.pending_calls().forget(peer.id());
+            other.pending_calls().forget(peer.client().id());
         }
         let waiting = peer.pending_calls().take();
-        // The task that served the peer serves the monitor from now on, once it is done with what
-        // it took of the peer: dropping the peer tells it.
+        // From now on, the task that served the peer serves the monitor, once it is done with the
+        // peer's messages that it took. Turning the peer into a monitor tells the task so.
         let monitor = peer.become_monitor(match_rules);
         routing
             .monitors
-            .insert(monitor.unique_name().clone(), monitor);
+            .insert(monitor.client().unique_name().clone(), monitor);
         drop(routing);
         for (caller, serial) in waiting {
             match no_reply(&caller, serial) {
@@ -343,15 +343,16 @@ impl Peers {
     /// A peer added while the bus pauses to hand over pauses right away: the bus takes none of its
     /// messages.
     fn insert(&self, routing: &mut Routing, peer: Peer, peer_stream: Stream) {
-        let unique_name = peer.unique_name().clone();
+        let unique_name = peer.client().unique_name().clone();
         if routing.peers.contains_key(&unique_name) {
             panic!("Unique name `{unique_name}` re-used. We're in deep trouble if this happens");
         }
         #[cfg(target_os = "linux")]
         if routing.handing_over {
             let mut peer = peer;
-            peer.pause();
-            *peer.paused() = Some(peer_stream.into_inner());
+            let client = peer.client_mut();
+            client.pause();
+            *client.paused() = Some(peer_stream.into_inner());
             routing.insert_peer(unique_name, peer);
 
             return;
@@ -359,7 +360,7 @@ impl Peers {
         let served = Served::new(&peer);
         spawn(
             self.clone()
-                .serve_peer(peer_stream, peer.listen_cancellation(), served),
+                .serve_peer(peer_stream, peer.client().listen_cancellation(), served),
         )
         .detach();
         routing.insert_peer(unique_name, peer);

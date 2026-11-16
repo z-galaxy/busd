@@ -90,7 +90,7 @@ impl DBus {
         // 1. `Hello` to return ASAP and hence client connection to be esablished.
         // 2. The `Hello` response to arrive before the `NameAcquired` signal.
         // The signals are part of the call, so a hand-over of the bus waits for them.
-        let unique_name = peer.unique_name().clone();
+        let unique_name = peer.client().unique_name().clone();
         let response = unique_name.clone();
         let ctxt = emitter.to_owned();
         let notify = async move {
@@ -256,7 +256,7 @@ impl DBus {
             .await
             .peers
             .get(&owner)
-            .map(|peer| peer.conn().clone())
+            .map(|peer| peer.client().conn().clone())
             .ok_or_else(|| Error::Failed(format!("Peer `{bus_name}` not found")))?;
 
         conn.peer_creds().await.cloned().map_err(|e| {

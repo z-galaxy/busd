@@ -45,7 +45,7 @@ impl Recipient {
         unique_name: OwnedUniqueName,
         timeout: Duration,
     ) -> io::Result<Self> {
-        let client = Client {
+        let link = Link {
             conn,
             unique_name,
             runtime: SharedRuntime::current()?,
@@ -54,7 +54,7 @@ impl Recipient {
             disconnecting: AtomicBool::new(false),
         };
 
-        Ok(Self(Kind::Client(Arc::new(client))))
+        Ok(Self(Kind::Client(Arc::new(link))))
     }
 
     /// The bus itself, on `conn`.
@@ -173,13 +173,13 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 enum Kind {
-    Client(Arc<Client>),
+    Client(Arc<Link>),
     Bus(Connection),
 }
 
-/// The connection of a client, as the bus sends messages on it.
+/// The bus's link to a client: the client's connection, on which the bus sends messages.
 #[derive(Debug)]
-struct Client {
+struct Link {
     conn: Connection,
     unique_name: OwnedUniqueName,
     runtime: SharedRuntime,
@@ -196,7 +196,7 @@ struct Client {
     disconnecting: AtomicBool,
 }
 
-impl Client {
+impl Link {
     /// Send `msgs`, and return those that the client can't take, for their file descriptors.
     async fn send(&self, msgs: &[Message]) -> Vec<Message> {
         if self.disconnecting.load(Ordering::SeqCst) {

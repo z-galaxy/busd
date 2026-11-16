@@ -95,7 +95,8 @@ impl Peers {
                                 continue;
                             }
 
-                            outbox.add(msgs, peer.id(), peer.recipient(), i);
+                            let client = peer.client();
+                            outbox.add(msgs, client.id(), client.recipient(), i);
                         }
                     } else {
                         trace!("Dropping {msg:?}, as `{sender}` is a peer no more");
@@ -124,7 +125,7 @@ impl Peers {
                         && matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
                         && !match (peer, header.reply_serial()) {
                             (Some((_, peer)), Some(serial)) => {
-                                pending_calls.remove(peer.id(), serial)
+                                pending_calls.remove(peer.client().id(), serial)
                             }
                             _ => false,
                         };
@@ -168,7 +169,10 @@ impl Peers {
                                 Some(refusal) => {
                                     rejected.push((msg.clone(), Rejection::from(refusal)))
                                 }
-                                None => outbox.add(msgs, peer.id(), peer.recipient(), i),
+                                None => {
+                                    let client = peer.client();
+                                    outbox.add(msgs, client.id(), client.recipient(), i)
+                                }
                             }
                         }
                         (None, _) => {
@@ -200,7 +204,8 @@ impl Peers {
                         continue;
                     }
 
-                    outbox.add(msgs, monitor.id(), monitor.recipient(), i);
+                    let client = monitor.client();
+                    outbox.add(msgs, client.id(), client.recipient(), i);
                 }
             }
         }
@@ -263,8 +268,8 @@ where
         return None;
     }
     let facts = facts();
-    let sender_names = name_registry.names_of(sender.unique_name());
-    let receiver_names = name_registry.names_of(receiver.unique_name());
+    let sender_names = name_registry.names_of(sender.client().unique_name());
+    let receiver_names = name_registry.names_of(receiver.client().unique_name());
     let (rejection, denied, action, preposition, other) =
         if !receiver.policy().may_receive(&facts, sender_names) {
             (
@@ -287,7 +292,7 @@ where
         broadcast,
         ..
     } = facts;
-    let (denied, other) = (denied.unique_name(), other.unique_name());
+    let (denied, other) = (denied.client().unique_name(), other.client().unique_name());
     let [path, interface, member] = [path, interface, member].map(|value| value.unwrap_or("none"));
     // A broadcast still goes to those that the policy lets have it, which is nothing for an
     // administrator to look at.

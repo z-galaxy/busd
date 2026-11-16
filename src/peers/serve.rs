@@ -163,7 +163,7 @@ impl Peers {
         let routing = &mut *guard;
         #[cfg(target_os = "linux")]
         if let Some(peer) = routing.peers.get_mut(unique_name) {
-            *peer.paused() = Some(stream);
+            *peer.client_mut().paused() = Some(stream);
             self.inner.paused_changed.notify(usize::MAX);
 
             return None;
@@ -176,13 +176,13 @@ impl Peers {
         }
         #[cfg(target_os = "linux")]
         if routing.handing_over {
-            *monitor.paused() = Some(stream);
+            *monitor.client_mut().paused() = Some(stream);
             self.inner.paused_changed.notify(usize::MAX);
 
             return None;
         }
 
-        Some((stream, monitor.listen_cancellation()))
+        Some((stream, monitor.client().listen_cancellation()))
     }
 
     /// Serve the monitor `unique_name`, whose messages come out of `stream`, until it goes, or
@@ -204,7 +204,7 @@ impl Peers {
             // monitor.
             #[cfg(target_os = "linux")]
             if let Some(monitor) = self.routing_mut().await.monitors.get_mut(&unique_name) {
-                *monitor.paused() = Some(stream);
+                *monitor.client_mut().paused() = Some(stream);
                 self.inner.paused_changed.notify(usize::MAX);
             }
 
@@ -291,8 +291,8 @@ impl Served {
     /// What the task that serves `peer` keeps of it.
     pub(super) fn new(peer: &Peer) -> Self {
         Self {
-            unique_name: peer.unique_name().clone(),
-            id: peer.id(),
+            unique_name: peer.client().unique_name().clone(),
+            id: peer.client().id(),
             pending_calls: peer.pending_calls().clone(),
             caller: peer.caller().clone(),
         }

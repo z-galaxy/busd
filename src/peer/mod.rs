@@ -1,8 +1,9 @@
 mod stream;
 pub use stream::*;
 #[cfg(target_os = "linux")]
-use zruntime::{spawn, Shared, Task};
-use zruntime::{Event, EventListener};
+use zruntime::spawn;
+mod client;
+pub use client::*;
 mod monitor;
 pub use monitor::*;
 mod recipient;
@@ -39,37 +40,19 @@ use crate::{
 /// A peer connection.
 #[derive(Debug)]
 pub struct Peer {
-    conn: Connection,
-    recipient: Recipient,
-    id: usize,
-    unique_name: OwnedUniqueName,
-    match_rules: MatchRules,
+    client: Client,
     /// The most match rules that the peer had at a time, since this instance of the bus has it.
     peak_match_rules: usize,
     /// The calls to the peer that wait for its reply.
     pending_calls: Arc<PendingCalls>,
     /// The peer, as the caller of the calls that wait for replies.
     caller: Arc<Caller>,
-    /// The peer, as an object that the bus keeps for its user, as with dbus-broker; none for the
-    /// bus itself. A monitor that the peer becomes takes it over.
-    charge: Option<Charge>,
     /// The gids of the client, as its credentials tell; none for the bus itself, or where they
     /// can't be told.
     groups: Box<[u32]>,
     /// What the policy of the bus has for the peer.
     policy: PeerPolicy,
     greeted: bool,
-    /// Notified as the peer goes, and as the bus pauses to hand over, for the task that serves the
-    /// peer to see why.
-    canceled_event: Event,
-    /// The stream of the messages of the peer, once the task that served the peer gave it back, as
-    /// the bus pauses to hand over.
-    #[cfg(target_os = "linux")]
-    paused: Option<MessageStream>,
-    /// The task that writes the peer what the instance of the bus that handed it over left
-    /// unwritten, while it is under way: see [`Peer::flush`].
-    #[cfg(target_os = "linux")]
-    flushing: Option<Task<(), Shared>>,
 }
 
 impl Peer {
@@ -82,7 +65,7 @@ impl Peer {
         charge: Charge,
     ) -> Result<(Self, Stream)> {
         debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
-        let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
+        let unique_name = unique_name(id);
         // Use `build_message_stream` to activate a message receiver before the socket reader
         // task is spawned, so that messages the client pipelines right after authentication
         // (notably `Hello`) are never dropped in the race window between `build()` and stream
@@ -106,29 +89,25 @@ impl Peer {
         trace!("created: {:?}", conn);
         // Those credentials tell the groups of the client too.
         let groups = groups(conn.peer_creds().await?);
-
-        let peer = Self {
-            recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
+        let recipient = Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?;
+        let client = Client::new(
             conn,
+            recipient,
             id,
-            caller: Caller::new(unique_name.clone(), user.clone()),
-            charge: Some(charge),
             unique_name,
-            match_rules: MatchRules::default(),
-            peak_match_rules: 0,
-            pending_calls: Arc::new(PendingCalls::new(user)),
+            MatchRules::default(),
+            Some(charge),
+        );
+
+        // The bus gives the peer its policy as it adds the peer.
+        Ok(Self::assemble(
+            client,
+            msg_stream,
+            user,
             groups,
-            // The bus gives the peer its policy as it adds the peer.
-            policy: PeerPolicy::default(),
-            greeted: false,
-            canceled_event: Event::new(),
-            #[cfg(target_os = "linux")]
-            paused: None,
-            #[cfg(target_os = "linux")]
-            flushing: None,
-        };
-        let stream = Stream::for_peer(&peer, msg_stream);
-        Ok((peer, stream))
+            PeerPolicy::default(),
+            false,
+        ))
     }
 
     /// The bus itself, serving the FDO D-Bus API, of `user`.
@@ -142,48 +121,31 @@ impl Peer {
         let unique_name = OwnedUniqueName::try_from(fdo::BUS_NAME).unwrap();
         let conn = Connection::from(&msg_stream);
         conn.peer_creds().await?;
-
-        let peer = Self {
-            recipient: Recipient::bus(conn.clone()),
+        let recipient = Recipient::bus(conn.clone());
+        let client = Client::new(
             conn,
-            id: BUS_ID,
-            caller: Caller::new(unique_name.clone(), user.clone()),
-            charge: None,
+            recipient,
+            BUS_ID,
             unique_name,
-            match_rules: MatchRules::default(),
-            peak_match_rules: 0,
-            // The bus answers the calls to it itself, and keeps no records of them.
-            pending_calls: Arc::new(PendingCalls::new(user)),
-            groups: Box::default(),
-            policy: PeerPolicy::unrestricted(),
-            greeted: true,
-            canceled_event: Event::new(),
-            #[cfg(target_os = "linux")]
-            paused: None,
-            #[cfg(target_os = "linux")]
-            flushing: None,
-        };
-        let stream = Stream::for_peer(&peer, msg_stream);
-        Ok((peer, stream))
+            MatchRules::default(),
+            None,
+        );
+
+        // Its pending calls stay empty, because the bus answers the calls to it itself and keeps no
+        // records of them.
+        Ok(Self::assemble(
+            client,
+            msg_stream,
+            user,
+            Box::default(),
+            PeerPolicy::unrestricted(),
+            true,
+        ))
     }
 
-    pub fn unique_name(&self) -> &OwnedUniqueName {
-        &self.unique_name
-    }
-
-    /// The number of the peer, which no other peer that the bus ever has shares: 0 for the bus
-    /// itself, and from 1 on for clients, whose unique names carry it.
-    pub fn id(&self) -> usize {
-        self.id
-    }
-
-    pub fn conn(&self) -> &Connection {
-        &self.conn
-    }
-
-    /// Where the bus sends the messages for the peer.
-    pub fn recipient(&self) -> &Recipient {
-        &self.recipient
+    /// The peer, as a client of the bus.
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     /// The calls to the peer that wait for its reply.
@@ -221,14 +183,6 @@ impl Peer {
         self.greeted
     }
 
-    pub fn match_rules(&self) -> &MatchRules {
-        &self.match_rules
-    }
-
-    pub fn listen_cancellation(&self) -> EventListener {
-        self.canceled_event.listen()
-    }
-
     /// Whether the message goes to this peer.
     ///
     /// A message with a destination goes to its destination alone, whatever the match rules of
@@ -238,12 +192,13 @@ impl Peer {
     ///
     /// Same as [`MatchRules::matches`].
     pub fn interested(&self, msg: &zbus::Message, name_registry: &NameRegistry) -> bool {
+        let unique_name = self.client.unique_name();
         match msg.header().destination() {
-            Some(BusName::Unique(name)) => *name == *self.unique_name,
+            Some(BusName::Unique(name)) => *name == **unique_name,
             Some(BusName::WellKnown(name)) => name_registry
                 .lookup(name)
-                .is_some_and(|owner| *owner == self.unique_name),
-            None => self.match_rules.matches(msg, name_registry),
+                .is_some_and(|owner| *owner == *unique_name),
+            None => self.client.match_rules().matches(msg, name_registry),
         }
     }
 
@@ -251,8 +206,9 @@ impl Peer {
     ///
     /// Whether the peer did not have the rule already: see [`MatchRules::add`].
     pub fn add_match_rule(&mut self, rule: OwnedMatchRule) -> bool {
-        let added = self.match_rules.add(rule);
-        self.peak_match_rules = self.peak_match_rules.max(self.match_rules.len());
+        let match_rules = self.client.match_rules_mut();
+        let added = match_rules.add(rule);
+        self.peak_match_rules = self.peak_match_rules.max(match_rules.len());
 
         added
     }
@@ -264,7 +220,7 @@ impl Peer {
 
     /// Remove the first rule that matches.
     pub fn remove_match_rule(&mut self, rule: OwnedMatchRule) -> zbus::fdo::Result<()> {
-        self.match_rules.remove(rule)
+        self.client.match_rules_mut().remove(rule)
     }
 
     /// This can only be called once.
@@ -279,8 +235,17 @@ impl Peer {
         Result::Ok(())
     }
 
+    /// Turn the peer into a monitor with `match_rules`. The monitor is the same client, and keeps
+    /// what the client had as a peer, such as a write under way, which continues.
+    ///
+    /// What only the peer had, such as its calls that wait for its reply, is dropped.
     pub fn become_monitor(self, match_rules: MatchRules) -> Monitor {
-        Monitor::new(self, match_rules)
+        // This tells the task that served the peer that the client is not a peer anymore.
+        self.client.notify_canceled();
+        let mut client = self.client;
+        *client.match_rules_mut() = match_rules;
+
+        Monitor::new(client)
     }
 
     /// The peer that another instance of the bus handed over, `client`.
@@ -301,7 +266,7 @@ impl Peer {
             match_rules,
         } = client;
         debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
-        let unique_name = OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
+        let unique_name = unique_name(id);
         // The client authenticated with the instance of the bus that handed it over, and the
         // connection goes on from where that instance left it: with the messages that zbus read of
         // the client and that the bus didn't take, and the part of the one that the client was in
@@ -320,73 +285,47 @@ impl Peer {
         let uid = creds.unix_user_id().context("The client has no user")?;
         let groups = groups(creds);
         let user = users.user(uid);
+        let recipient = Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?;
+        let charge = Charge::taken_over(&user, &user);
+        let client = Client::new(conn, recipient, id, unique_name, match_rules, Some(charge));
 
-        let peer = Self {
-            recipient: Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?,
-            conn,
-            id,
-            caller: Caller::new(unique_name.clone(), user.clone()),
-            charge: Some(Charge::taken_over(&user, &user)),
-            unique_name,
-            peak_match_rules: match_rules.len(),
-            match_rules,
-            pending_calls: Arc::new(PendingCalls::new(user)),
+        // The bus gives the peer its policy as it adds the peer.
+        Ok(Self::assemble(
+            client,
+            msg_stream,
+            user,
             groups,
-            // The bus gives the peer its policy as it adds the peer.
-            policy: PeerPolicy::default(),
+            PeerPolicy::default(),
             greeted,
-            canceled_event: Event::new(),
-            paused: None,
-            flushing: None,
-        };
-        let stream = Stream::for_peer(&peer, msg_stream);
-        Ok((peer, stream))
+        ))
+    }
+
+    /// The peer, as a client of the bus, as a mutable reference.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn client_mut(&mut self) -> &mut Client {
+        &mut self.client
     }
 
     /// Whether the peer is the bus itself.
     pub(crate) fn is_bus(&self) -> bool {
-        self.id == BUS_ID
+        self.client.id() == BUS_ID
     }
 
-    /// Pause the peer, as the bus hands over: have the task that serves the peer give the stream of
-    /// its messages back, once it is done with those that it took, and have no send to the peer,
-    /// nor the hand-over of its connection, wait for it to take what the bus sends it from now on,
-    /// as what it doesn't take goes on with the hand-over. That stops the write of what the
-    /// instance of the bus that handed the peer over left unwritten, if it is still under way
-    /// ([`Peer::flush`]). The bus itself pauses as its clients do.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn pause(&mut self) {
-        let prepared = self.conn.prepare_hand_over();
-        debug_assert!(prepared, "the connection of a peer can't be handed over");
-        // The write waits for the peer to take it, for as long as the peer has to take a message,
-        // and holds the turn to write meanwhile, which the sends to the peer and the hand-over of
-        // its connection wait for. Dropping its task lets go of the turn, and leaves what it didn't
-        // write to them.
-        self.flushing = None;
-        self.canceled_event.notify(usize::MAX);
-    }
-
-    /// Write the peer what the instance of the bus that handed it over left unwritten, if anything,
-    /// in a task of its own, as [`Recipient::flush`] does, until the bus pauses the peer, or the
-    /// monitor that it becomes, to hand over in turn ([`Peer::pause`]), or lets go of it.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn flush(&mut self) {
-        self.flushing = self.recipient.flush();
-    }
-
-    /// Write what the instance of the bus that handed over left unwritten on the connection of the
-    /// bus itself, of which this is the peer and `service` the other end, if anything, in a task
-    /// of its own, until the bus pauses the peer, to hand over in turn ([`Peer::pause`]), or lets
-    /// go of it: the calls to the bus that this end took and didn't pass on, and what the bus sent
-    /// and `service` didn't pass on. Each end writes that ahead of what it sends, but only once
-    /// it sends, or is told to here.
+    /// Write what the previous instance of the bus left unwritten on the bus's own connection, if
+    /// anything, in a task of its own. This peer is one end of that connection, and `service` is
+    /// the other. What is left unwritten is the calls to the bus that this end took and didn't pass
+    /// on, and what the bus sent that `service` didn't pass on. The write stops when the bus pauses
+    /// the peer to hand over in turn ([`Client::pause`]), or when the bus lets go of the peer. Each
+    /// end writes what is left ahead of what it sends, but only once it sends, or once it is told
+    /// to here.
     #[cfg(target_os = "linux")]
     pub(crate) fn flush_us(&mut self, service: &Connection) {
-        if self.conn.unwritten_len() == 0 && service.unwritten_len() == 0 {
+        let conn = self.client.conn();
+        if conn.unwritten_len() == 0 && service.unwritten_len() == 0 {
             return;
         }
-        let (peer, service) = (self.conn.clone(), service.clone());
-        self.flushing = Some(spawn(async move {
+        let (peer, service) = (conn.clone(), service.clone());
+        self.client.set_flushing(spawn(async move {
             let (to_bus, from_bus) = join(peer.flush(), service.flush()).await;
             for (flushed, what) in [(to_bus, "the calls to the bus"), (from_bus, "the messages")] {
                 if let Err(e) = flushed {
@@ -398,17 +337,30 @@ impl Peer {
         }));
     }
 
-    /// The stream of the messages of the peer, if the task that served the peer gave it back, as
-    /// the bus pauses to hand over.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn paused(&mut self) -> &mut Option<MessageStream> {
-        &mut self.paused
-    }
-}
+    /// Build a peer from `client`, and the stream of the peer's messages, which come from
+    /// `msg_stream`. The peer belongs to `user`, is in the groups `groups`, has `policy`, and
+    /// called `Hello` if `greeted`.
+    fn assemble(
+        client: Client,
+        msg_stream: MessageStream,
+        user: Arc<User>,
+        groups: Box<[u32]>,
+        policy: PeerPolicy,
+        greeted: bool,
+    ) -> (Self, Stream) {
+        let unique_name = client.unique_name().clone();
+        let peer = Self {
+            peak_match_rules: client.match_rules().len(),
+            client,
+            pending_calls: Arc::new(PendingCalls::new(user.clone())),
+            caller: Caller::new(unique_name, user),
+            groups,
+            policy,
+            greeted,
+        };
+        let stream = Stream::for_peer(&peer, msg_stream);
 
-impl Drop for Peer {
-    fn drop(&mut self) {
-        self.canceled_event.notify(usize::MAX);
+        (peer, stream)
     }
 }
 
