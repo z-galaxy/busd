@@ -164,9 +164,13 @@ git = "https://github.com/z-galaxy/zoter"
 rev = "fd146b63bbdf7771e9548aceab8623ee0a102b39"
 
 # The zbus on crates.io builds on zoter 0.1, and busd stores the hand-overs of zbus in those of the
-# zoter that it builds on itself, so the two have to build on one. Until zbus releases a version
-# that builds on zoter 0.2.0, busd builds on the revision of zbus that takes it, from git as busd
-# does. This goes as busd takes that release from crates.io.
+# zoter that it builds on itself, so the two have to build on one. busd also hands the connection
+# on which it serves the D-Bus API over to its next instance, with its object server
+# (`Connection::hand_over`), has the signals that follow its replies be part of their calls, for
+# that hand-over to wait for them (`ResponseDispatchNotifier::followed_by`), and hands both ends of
+# that connection over as one item of the hand-over (`ChannelHandover`). zbus is yet to release
+# those: until it does, busd builds on the revision of zbus that has them. This goes as busd takes
+# that release from crates.io.
 [patch.crates-io.zbus]
 git = "https://github.com/z-galaxy/zbus"
-rev = "4293ec7e0c8f5593acf3a57411483971d8848c34"
+rev = "3a05c2121cf0c363177d5ade259d50b38470eaa2"
