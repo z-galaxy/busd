@@ -49,8 +49,11 @@ pub struct Bus {
     address: Address,
     peers: Peers,
     guid: OwnedGuid,
+    /// The number of the last client that connected.
     next_id: usize,
     send_timeout: Duration,
+    /// The end of the bus's own connection on which the bus answers the calls to it. The bus
+    /// keeps this end for as long as it lives.
     _self_conn: Connection,
 }
 
