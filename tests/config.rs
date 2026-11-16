@@ -1,8 +1,8 @@
 use std::{path::PathBuf, str::FromStr};
 
 use busd::config::{
-    Access, BusType, Config, ConnectOperation, MessageType, Name, NameOwnership, Operation, Policy,
-    ReceiveOperation, Rule, SendOperation,
+    Access, BusType, Config, ConnectOperation, MessageMatch, MessageType, Name, NameOwnership,
+    Operation, Policy, ReceiveOperation, Rule, SendOperation,
 };
 use zbus::Address;
 
@@ -61,15 +61,12 @@ fn config_read_file_example_session_disable_stats_conf_ok() {
             policies: vec![Policy::DefaultContext(vec![Rule {
                 access: Access::Deny,
                 operation: Operation::Send(SendOperation {
-                    broadcast: None,
                     destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                    error: None,
-                    interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                    max_fds: None,
-                    member: None,
-                    min_fds: None,
-                    path: None,
-                    r#type: None
+                    broadcast: None,
+                    message: MessageMatch {
+                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                        ..Default::default()
+                    }
                 })
             },]),],
             ..Default::default()
@@ -89,15 +86,12 @@ fn config_read_file_example_system_enable_stats_conf_ok() {
                 vec![Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                            ..Default::default()
+                        }
                     })
                 }],
                 String::from("USERNAME"),
@@ -128,29 +122,17 @@ fn config_read_file_session_conf_ok() {
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Any),
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch::default()
                     })
                 },
                 // `<allow eavesdrop="true"/>` is a receive rule with no restriction.
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
                         sender: None,
-                        r#type: None,
+                        message: MessageMatch::default()
                     })
                 },
                 Rule {
@@ -193,207 +175,163 @@ fn config_read_file_system_conf_ok() {
                 Rule {
                     access: Access::Deny,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::MethodCall),
+                        broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodCall),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::Signal),
+                        broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Signal),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::MethodReturn),
+                        broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodReturn),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::Error),
+                        broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Error),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
                         sender: None,
-                        r#type: Some(MessageType::MethodCall),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodCall),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
                         sender: None,
-                        r#type: Some(MessageType::MethodReturn),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodReturn),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
                         sender: None,
-                        r#type: Some(MessageType::Error),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Error),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
                         sender: None,
-                        r#type: Some(MessageType::Signal),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Signal),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus")),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Introspectable")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Introspectable")),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Properties")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Properties")),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Containers1")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Containers1")),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Deny,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus")),
-                        max_fds: None,
-                        member: Some(String::from("UpdateActivationEnvironment")),
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus")),
+                            member: Some(String::from("UpdateActivationEnvironment")),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Deny,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                            ..Default::default()
+                        },
                     }),
                 },
                 Rule {
                     access: Access::Deny,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.systemd1.Activator")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.systemd1.Activator")),
+                            ..Default::default()
+                        },
                     }),
                 },
             ]),
@@ -401,15 +339,12 @@ fn config_read_file_system_conf_ok() {
                 vec![Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.systemd1.Activator")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.systemd1.Activator")),
+                            ..Default::default()
+                        },
                     }),
                 }],
                 String::from("root"),
@@ -418,15 +353,12 @@ fn config_read_file_system_conf_ok() {
                 vec![Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Monitoring")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Monitoring")),
+                            ..Default::default()
+                        },
                     }),
                 }],
                 String::from("root"),
@@ -435,15 +367,12 @@ fn config_read_file_system_conf_ok() {
                 vec![Rule {
                     access: Access::Allow,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                            ..Default::default()
+                        },
                     }),
                 }],
                 String::from("root"),

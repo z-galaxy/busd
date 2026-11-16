@@ -1,4 +1,7 @@
-use rule::{Access, ConnectOperation, NameOwnership, Operation, ReceiveOperation, SendOperation};
+use rule::{
+    Access, ConnectOperation, MessageMatch, NameOwnership, Operation, ReceiveOperation, Rule,
+    SendOperation,
+};
 
 use super::*;
 
@@ -280,30 +283,38 @@ fn config_parse_with_policies_ok() {
                         Rule {
                             access: Access::Allow,
                             operation: Operation::Send(SendOperation {
-                                broadcast: Some(true),
                                 destination: Some(Name::Exact(String::from(
                                     "org.freedesktop.DBus"
                                 ))),
-                                error: Some(String::from("something bad")),
-                                interface: Some(String::from("org.freedesktop.systemd1.Activator")),
-                                max_fds: Some(128),
-                                member: Some(String::from("DoSomething")),
-                                min_fds: Some(12),
-                                path: Some(String::from("/org/freedesktop")),
-                                r#type: Some(MessageType::Signal),
+                                broadcast: Some(true),
+                                message: MessageMatch {
+                                    r#type: Some(MessageType::Signal),
+                                    error: Some(String::from("something bad")),
+                                    path: Some(String::from("/org/freedesktop")),
+                                    interface: Some(String::from(
+                                        "org.freedesktop.systemd1.Activator"
+                                    )),
+                                    member: Some(String::from("DoSomething")),
+                                    min_fds: Some(12),
+                                    max_fds: Some(128),
+                                }
                             })
                         },
                         Rule {
                             access: Access::Allow,
                             operation: Operation::Receive(ReceiveOperation {
-                                error: Some(String::from("something bad")),
-                                interface: Some(String::from("org.freedesktop.systemd1.Activator")),
-                                max_fds: Some(128),
-                                member: Some(String::from("DoSomething")),
-                                min_fds: Some(12),
-                                path: Some(String::from("/org/freedesktop")),
-                                sender: Some(String::from("org.freedesktop.DBus")),
-                                r#type: Some(MessageType::Signal),
+                                sender: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
+                                message: MessageMatch {
+                                    r#type: Some(MessageType::Signal),
+                                    error: Some(String::from("something bad")),
+                                    path: Some(String::from("/org/freedesktop")),
+                                    interface: Some(String::from(
+                                        "org.freedesktop.systemd1.Activator"
+                                    )),
+                                    member: Some(String::from("DoSomething")),
+                                    min_fds: Some(12),
+                                    max_fds: Some(128),
+                                }
                             })
                         }
                     ],
@@ -314,29 +325,23 @@ fn config_parse_with_policies_ok() {
                         Rule {
                             access: Access::Allow,
                             operation: Operation::Send(SendOperation {
-                                broadcast: None,
                                 destination: Some(Name::Prefix(String::from("org.freedesktop"))),
-                                error: None,
-                                interface: None,
-                                max_fds: None,
-                                member: Some(String::from("DoSomething")),
-                                min_fds: None,
-                                path: None,
-                                r#type: None
+                                broadcast: None,
+                                message: MessageMatch {
+                                    member: Some(String::from("DoSomething")),
+                                    ..Default::default()
+                                }
                             })
                         },
                         // `<allow send_member=...` should be dropped
                         Rule {
                             access: Access::Allow,
                             operation: Operation::Receive(ReceiveOperation {
-                                sender: Some(String::from("org.freedesktop.Avahi")),
-                                error: None,
-                                interface: None,
-                                max_fds: None,
-                                member: Some(String::from("DoSomething")),
-                                min_fds: None,
-                                path: None,
-                                r#type: None
+                                sender: Some(Name::Exact(String::from("org.freedesktop.Avahi"))),
+                                message: MessageMatch {
+                                    member: Some(String::from("DoSomething")),
+                                    ..Default::default()
+                                }
                             })
                         },
                     ],
@@ -345,15 +350,9 @@ fn config_parse_with_policies_ok() {
                 Policy::MandatoryContext(vec![Rule {
                     access: Access::Deny,
                     operation: Operation::Send(SendOperation {
-                        broadcast: None,
                         destination: Some(Name::Exact(String::from("net.connman.iwd"))),
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None
+                        broadcast: None,
+                        message: MessageMatch::default()
                     })
                 },]),
             ],
@@ -405,29 +404,13 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
             policies: vec![
                 Policy::DefaultContext(vec![
                     Rule { access: Access::Allow, operation: // `eavesdrop="true"` is dropped, keep other attributes
-                        Operation::Send(SendOperation {
-                            broadcast: None,
-                            destination: Some(Name::Any),
-                            error: None,
-                            interface: None,
-                            max_fds: None,
-                            member: None,
-                            min_fds: None,
-                            path: None,
-                            r#type: None
-                        }) },
+                            Operation::Send(SendOperation { destination: Some(Name::Any), broadcast: None, message: MessageMatch::default() }) },
                     // `<allow eavesdrop="true"/>` is a receive rule with no restriction
                     Rule {
                         access: Access::Allow,
                         operation: Operation::Receive(ReceiveOperation {
-                            error: None,
-                            interface: None,
-                            max_fds: None,
-                            member: None,
-                            min_fds: None,
-                            path: None,
                             sender: None,
-                            r#type: None
+                            message: MessageMatch::default()
                         })
                     },
                     // `<deny eavesdrop="true"/>` is dropped: it only concerns eavesdropping
@@ -435,56 +418,44 @@ fn config_parse_with_policies_with_ignored_rules_and_rule_attributes_ok() {
                     Rule {
                         access: Access::Deny,
                         operation: Operation::Send(SendOperation {
-                            broadcast: None,
                             destination: None,
-                            error: None,
-                            interface: None,
-                            max_fds: None,
-                            member: None,
-                            min_fds: None,
-                            path: None,
-                            r#type: Some(MessageType::MethodReturn)
+                            broadcast: None,
+                            message: MessageMatch {
+                                r#type: Some(MessageType::MethodReturn),
+                                ..Default::default()
+                            }
                         })
                     },
                     Rule {
                         access: Access::Allow,
                         operation: Operation::Send(SendOperation {
-                            broadcast: None,
                             destination: None,
-                            error: None,
-                            interface: None,
-                            max_fds: None,
-                            member: None,
-                            min_fds: None,
-                            path: None,
-                            r#type: Some(MessageType::MethodReturn)
+                            broadcast: None,
+                            message: MessageMatch {
+                                r#type: Some(MessageType::MethodReturn),
+                                ..Default::default()
+                            }
                         })
                     },
                     // `receive_requested_reply` is dropped, keep other attributes
                     Rule {
                         access: Access::Deny,
                         operation: Operation::Receive(ReceiveOperation {
-                            error: None,
-                            interface: None,
-                            max_fds: None,
-                            member: None,
-                            min_fds: None,
-                            path: None,
                             sender: None,
-                            r#type: Some(MessageType::Error)
+                            message: MessageMatch {
+                                r#type: Some(MessageType::Error),
+                                ..Default::default()
+                            }
                         })
                     },
                     Rule {
                         access: Access::Allow,
                         operation: Operation::Receive(ReceiveOperation {
-                            error: None,
-                            interface: None,
-                            max_fds: None,
-                            member: None,
-                            min_fds: None,
-                            path: None,
                             sender: None,
-                            r#type: Some(MessageType::Error)
+                            message: MessageMatch {
+                                r#type: Some(MessageType::Error),
+                                ..Default::default()
+                            }
                         })
                     },
                 ]),

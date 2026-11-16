@@ -101,7 +101,9 @@ use std::{collections::HashMap, sync::Arc};
 use zbus::{message::Type, names::OwnedWellKnownName};
 
 use crate::{
-    config::{self, Access, BusType, Config, ConnectOperation, MessageType, Name, Operation},
+    config::{
+        self, Access, BusType, Config, ConnectOperation, MessageMatch, MessageType, Name, Operation,
+    },
     debug, warn,
 };
 
@@ -407,42 +409,18 @@ fn add_rule(
             });
         }
         Operation::Send(send) => {
-            let condition = Condition {
-                r#type: &send.r#type,
-                error: &send.error,
-                path: &send.path,
-                interface: &send.interface,
-                member: &send.member,
-                broadcast: send.broadcast,
-                min_fds: send.min_fds,
-                max_fds: send.max_fds,
-            };
-            let Some(rule) = MessageRule::new(rank, allow, condition) else {
+            let Some(rule) = MessageRule::new(rank, allow, &send.message, send.broadcast) else {
                 debug!("Ignoring a send rule about replies: {send:?}");
                 return;
             };
             set.send.add(send.destination.as_ref(), rule);
         }
         Operation::Receive(receive) => {
-            let condition = Condition {
-                r#type: &receive.r#type,
-                error: &receive.error,
-                path: &receive.path,
-                interface: &receive.interface,
-                member: &receive.member,
-                broadcast: None,
-                min_fds: receive.min_fds,
-                max_fds: receive.max_fds,
-            };
-            let Some(rule) = MessageRule::new(rank, allow, condition) else {
+            let Some(rule) = MessageRule::new(rank, allow, &receive.message, None) else {
                 debug!("Ignoring a receive rule about replies: {receive:?}");
                 return;
             };
-            let sender = receive.sender.as_ref().map(|sender| match sender.as_str() {
-                "*" => Name::Any,
-                _ => Name::Exact(sender.clone()),
-            });
-            set.receive.add(sender.as_ref(), rule);
+            set.receive.add(receive.sender.as_ref(), rule);
         }
     }
 }
@@ -689,16 +667,21 @@ struct MessageRule {
 }
 
 impl MessageRule {
-    /// The rule of `condition`, or nothing if it is about replies, which are not subject to the
-    /// policy.
-    fn new(rank: Rank, allow: bool, condition: Condition<'_>) -> Option<Self> {
-        let r#type = match condition.r#type {
+    /// The rule built from `message` and `broadcast`, or `None` if the rule is about replies,
+    /// which are not subject to the policy.
+    fn new(
+        rank: Rank,
+        allow: bool,
+        message: &MessageMatch,
+        broadcast: Option<bool>,
+    ) -> Option<Self> {
+        let r#type = match message.r#type {
             None | Some(MessageType::Any) => None,
             Some(MessageType::MethodCall) => Some(Type::MethodCall),
             Some(MessageType::Signal) => Some(Type::Signal),
             Some(MessageType::MethodReturn | MessageType::Error) => return None,
         };
-        if condition.error.is_some() {
+        if message.error.is_some() {
             return None;
         }
         let fds = |fds: Option<u32>| fds.map(|fds| usize::try_from(fds).unwrap_or(usize::MAX));
@@ -707,12 +690,12 @@ impl MessageRule {
             rank,
             allow,
             r#type,
-            path: attribute(condition.path),
-            interface: attribute(condition.interface),
-            member: attribute(condition.member),
-            broadcast: condition.broadcast,
-            min_fds: fds(condition.min_fds),
-            max_fds: fds(condition.max_fds),
+            path: attribute(&message.path),
+            interface: attribute(&message.interface),
+            member: attribute(&message.member),
+            broadcast,
+            min_fds: fds(message.min_fds),
+            max_fds: fds(message.max_fds),
         })
     }
 
@@ -746,18 +729,6 @@ impl MessageRule {
             allow: self.allow,
         }
     }
-}
-
-/// The attributes of a send or receive rule that [`MessageRule::new`] takes.
-struct Condition<'r> {
-    r#type: &'r Option<MessageType>,
-    error: &'r Option<String>,
-    path: &'r Option<String>,
-    interface: &'r Option<String>,
-    member: &'r Option<String>,
-    broadcast: Option<bool>,
-    min_fds: Option<u32>,
-    max_fds: Option<u32>,
 }
 
 /// The value of an attribute that names a path, interface or member, or nothing if it is `*`,

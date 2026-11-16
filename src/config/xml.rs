@@ -13,7 +13,8 @@ use serde::Deserialize;
 
 use super::{
     rule::{
-        Access, ConnectOperation, NameOwnership, Operation, ReceiveOperation, Rule, SendOperation,
+        Access, ConnectOperation, MessageMatch, NameOwnership, Operation, ReceiveOperation, Rule,
+        SendOperation,
     },
     BusType, MessageType, Name, Policy,
 };
@@ -559,15 +560,21 @@ impl RuleAttributes {
     }
 
     fn into_receive(self) -> ReceiveOperation {
+        let sender = self.receive_sender.map(|sender| match sender.as_str() {
+            "*" => Name::Any,
+            _ => Name::Exact(sender),
+        });
         ReceiveOperation {
-            error: self.receive_error,
-            interface: self.receive_interface,
-            max_fds: self.max_fds,
-            member: self.receive_member,
-            min_fds: self.min_fds,
-            path: self.receive_path,
-            sender: self.receive_sender,
-            r#type: self.receive_type,
+            sender,
+            message: MessageMatch {
+                r#type: self.receive_type,
+                error: self.receive_error,
+                path: self.receive_path,
+                interface: self.receive_interface,
+                member: self.receive_member,
+                min_fds: self.min_fds,
+                max_fds: self.max_fds,
+            },
         }
     }
 
@@ -591,15 +598,17 @@ impl RuleAttributes {
             _ => None,
         };
         SendOperation {
-            broadcast: self.send_broadcast,
             destination,
-            error: self.send_error,
-            interface: self.send_interface,
-            max_fds: self.max_fds,
-            member: self.send_member,
-            min_fds: self.min_fds,
-            path: self.send_path,
-            r#type: self.send_type,
+            broadcast: self.send_broadcast,
+            message: MessageMatch {
+                r#type: self.send_type,
+                error: self.send_error,
+                path: self.send_path,
+                interface: self.send_interface,
+                member: self.send_member,
+                min_fds: self.min_fds,
+                max_fds: self.max_fds,
+            },
         }
     }
 }

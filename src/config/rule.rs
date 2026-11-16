@@ -38,25 +38,26 @@ pub struct NameOwnership {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReceiveOperation {
-    pub error: Option<String>,
-    pub interface: Option<String>,
-    pub max_fds: Option<u32>,
-    pub member: Option<String>,
-    pub min_fds: Option<u32>,
-    pub path: Option<String>,
-    pub sender: Option<String>,
-    pub r#type: Option<MessageType>,
+    pub sender: Option<Name>,
+    pub message: MessageMatch,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SendOperation {
-    pub broadcast: Option<bool>,
     pub destination: Option<Name>,
+    pub broadcast: Option<bool>,
+    pub message: MessageMatch,
+}
+
+/// The conditions that a send or receive rule sets on the message itself, whoever the other party
+/// is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageMatch {
+    pub r#type: Option<MessageType>,
     pub error: Option<String>,
+    pub path: Option<String>,
     pub interface: Option<String>,
-    pub max_fds: Option<u32>,
     pub member: Option<String>,
     pub min_fds: Option<u32>,
-    pub path: Option<String>,
-    pub r#type: Option<MessageType>,
+    pub max_fds: Option<u32>,
 }
