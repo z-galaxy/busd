@@ -155,11 +155,11 @@ impl NameRegistry {
 
                     (
                         RequestNameReply::PrimaryOwner,
-                        Some(NameOwnerChanged {
-                            name: BusName::from(name).into(),
-                            old_owner: Some(old_owner),
-                            new_owner: Some(unique_name),
-                        }),
+                        Some(NameOwnerChanged::well_known(
+                            name.into(),
+                            Some(old_owner),
+                            Some(unique_name),
+                        )),
                     )
                 } else if !flags.contains(RequestNameFlags::DO_NOT_QUEUE) {
                     let allow_replacement = flags.contains(RequestNameFlags::ALLOW_REPLACEMENT);
@@ -202,11 +202,7 @@ impl NameRegistry {
 
                 (
                     RequestNameReply::PrimaryOwner,
-                    Some(NameOwnerChanged {
-                        name: BusName::from(name.into_inner()).into(),
-                        old_owner: None,
-                        new_owner: Some(unique_name),
-                    }),
+                    Some(NameOwnerChanged::well_known(name, None, Some(unique_name))),
                 )
             }
         }
@@ -244,11 +240,11 @@ impl NameRegistry {
 
                     (
                         ReleaseNameReply::Released,
-                        Some(NameOwnerChanged {
-                            name: BusName::from(name).into(),
-                            old_owner: Some(owner),
-                            new_owner: new_owner_name,
-                        }),
+                        Some(NameOwnerChanged::well_known(
+                            name.into(),
+                            Some(owner),
+                            new_owner_name,
+                        )),
                     )
                 } else {
                     for (i, waiting) in entry.waiting_list.iter().enumerate() {
@@ -398,11 +394,64 @@ impl NameRegistry {
     }
 }
 
+/// A change of a name's owner, which the bus signals. See
+/// [`crate::peers::Peers::notify_name_changes`].
 #[derive(Debug)]
 pub struct NameOwnerChanged {
-    pub name: OwnedBusName,
-    pub old_owner: Option<OwnedUniqueName>,
-    pub new_owner: Option<OwnedUniqueName>,
+    name: OwnedBusName,
+    old_owner: Option<OwnedUniqueName>,
+    new_owner: Option<OwnedUniqueName>,
+}
+
+impl NameOwnerChanged {
+    /// A change of a well-known name's owner. `old_owner` is `None` if the name had no owner
+    /// before, and `new_owner` is `None` if it has none after.
+    pub fn well_known(
+        name: OwnedWellKnownName,
+        old_owner: Option<OwnedUniqueName>,
+        new_owner: Option<OwnedUniqueName>,
+    ) -> Self {
+        Self {
+            name: BusName::from(name.into_inner()).into(),
+            old_owner,
+            new_owner,
+        }
+    }
+
+    /// The change that a client makes when it appears on the bus: its unique name gets its owner,
+    /// the client itself.
+    pub fn appeared(unique_name: OwnedUniqueName) -> Self {
+        Self {
+            name: BusName::from(unique_name.clone()).into(),
+            old_owner: None,
+            new_owner: Some(unique_name),
+        }
+    }
+
+    /// The change that a client makes when it leaves the bus or becomes a monitor: its unique name
+    /// loses its owner.
+    pub fn vanished(unique_name: OwnedUniqueName) -> Self {
+        Self {
+            name: BusName::from(unique_name.clone()).into(),
+            old_owner: Some(unique_name),
+            new_owner: None,
+        }
+    }
+
+    /// The name whose owner changed.
+    pub fn name(&self) -> &OwnedBusName {
+        &self.name
+    }
+
+    /// The owner of the name before the change, if it had one.
+    pub fn old_owner(&self) -> Option<&OwnedUniqueName> {
+        self.old_owner.as_ref()
+    }
+
+    /// The owner of the name after the change, if it has one.
+    pub fn new_owner(&self) -> Option<&OwnedUniqueName> {
+        self.new_owner.as_ref()
+    }
 }
 
 #[cfg(test)]

@@ -5,10 +5,7 @@ use futures_util::{
     future::{select, Either},
     stream::StreamExt,
 };
-use zbus::{
-    names::{BusName, OwnedUniqueName},
-    MessageStream,
-};
+use zbus::{names::OwnedUniqueName, MessageStream};
 use zruntime::EventListener;
 
 use super::{forward::no_reply, outbox::Outbox, Peers};
@@ -258,12 +255,8 @@ impl Peers {
         for changed in names_changes {
             self.notify_name_changes(changed).await?;
         }
-        self.notify_name_changes(NameOwnerChanged {
-            name: BusName::from(unique_name.clone()).into(),
-            old_owner: Some(unique_name.clone()),
-            new_owner: None,
-        })
-        .await?;
+        self.notify_name_changes(NameOwnerChanged::vanished(unique_name.clone()))
+            .await?;
         // Nor will the calls that wait on the peer get its replies, so they get an error from the
         // bus instead, as with dbus-broker, rather than wait for as long as their callers do.
         for (caller, serial) in waiting {

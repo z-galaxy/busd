@@ -7,8 +7,8 @@ use zbus::{
 
 use super::{ensure_privileged, msg_sender};
 use crate::{
-    fdo::DBus,
     match_rules::MatchRules,
+    name_registry::NameOwnerChanged,
     peers::{Peers, WeakPeers},
 };
 
@@ -58,7 +58,6 @@ impl Monitoring {
         // We want to emit the name change signals **after** the `BecomeMonitor` method returns.
         // Otherwise, some clients (e.g `busctl monitor`) can get confused.
         let conn = ctxt.connection().clone();
-        let ctxt = ctxt.to_owned();
         let notify = async move {
             let names_changes = peers
                 .routing_mut()
@@ -72,20 +71,11 @@ impl Monitoring {
                 }
             }
 
-            if let Err(e) = DBus::name_owner_changed(
-                &ctxt,
-                owner.clone().into(),
-                Some(owner.clone()).into(),
-                None.into(),
-            )
-            .await
+            if let Err(e) = peers
+                .notify_name_changes(NameOwnerChanged::vanished(owner.into()))
+                .await
             {
                 warn!("Failed to notify peers of name change: {}", e);
-            }
-
-            let ctxt = ctxt.set_destination(owner.clone().into());
-            if let Err(e) = DBus::name_lost(&ctxt, owner.into()).await {
-                warn!("Failed to send `NameLost` signal: {}", e);
             }
         };
 

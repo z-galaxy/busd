@@ -13,7 +13,10 @@ use zbus::{
 };
 
 use super::msg_sender;
-use crate::peers::{Peers, WeakPeers};
+use crate::{
+    name_registry::NameOwnerChanged,
+    peers::{Peers, WeakPeers},
+};
 
 #[derive(Debug)]
 pub struct DBus {
@@ -79,37 +82,26 @@ impl DBus {
     ) -> Result<ResponseDispatchNotifier<OwnedUniqueName>> {
         let name = msg_sender(&hdr);
         let peers = self.peers()?;
-        let mut routing = peers.routing_mut().await;
-        let peer = routing
-            .peers
-            .get_mut(name.as_str())
-            .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
-        peer.hello()?;
+        let unique_name = {
+            let mut routing = peers.routing_mut().await;
+            let peer = routing
+                .peers
+                .get_mut(name.as_str())
+                .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
+            peer.hello()?;
+
+            peer.client().unique_name().clone()
+        };
 
         // Notify name change once the response is sent because we want:
         // 1. `Hello` to return ASAP and hence client connection to be esablished.
         // 2. The `Hello` response to arrive before the `NameAcquired` signal.
         // The signals are part of the call, so a hand-over of the bus waits for them.
-        let unique_name = peer.client().unique_name().clone();
         let response = unique_name.clone();
-        let ctxt = emitter.to_owned();
         let notify = async move {
-            let owner = UniqueName::from(unique_name);
-
-            if let Err(e) = Self::name_owner_changed(
-                &ctxt,
-                owner.clone().into(),
-                None.into(),
-                Some(owner.clone()).into(),
-            )
-            .await
-            {
+            let changed = NameOwnerChanged::appeared(unique_name);
+            if let Err(e) = peers.notify_name_changes(changed).await {
                 warn!("Failed to notify peers of name change: {}", e);
-            }
-
-            let ctxt = ctxt.set_destination(owner.clone().into());
-            if let Err(e) = Self::name_acquired(&ctxt, owner.into()).await {
-                warn!("Failed to send `NameAcquired` signal: {}", e);
             }
         };
 

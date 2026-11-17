@@ -9,7 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use zbus::{
     connection,
     names::{BusName, UniqueName},
-    Connection, Message, MessageStream, Optional, OwnedGuid,
+    object_server::SignalEmitter,
+    Connection, Message, MessageStream, OwnedGuid,
 };
 #[cfg(target_os = "linux")]
 use zruntime::Event;
@@ -298,40 +299,36 @@ impl Peers {
         true
     }
 
-    /// Signal a change of the owner of a name.
+    /// Signal a change of a name's owner: `NameOwnerChanged` to all, then `NameLost` to the old
+    /// owner, if any, and `NameAcquired` to the new owner, if any.
     ///
-    /// The signals go out on the connection of the bus, like its replies and its other signals,
-    /// so that they all reach each recipient in the order that the bus sends them.
-    pub async fn notify_name_changes(&self, name_owner_changed: NameOwnerChanged) -> Result<()> {
+    /// The signals go out on the bus's connection, like its replies and its other signals, so that
+    /// they all reach each recipient in the order in which the bus sends them. It stops at the
+    /// first signal that fails to go out.
+    pub async fn notify_name_changes(&self, changed: NameOwnerChanged) -> Result<()> {
         let bus = self.bus_conn().clone().context("The bus isn't up")?;
-        let name = BusName::from(name_owner_changed.name);
-        let old_owner = name_owner_changed.old_owner.map(UniqueName::from);
-        let new_owner = name_owner_changed.new_owner.map(UniqueName::from);
+        let emitter = SignalEmitter::new(&bus, fdo::DBus::PATH)?;
+        let name = BusName::from(changed.name());
+        let old_owner = changed.old_owner().map(UniqueName::from);
+        let new_owner = changed.new_owner().map(UniqueName::from);
 
         // First broadcast the name change signal.
-        let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameOwnerChanged")
-            .sender(fdo::BUS_NAME)
-            .build(&(
-                &name,
-                Optional::from(old_owner.clone()),
-                Optional::from(new_owner.clone()),
-            ))?;
-        bus.send(&msg).await?;
+        fdo::DBus::name_owner_changed(
+            &emitter,
+            name.clone(),
+            old_owner.clone().into(),
+            new_owner.clone().into(),
+        )
+        .await?;
 
         // Now unicast the appropriate signal to the old and new owners.
         if let Some(old_owner) = old_owner {
-            let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameLost")
-                .sender(fdo::BUS_NAME)
-                .destination(old_owner)
-                .build(&name)?;
-            bus.send(&msg).await?;
+            let emitter = emitter.clone().set_destination(old_owner.into());
+            fdo::DBus::name_lost(&emitter, name.clone()).await?;
         }
         if let Some(new_owner) = new_owner {
-            let msg = Message::signal(fdo::DBus::PATH, fdo::DBus::INTERFACE, "NameAcquired")
-                .sender(fdo::BUS_NAME)
-                .destination(new_owner)
-                .build(&name)?;
-            bus.send(&msg).await?;
+            let emitter = emitter.set_destination(new_owner.into());
+            fdo::DBus::name_acquired(&emitter, name).await?;
         }
 
         Ok(())
