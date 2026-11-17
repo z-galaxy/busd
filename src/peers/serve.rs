@@ -240,8 +240,7 @@ impl Peers {
             .routing_mut()
             .await
             .name_registry
-            .release_all(unique_name.inner().clone())
-            .await;
+            .release_all(unique_name.inner().clone());
 
         self.finish_clean_up(unique_name, names_changes, waiting)
             .await

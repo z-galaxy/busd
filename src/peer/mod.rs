@@ -224,7 +224,7 @@ impl Peer {
     }
 
     /// This can only be called once.
-    pub async fn hello(&mut self) -> zbus::fdo::Result<()> {
+    pub fn hello(&mut self) -> zbus::fdo::Result<()> {
         if self.greeted {
             return Err(zbus::fdo::Error::Failed(
                 "Can only call `Hello` method once".to_string(),

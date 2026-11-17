@@ -84,7 +84,7 @@ impl DBus {
             .peers
             .get_mut(name.as_str())
             .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
-        peer.hello().await?;
+        peer.hello()?;
 
         // Notify name change once the response is sent because we want:
         // 1. `Hello` to return ASAP and hence client connection to be esablished.
@@ -150,7 +150,6 @@ impl DBus {
             routing
                 .name_registry
                 .request_name(name, unique_name.clone(), flags)
-                .await
         };
         // The signals go out once the lock of the routing is let go of.
         if let Some(changed) = name_owner_changed {
@@ -176,8 +175,7 @@ impl DBus {
             .routing_mut()
             .await
             .name_registry
-            .release_name(name, unique_name.clone())
-            .await;
+            .release_name(name, unique_name.clone());
         if let Some(changed) = name_owner_changed {
             peers
                 .notify_name_changes(changed)

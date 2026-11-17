@@ -107,7 +107,7 @@ pub struct Owned {
 }
 
 impl NameRegistry {
-    pub async fn request_name(
+    pub fn request_name(
         &mut self,
         name: WellKnownName<'_>,
         unique_name: UniqueName<'_>,
@@ -211,7 +211,7 @@ impl NameRegistry {
         }
     }
 
-    pub async fn release_name(
+    pub fn release_name(
         &mut self,
         name: WellKnownName<'_>,
         owner: UniqueName<'_>,
@@ -266,7 +266,7 @@ impl NameRegistry {
         }
     }
 
-    pub async fn release_all(&mut self, owner: UniqueName<'_>) -> Vec<NameOwnerChanged> {
+    pub fn release_all(&mut self, owner: UniqueName<'_>) -> Vec<NameOwnerChanged> {
         // Find all names registered and queued by the given owner.
         let names: Vec<_> = self
             .names
@@ -287,7 +287,7 @@ impl NameRegistry {
         // Now release our claim or waiting list tickets from all these names.
         let mut all_changed = vec![];
         for name in names {
-            let (_, changed) = self.release_name(name.inner().clone(), owner.clone()).await;
+            let (_, changed) = self.release_name(name.inner().clone(), owner.clone());
             if let Some(changed) = changed {
                 all_changed.push(changed);
             }

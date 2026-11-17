@@ -375,8 +375,7 @@ impl Peers {
             for (unique_name, _, names_changes) in &mut gone {
                 *names_changes = routing
                     .name_registry
-                    .release_all(unique_name.inner().clone())
-                    .await;
+                    .release_all(unique_name.inner().clone());
             }
             // The calls that wait on the peers, of the callers that are back too, the bus itself
             // among them: the bus would forget the calls of the others as it cleans up after them.
