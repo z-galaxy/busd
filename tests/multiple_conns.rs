@@ -7,7 +7,7 @@ use zbus::connection;
 #[test]
 #[instrument]
 #[timeout(30000)]
-fn multi_conenct() {
+fn multi_connect() {
     init_tracing();
 
     zruntime::block_on(with_bus(|address| async move {
