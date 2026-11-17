@@ -1,7 +1,12 @@
 //! The hand-over of a bus to its next instance, which serves its clients on from where it stopped,
 //! on the same connections.
 
-use std::{collections::HashMap, os::fd::OwnedFd, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -162,13 +167,31 @@ pub struct Handover {
     pub(crate) state: State,
     /// The socket that the bus listened on, unless it was given one, as by systemd's socket
     /// activation, which then gives the next instance the socket too.
-    pub listener: Option<OwnedFd>,
+    pub(crate) listener: Option<OwnedFd>,
     /// The clients, peers and monitors.
-    pub clients: Vec<ClientHandover>,
+    pub(crate) clients: Vec<ClientHandover>,
     /// The connection on which the previous instance served the D-Bus API. `None` in a hand-over
     /// of a version that came without it: the next instance then serves the API on a new
     /// connection.
     pub(crate) own: Option<OwnHandover>,
+}
+
+impl Handover {
+    /// The socket that the bus listened on, or `None` if the bus was given its socket, for example
+    /// by systemd's socket activation.
+    pub fn listener(&self) -> Option<BorrowedFd<'_>> {
+        self.listener.as_ref().map(OwnedFd::as_fd)
+    }
+
+    /// The clients, peers and monitors.
+    pub fn clients(&self) -> &[ClientHandover] {
+        &self.clients
+    }
+
+    /// The clients, peers and monitors, as a mutable reference.
+    pub fn clients_mut(&mut self) -> &mut Vec<ClientHandover> {
+        &mut self.clients
+    }
 }
 
 /// How long a client in the middle of its handshake has to finish that as the bus hands over,

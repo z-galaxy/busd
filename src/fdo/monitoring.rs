@@ -58,7 +58,7 @@ impl Monitoring {
             let names_changes = peers
                 .routing_mut()
                 .await
-                .name_registry
+                .names_mut()
                 .release_all(owner.clone());
             // Notify each new owner, as when the previous owner disconnects.
             for changed in names_changes {

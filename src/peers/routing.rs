@@ -27,9 +27,9 @@ pub struct Routing {
     /// hash of the name and one comparison with the name of the peer, rather than kept in a tree,
     /// which would compare the name with the keys of each node on the way, every comparison
     /// through the `:busd.` that the unique names of all clients start with.
-    pub peers: HashMap<OwnedUniqueName, Peer, foldhash::fast::RandomState>,
+    pub(super) peers: HashMap<OwnedUniqueName, Peer, foldhash::fast::RandomState>,
     /// The owners of the well-known names, and those that queue for them.
-    pub name_registry: NameRegistry,
+    pub(super) name_registry: NameRegistry,
     /// The monitors, by their unique names.
     pub(super) monitors: BTreeMap<OwnedUniqueName, Monitor>,
     /// Whether the bus is handing over to its next instance, so that it pauses the clients that
@@ -48,16 +48,44 @@ pub struct Routing {
 }
 
 impl Routing {
+    /// The peer `name`, or the error with which the bus answers a call about a peer that it
+    /// doesn't have: `NameHasNoOwner`, "No such peer: {name}".
+    pub fn peer(&self, name: &str) -> zbus::fdo::Result<&Peer> {
+        self.peers.get(name).ok_or_else(|| no_such_peer(name))
+    }
+
+    /// The peer `name`, as a mutable reference, or the error that [`Routing::peer`] returns.
+    pub fn peer_mut(&mut self, name: &str) -> zbus::fdo::Result<&mut Peer> {
+        self.peers.get_mut(name).ok_or_else(|| no_such_peer(name))
+    }
+
+    /// Whether the bus has the peer `name`.
+    pub fn has_peer(&self, name: &str) -> bool {
+        self.peers.contains_key(name)
+    }
+
+    /// The unique names of the peers, the bus itself among them.
+    pub fn peer_names(&self) -> impl Iterator<Item = &OwnedUniqueName> {
+        self.peers.keys()
+    }
+
+    /// The owners of the well-known names, and those that queue for them.
+    pub fn names(&self) -> &NameRegistry {
+        &self.name_registry
+    }
+
+    /// The owners of the well-known names, and those that queue for them, as a mutable reference.
+    pub fn names_mut(&mut self) -> &mut NameRegistry {
+        &mut self.name_registry
+    }
+
     /// Add `rule` to the match rules of the peer `name`.
     pub fn add_match_rule(
         &mut self,
         name: &UniqueName<'_>,
         rule: OwnedMatchRule,
     ) -> zbus::fdo::Result<()> {
-        let peer = self
-            .peers
-            .get_mut(name.as_str())
-            .ok_or_else(|| zbus::fdo::Error::NameHasNoOwner(format!("No such peer: {name}")))?;
+        let peer = self.peer_mut(name.as_str())?;
         if peer.add_match_rule(rule) {
             let rules = peer.client().match_rules().len();
             self.match_rule_counts.add(1, rules);
@@ -72,10 +100,7 @@ impl Routing {
         name: &UniqueName<'_>,
         rule: OwnedMatchRule,
     ) -> zbus::fdo::Result<()> {
-        let peer = self
-            .peers
-            .get_mut(name.as_str())
-            .ok_or_else(|| zbus::fdo::Error::NameHasNoOwner(format!("No such peer: {name}")))?;
+        let peer = self.peer_mut(name.as_str())?;
         peer.remove_match_rule(rule)?;
         self.match_rule_counts.total = self.match_rule_counts.total.saturating_sub(1);
 
@@ -129,4 +154,10 @@ impl MatchRuleCounts {
         self.peak_total = self.peak_total.max(self.total);
         self.peak_per_peer = self.peak_per_peer.max(rules);
     }
+}
+
+/// The error with which the bus answers a call about the peer `name`, if the bus doesn't have that
+/// peer.
+fn no_such_peer(name: &str) -> zbus::fdo::Error {
+    zbus::fdo::Error::NameHasNoOwner(format!("No such peer: {name}"))
 }

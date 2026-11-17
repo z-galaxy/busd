@@ -96,7 +96,7 @@
 //! - The deprecated `at_console` context is not supported; dbus-broker still supports it.
 //! - The names of users and groups are resolved from `/etc/passwd` and `/etc/group` alone.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use zbus::{message::Type, names::OwnedWellKnownName};
 
@@ -342,14 +342,14 @@ impl Default for PeerPolicy {
 /// What the policy looks at in a message.
 #[derive(Clone, Copy, Debug)]
 pub struct Facts<'m> {
-    pub msg_type: Type,
-    pub path: Option<&'m str>,
-    pub interface: Option<&'m str>,
-    pub member: Option<&'m str>,
+    msg_type: Type,
+    path: Option<&'m str>,
+    interface: Option<&'m str>,
+    member: Option<&'m str>,
     /// Whether the message is a signal without a destination.
-    pub broadcast: bool,
+    broadcast: bool,
     /// How many file descriptors the message carries.
-    pub fds: usize,
+    fds: usize,
 }
 
 impl<'m> Facts<'m> {
@@ -365,6 +365,26 @@ impl<'m> Facts<'m> {
             broadcast: msg_type == Type::Signal && header.destination().is_none(),
             fds: msg.data().fds().len(),
         }
+    }
+
+    /// Whether the message is a signal without a destination.
+    pub fn is_broadcast(&self) -> bool {
+        self.broadcast
+    }
+}
+
+/// The message as a log line shows it: its type, path, interface and member, with `none` for each
+/// one that it lacks.
+impl fmt::Display for Facts<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [path, interface, member] =
+            [self.path, self.interface, self.member].map(|value| value.unwrap_or("none"));
+
+        write!(
+            f,
+            "the {:?} (path {path}, interface {interface}, member {member})",
+            self.msg_type
+        )
     }
 }
 

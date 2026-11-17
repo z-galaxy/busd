@@ -81,10 +81,7 @@ impl DBus {
         let peers = self.peers()?;
         let unique_name = {
             let mut routing = peers.routing_mut().await;
-            let peer = routing
-                .peers
-                .get_mut(name.as_str())
-                .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {name}")))?;
+            let peer = routing.peer_mut(name.as_str())?;
             peer.hello()?;
 
             peer.client().unique_name().clone()
@@ -121,10 +118,7 @@ impl DBus {
         let peers = self.peers()?;
         let (reply, name_owner_changed) = {
             let mut routing = peers.routing_mut().await;
-            let peer = routing
-                .peers
-                .get(unique_name.as_str())
-                .ok_or_else(|| Error::NameHasNoOwner(format!("No such peer: {unique_name}")))?;
+            let peer = routing.peer(unique_name.as_str())?;
             if !peer.policy().may_own(&name) {
                 warn!(
                     "Refusing `{name}` to `{unique_name}`, as the policy does not let it own the \
@@ -137,7 +131,7 @@ impl DBus {
             }
 
             routing
-                .name_registry
+                .names_mut()
                 .request_name(name, unique_name.clone(), flags)
         };
         // The signals go out once the lock of the routing is let go of.
@@ -163,7 +157,7 @@ impl DBus {
         let (reply, name_owner_changed) = peers
             .routing_mut()
             .await
-            .name_registry
+            .names_mut()
             .release_name(name, unique_name.clone());
         if let Some(changed) = name_owner_changed {
             peers
@@ -180,13 +174,11 @@ impl DBus {
         let peers = self.peers()?;
         let routing = peers.routing().await;
         match name {
-            BusName::WellKnown(name) => {
-                routing.name_registry.lookup(&name).cloned().ok_or_else(|| {
-                    Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
-                })
-            }
+            BusName::WellKnown(name) => routing.names().lookup(&name).cloned().ok_or_else(|| {
+                Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
+            }),
             BusName::Unique(name) => {
-                if routing.peers.contains_key(&*name) {
+                if routing.has_peer(&name) {
                     Ok(name.into())
                 } else {
                     Err(Error::NameHasNoOwner(
@@ -241,10 +233,9 @@ impl DBus {
             .peers()?
             .routing()
             .await
-            .peers
-            .get(&owner)
+            .peer(&owner)
             .map(|peer| peer.client().conn().clone())
-            .ok_or_else(|| Error::Failed(format!("Peer `{bus_name}` not found")))?;
+            .map_err(|_| Error::Failed(format!("Peer `{bus_name}` not found")))?;
 
         conn.peer_creds().await.cloned().map_err(|e| {
             Error::Failed(format!(
@@ -309,15 +300,14 @@ impl DBus {
         let peers = self.peers()?;
         let routing = peers.routing().await;
         let mut names: Vec<_> = routing
-            .peers
-            .keys()
+            .peer_names()
             .cloned()
             .map(|n| BusName::Unique(n.into()).into())
             .collect();
 
         names.extend(
             routing
-                .name_registry
+                .names()
                 .all_names()
                 .keys()
                 .map(|n| BusName::WellKnown(n.into()).into()),
@@ -331,7 +321,7 @@ impl DBus {
         self.peers()?
             .routing()
             .await
-            .name_registry
+            .names()
             .waiting_list(name)
             .ok_or_else(|| {
                 Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())

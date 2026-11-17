@@ -284,28 +284,13 @@ where
         } else {
             return None;
         };
-    let Facts {
-        msg_type,
-        path,
-        interface,
-        member,
-        broadcast,
-        ..
-    } = facts;
     let (denied, other) = (denied.client().unique_name(), other.client().unique_name());
-    let [path, interface, member] = [path, interface, member].map(|value| value.unwrap_or("none"));
     // A broadcast still goes to those that the policy lets have it, which is nothing for an
     // administrator to look at.
-    if broadcast {
-        trace!(
-            "The policy denies `{denied}` {action} the {msg_type:?} (path {path}, interface \
-             {interface}, member {member}) {preposition} `{other}`"
-        );
+    if facts.is_broadcast() {
+        trace!("The policy denies `{denied}` {action} {facts} {preposition} `{other}`");
     } else {
-        warn!(
-            "The policy denies `{denied}` {action} the {msg_type:?} (path {path}, interface \
-             {interface}, member {member}) {preposition} `{other}`"
-        );
+        warn!("The policy denies `{denied}` {action} {facts} {preposition} `{other}`");
     }
 
     Some(rejection)
