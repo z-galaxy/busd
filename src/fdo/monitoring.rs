@@ -1,5 +1,3 @@
-use std::sync::{Arc, Weak};
-
 use crate::{debug, warn};
 use zbus::{
     fdo::{Error, Result},
@@ -7,21 +5,25 @@ use zbus::{
     object_server::{ResponseDispatchNotifier, SignalEmitter},
 };
 
-use super::{ensure_privileged, msg_sender};
-use crate::{fdo::DBus, match_rules::MatchRules, peers::Peers};
+use super::{ensure_privileged, msg_sender, upgrade};
+use crate::{
+    match_rules::MatchRules,
+    name_registry::NameOwnerChanged,
+    peers::{Peers, WeakPeers},
+};
 
 #[derive(Debug)]
 pub struct Monitoring {
-    peers: Weak<Peers>,
+    peers: WeakPeers,
 }
 
 impl Monitoring {
     pub const PATH: &'static str = "/org/freedesktop/DBus";
     pub const INTERFACE: &'static str = "org.freedesktop.DBus.Monitoring";
 
-    pub fn new(peers: Arc<Peers>) -> Self {
+    pub fn new(peers: &Peers) -> Self {
         Self {
-            peers: Arc::downgrade(&peers),
+            peers: peers.downgrade(),
         }
     }
 }
@@ -42,11 +44,7 @@ impl Monitoring {
         #[zbus(signal_emitter)] ctxt: SignalEmitter<'_>,
     ) -> Result<ResponseDispatchNotifier<()>> {
         let owner = msg_sender(&hdr).to_owned();
-        let peers = self
-            .peers
-            .upgrade()
-            // Can it happen in any other situation than the bus shutting down?
-            .ok_or_else(|| Error::Failed("Bus shutting down.".to_string()))?;
+        let peers = upgrade(&self.peers)?;
         ensure_privileged(&peers, &hdr).await?;
         if !peers.make_monitor(&owner, match_rules).await {
             return Err(Error::NameHasNoOwner(format!("No such peer: {owner}")));
@@ -56,14 +54,12 @@ impl Monitoring {
         // We want to emit the name change signals **after** the `BecomeMonitor` method returns.
         // Otherwise, some clients (e.g `busctl monitor`) can get confused.
         let conn = ctxt.connection().clone();
-        let ctxt = ctxt.to_owned();
         let notify = async move {
             let names_changes = peers
                 .routing_mut()
                 .await
-                .name_registry
-                .release_all(owner.clone())
-                .await;
+                .names_mut()
+                .release_all(owner.clone());
             // Notify each new owner, as when the previous owner disconnects.
             for changed in names_changes {
                 if let Err(e) = peers.notify_name_changes(changed).await {
@@ -71,20 +67,11 @@ impl Monitoring {
                 }
             }
 
-            if let Err(e) = DBus::name_owner_changed(
-                &ctxt,
-                owner.clone().into(),
-                Some(owner.clone()).into(),
-                None.into(),
-            )
-            .await
+            if let Err(e) = peers
+                .notify_name_changes(NameOwnerChanged::vanished(owner.into()))
+                .await
             {
                 warn!("Failed to notify peers of name change: {}", e);
-            }
-
-            let ctxt = ctxt.set_destination(owner.clone().into());
-            if let Err(e) = DBus::name_lost(&ctxt, owner.into()).await {
-                warn!("Failed to send `NameLost` signal: {}", e);
             }
         };
 

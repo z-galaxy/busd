@@ -1,23 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    env::temp_dir,
-    future::Future,
-    pin::pin,
-    sync::Once,
     time::Duration,
 };
 
 use anyhow::{ensure, Context};
-use busd::bus::Bus;
-use futures_util::{
-    future::{select, try_join, Either},
-    stream::StreamExt,
-};
+use busd::testing::{connect, init_tracing, with_bus};
+use futures_util::{future::try_join, stream::StreamExt};
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use tracing::instrument;
 use zbus::{
     connection,
@@ -26,7 +15,7 @@ use zbus::{
     proxy::CacheProperties,
     Connection, Message, MessageStream,
 };
-use zruntime::{Event, SharedRuntime};
+use zruntime::SharedRuntime;
 
 #[test]
 #[instrument]
@@ -34,12 +23,7 @@ use zruntime::{Event, SharedRuntime};
 fn name_ownership_changes() {
     init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        with_bus(&address, name_ownership_changes_client).await;
-    });
+    zruntime::block_on(with_bus(name_ownership_changes_client));
 }
 
 /// A client can neither ask for nor release the name of the bus itself: the bus refuses both with
@@ -50,12 +34,7 @@ fn name_ownership_changes() {
 fn reserved_name() {
     init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        with_bus(&address, reserved_name_client).await;
-    });
+    zruntime::block_on(with_bus(reserved_name_client));
 }
 
 /// Every method of the bus, among many other calls to the bus that a client sends at once, gets its
@@ -69,12 +48,7 @@ fn reserved_name() {
 fn every_call_to_the_bus_among_calls() {
     init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        with_bus(&address, every_call_to_the_bus_among_calls_client).await;
-    });
+    zruntime::block_on(with_bus(every_call_to_the_bus_among_calls_client));
 }
 
 /// The `Interfaces` property of the bus lists the `org.freedesktop.DBus.Monitoring` and
@@ -85,42 +59,7 @@ fn every_call_to_the_bus_among_calls() {
 fn properties() {
     init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        with_bus(&address, properties_client).await;
-    });
-}
-
-/// Run `test` against a bus at `address`.
-async fn with_bus<F, T>(address: &str, test: F)
-where
-    F: FnOnce(String) -> T,
-    T: Future<Output = anyhow::Result<()>>,
-{
-    let mut bus = Bus::for_address(Some(address)).await.unwrap();
-    let stop = Event::new();
-    let stopped = stop.listen();
-
-    let handle = zruntime::spawn(async move {
-        {
-            let running = pin!(bus.run());
-            match select(stopped, running).await {
-                Either::Left(_) => (),
-                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-            }
-        }
-
-        bus
-    });
-
-    let ret = test(address.to_owned()).await;
-    stop.notify(usize::MAX);
-    let bus = handle.await.unwrap();
-    bus.cleanup().await.unwrap();
-    ret.unwrap();
+    zruntime::block_on(with_bus(properties_client));
 }
 
 #[instrument]
@@ -548,10 +487,6 @@ async fn burst(conn: &Connection, calls: &[Message]) -> anyhow::Result<Vec<Messa
     Ok(replies)
 }
 
-async fn connect(address: &str) -> zbus::Result<Connection> {
-    connection::Builder::address(address).build().await
-}
-
 /// A call to the bus, of `method` with `body`.
 fn call_bus<B>(method: &str, body: &B) -> zbus::Result<Message>
 where
@@ -569,11 +504,6 @@ where
         .destination(BUS_NAME)
         .interface(interface)
         .build(body)
-}
-
-fn init_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(busd::tracing_subscriber::init);
 }
 
 /// The name of the bus, and of its interface.

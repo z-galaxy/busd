@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    os::fd::{AsFd, OwnedFd},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     sync::Arc,
     time::Duration,
 };
@@ -11,15 +11,19 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use zbus::{
-    address::Transport,
-    connection,
-    names::{OwnedUniqueName, OwnedWellKnownName},
     wire::{serialized, to_bytes, LE},
-    Address, OwnedGuid, Type,
+    OwnedGuid, Type,
 };
 
-use super::Bus;
-use crate::{info, match_rules::MatchRules, peers::Peers, policy::Policy};
+use super::{Bus, Listener};
+use crate::{
+    info,
+    peers::{
+        handover::{ClientHandover, MonitorState, NameState, OwnHandover, PeerState, Snapshot},
+        Peers,
+    },
+    policy::Policy,
+};
 
 impl Bus {
     /// Stop the bus where its next instance can take over from it, and hand it over.
@@ -56,12 +60,12 @@ impl Bus {
     pub async fn hand_over(self) -> Result<Handover> {
         // The socket that the bus listens on is duplicated ahead of those of the clients, which a
         // lack of file descriptors only fails one at a time.
-        let listener = if self.bound {
-            Some(self.listener.as_fd().try_clone_to_owned()?)
+        let listener = if self.listener.is_bound() {
+            Some(self.listener.try_clone_to_owned()?)
         } else {
             None
         };
-        let peers = self.inner.peers.clone();
+        let peers = self.peers.clone();
         peers.pause(STOP_TIMEOUT).await?;
         peers.settle().await;
         // The bus's own connection goes first: if that fails, the bus still has its clients, and
@@ -69,8 +73,8 @@ impl Bus {
         let own = peers.hand_over_us().await?;
         let (snapshot, clients) = peers.snapshot().await?;
         let state = State {
-            guid: self.inner.guid.clone(),
-            last_id: self.inner.next_id as u64,
+            guid: self.guid.clone(),
+            last_id: self.next_id as u64,
             peers: snapshot.peers,
             monitors: snapshot.monitors,
             names: snapshot.names,
@@ -123,9 +127,9 @@ impl Bus {
             (None, Some(listener)) => (listener, true),
             (None, None) => bail!("Nothing to listen on: no socket was handed over or given."),
         };
-        let (listener, unix) = Self::listener(listener)?;
-        let address = Address::new(Transport::Unix(unix)).set_guid(state.guid.clone())?;
+        let listener = Listener::from_fd(listener, bound)?;
         let guid = state.guid;
+        let address = listener.address(&guid)?;
         let last_id = usize::try_from(state.last_id)?;
         let peers = Peers::new();
         // Before the bus has the clients of the hand-over, which it serves as soon as it has them.
@@ -142,8 +146,8 @@ impl Bus {
             names: state.names,
         };
         let service_conn = peers.restore(snapshot, clients, send_timeout, us).await?;
-        let mut bus = Self::with_peers(listener, address, guid, bound, peers, service_conn);
-        bus.inner.next_id = last_id;
+        let mut bus = Self::with_peers(listener, address, guid, peers, service_conn);
+        bus.next_id = last_id;
         bus.set_send_timeout(send_timeout);
 
         Ok(bus)
@@ -163,40 +167,31 @@ pub struct Handover {
     pub(crate) state: State,
     /// The socket that the bus listened on, unless it was given one, as by systemd's socket
     /// activation, which then gives the next instance the socket too.
-    pub listener: Option<OwnedFd>,
+    pub(crate) listener: Option<OwnedFd>,
     /// The clients, peers and monitors.
-    pub clients: Vec<ClientHandover>,
+    pub(crate) clients: Vec<ClientHandover>,
     /// The connection on which the previous instance served the D-Bus API. `None` in a hand-over
     /// of a version that came without it: the next instance then serves the API on a new
     /// connection.
     pub(crate) own: Option<OwnHandover>,
 }
 
-/// The hand-over of the connection on which a bus serves the D-Bus API: both of its ends.
-///
-/// The bus serves the API as a peer of its own, over a channel in its process. It answers the
-/// calls to it on one end. Its peer has the other end, and the bus forwards the messages of that
-/// peer as it does those of any client. Whatever is on its way between the two ends as the bus
-/// hands over goes with them: the calls to the bus that it didn't take, and the replies and
-/// signals that it sent and didn't pass on to its clients.
-#[derive(Debug)]
-pub struct OwnHandover {
-    /// The end on which the bus answers the calls to it.
-    pub(crate) service: connection::Handover,
-    /// The other end, which the peer of the bus has.
-    pub(crate) peer: connection::Handover,
-}
+impl Handover {
+    /// The socket that the bus listened on, or `None` if the bus was given its socket, for example
+    /// by systemd's socket activation.
+    pub fn listener(&self) -> Option<BorrowedFd<'_>> {
+        self.listener.as_ref().map(OwnedFd::as_fd)
+    }
 
-/// What a bus hands over of a client, besides what the state of the bus holds of it: its
-/// connection.
-#[derive(Debug)]
-pub struct ClientHandover {
-    /// The number of the client, which its unique name carries.
-    pub id: usize,
-    /// The hand-over of the connection of the client: its socket, with what zbus read of the
-    /// client and the bus didn't take, and the file descriptors that came with that, which the
-    /// next instance passes on.
-    pub connection: connection::Handover,
+    /// The clients, peers and monitors.
+    pub fn clients(&self) -> &[ClientHandover] {
+        &self.clients
+    }
+
+    /// The clients, peers and monitors, as a mutable reference.
+    pub fn clients_mut(&mut self) -> &mut Vec<ClientHandover> {
+        &mut self.clients
+    }
 }
 
 /// How long a client in the middle of its handshake has to finish that as the bus hands over,
@@ -207,14 +202,6 @@ pub struct ClientHandover {
 /// Nor does it wait for its clients to take what it sends them: what a client doesn't take goes on
 /// with the hand-over of its connection.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// The peers, monitors and names of a bus, as it hands them over.
-#[derive(Debug)]
-pub(crate) struct Snapshot {
-    pub(crate) peers: Vec<PeerState>,
-    pub(crate) monitors: Vec<MonitorState>,
-    pub(crate) names: Vec<NameState>,
-}
 
 /// The state of a bus, as it hands it over.
 #[derive(Debug, Deserialize, Serialize, Type)]
@@ -258,36 +245,6 @@ impl State {
     }
 }
 
-/// A peer, as the bus hands it over.
-#[derive(Debug, Deserialize, Serialize, Type)]
-pub(crate) struct PeerState {
-    /// The number of the peer, which its unique name carries.
-    pub(crate) id: u64,
-    /// Whether the peer called `Hello`.
-    pub(crate) greeted: bool,
-    pub(crate) match_rules: MatchRules,
-    /// The calls to the peer that wait for its reply: the number of the caller, its unique name,
-    /// and the serial of the call.
-    pub(crate) pending_calls: Vec<(u64, OwnedUniqueName, u32)>,
-}
-
-/// A monitor, as the bus hands it over.
-#[derive(Debug, Deserialize, Serialize, Type)]
-pub(crate) struct MonitorState {
-    /// The number of the peer that became the monitor.
-    pub(crate) id: u64,
-    pub(crate) match_rules: MatchRules,
-}
-
-/// A well-known name, as the bus hands it over: its owner first, then those that queue for it, in
-/// order, each with whether it lets another take the name over from it, and whether it doesn't
-/// queue for the name once that happens.
-#[derive(Debug, Deserialize, Serialize, Type)]
-pub(crate) struct NameState {
-    pub(crate) name: OwnedWellKnownName,
-    pub(crate) owners: Vec<(OwnedUniqueName, bool, bool)>,
-}
-
 /// The version of the state. A bus takes over from a bus of the same version, or of the version
 /// before it, and from no other.
 const VERSION: u32 = 2;
@@ -299,9 +256,13 @@ const VERSION_WITHOUT_OWN: u32 = 1;
 
 #[cfg(test)]
 mod tests {
-    use zbus::{names::OwnedUniqueName, OwnedMatchRule};
+    use zbus::{
+        names::{OwnedUniqueName, OwnedWellKnownName},
+        OwnedMatchRule,
+    };
 
     use super::*;
+    use crate::match_rules::MatchRules;
 
     #[test]
     fn state() {
@@ -339,6 +300,58 @@ mod tests {
         let error = State::decode(&other).unwrap_err();
         let expected = format!("version {version}");
         assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    /// A bus and the instance that takes over from it share only the bytes of the state, and the
+    /// two may run different versions of busd. A state of this version encodes to these bytes and
+    /// decodes from them, however the types that hold it change. Changing the encoding requires a
+    /// new version.
+    #[test]
+    fn encoding_of_the_state_is_pinned() {
+        let name = |id: u32| OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
+        // At most one rule per peer, because a peer's rules are in no particular order.
+        let rules = |rule: &str| {
+            let mut rules = MatchRules::default();
+            rules.add(OwnedMatchRule::try_from(rule).unwrap());
+
+            rules
+        };
+        let state = State {
+            guid: zbus::Guid::from_static_str("0123456789abcdef0123456789abcdef")
+                .unwrap()
+                .into(),
+            last_id: 3,
+            peers: vec![
+                PeerState {
+                    id: 1,
+                    greeted: true,
+                    match_rules: rules("type='signal',sender='org.zbus.Test'"),
+                    pending_calls: vec![(2, name(2), 7)],
+                },
+                PeerState {
+                    id: 2,
+                    greeted: false,
+                    match_rules: MatchRules::default(),
+                    pending_calls: Vec::new(),
+                },
+            ],
+            monitors: vec![MonitorState {
+                id: 3,
+                match_rules: rules("type='method_call'"),
+            }],
+            names: vec![NameState {
+                name: OwnedWellKnownName::try_from("org.zbus.Test").unwrap(),
+                owners: vec![(name(1), false, true), (name(2), true, false)],
+            }],
+        };
+
+        let encoded = state.encode().unwrap();
+        let hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, ENCODED);
+
+        let (decoded, with_own) = State::decode(&encoded).unwrap();
+        assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
+        assert!(with_own);
     }
 
     /// A bus takes over from a state of the version before this one. That version came without
@@ -387,4 +400,16 @@ mod tests {
             assert!(State::decode(&spoiled).is_err(), "{spoiled:?}");
         }
     }
+
+    /// The state of `encoding_of_the_state_is_pinned`, encoded by version 2, in hexadecimal.
+    const ENCODED: &str = concat!(
+        "02000000000000002000000030313233343536373839616263646566303132333435363738396162",
+        "63646566000000000300000000000000700000000000000001000000000000000100000029000000",
+        "24000000747970653d277369676e616c272c73656e6465723d276f72672e7a6275732e5465737427",
+        "00000000180000000200000000000000070000003a627573642e3200070000000200000000000000",
+        "00000000000000000000000000000000230000000000000003000000000000001700000012000000",
+        "747970653d276d6574686f645f63616c6c270000440000000d0000006f72672e7a6275732e546573",
+        "740000002c000000070000003a627573642e3100000000000100000000000000070000003a627573",
+        "642e32000100000000000000",
+    );
 }

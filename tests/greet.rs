@@ -1,13 +1,13 @@
-use std::{env::temp_dir, pin::pin, time::Duration};
+use std::time::Duration;
 
 use anyhow::anyhow;
-use busd::bus::Bus;
-use futures_util::{
-    future::{select, Either},
-    pin_mut,
-    stream::StreamExt,
+use busd::{
+    bus::Bus,
+    testing::{init_tracing, unix_address, Running},
 };
+use futures_util::{pin_mut, stream::StreamExt};
 use ntest::timeout;
+#[cfg(target_os = "linux")]
 use rand::{
     distr::{Alphanumeric, SampleString},
     rng,
@@ -22,20 +22,17 @@ use zbus::{
     proxy::CacheProperties,
     Address, AsyncDrop, Connection, MatchRule, MessageStream, ObjectPath,
 };
-use zruntime::{Event, SharedRuntime};
+use zruntime::SharedRuntime;
 
 #[test]
 #[instrument]
 #[timeout(30000)]
 fn greet() {
-    busd::tracing_subscriber::init();
+    init_tracing();
 
     zruntime::block_on(async {
         // Unix socket
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        greet_(&address).await;
+        greet_(&unix_address()).await;
 
         // Abstract Unix socket, which only Linux has.
         #[cfg(target_os = "linux")]
@@ -62,35 +59,19 @@ fn tcp_refused() {
 }
 
 async fn greet_(socket_addr: &str) {
-    let mut bus = Bus::for_address(Some(socket_addr)).await.unwrap();
+    let bus = Bus::for_address(Some(socket_addr)).await.unwrap();
     // The bus gives its clients the address that it was given, with its GUID added, and that's
     // where they connect.
     let address = bus.address().clone();
     let given = Address::try_from(socket_addr).unwrap();
     assert_eq!(address.transport(), given.transport());
-    let stop = Event::new();
-    let stopped = stop.listen();
-
-    let handle = zruntime::spawn(async move {
-        {
-            let running = pin!(bus.run());
-            match select(stopped, running).await {
-                Either::Left(_) => (),
-                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-            }
-        }
-
-        bus
-    });
+    let running = Running::new(bus);
 
     let ret = match greet_service(&address).await {
         Ok(service_conn) => greet_client(&address).await.map(|_| service_conn),
         Err(e) => Err(e),
     };
-    stop.notify(usize::MAX);
-    let bus = handle.await.unwrap();
-    bus.cleanup().await.unwrap();
+    running.finish().await;
     let _ = ret.unwrap();
 }
 

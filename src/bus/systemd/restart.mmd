@@ -14,5 +14,5 @@ sequenceDiagram
     Note over new: raises its soft limit of<br/>open FDs to the hard one
     new->>systemd: FDSTOREREMOVE (each name)
     Note over new: reads the memfd, and takes the connection<br/>FDs out of the queue sockets
-    Note over new: restores the connections
     new->>systemd: READY=1
+    Note over new: restores the connections

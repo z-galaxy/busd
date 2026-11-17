@@ -151,14 +151,13 @@ pub enum Refusal {
     QuotaExceeded,
 }
 
-/// The record of each call, by the number of the caller, as [`Peer::id`] has it, and the serial of
-/// the call.
+/// The record of each call, keyed by the caller's number ([`Client::id`]) and the call's serial.
 ///
 /// The records are hashed with foldhash rather than with the SipHash of the standard library, which
 /// takes several times as long to hash their keys. A caller picks the serials of its calls, but
 /// foldhash is seeded at random, so that it can't pick serials whose hashes collide.
 ///
-/// [`Peer::id`]: super::Peer::id
+/// [`Client::id`]: super::Client::id
 type Calls = HashMap<(usize, NonZeroU32), Call, foldhash::fast::RandomState>;
 
 /// The record of a call that waits for its reply.

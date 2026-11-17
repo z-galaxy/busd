@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io,
     pin::pin,
     sync::{
@@ -44,7 +45,7 @@ impl Recipient {
         unique_name: OwnedUniqueName,
         timeout: Duration,
     ) -> io::Result<Self> {
-        let client = Client {
+        let link = Link {
             conn,
             unique_name,
             runtime: SharedRuntime::current()?,
@@ -53,7 +54,7 @@ impl Recipient {
             disconnecting: AtomicBool::new(false),
         };
 
-        Ok(Self(Kind::Client(Arc::new(client))))
+        Ok(Self(Kind::Client(Arc::new(link))))
     }
 
     /// The bus itself, on `conn`.
@@ -172,13 +173,13 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 enum Kind {
-    Client(Arc<Client>),
+    Client(Arc<Link>),
     Bus(Connection),
 }
 
-/// The connection of a client, as the bus sends messages on it.
+/// The bus's link to a client: the client's connection, on which the bus sends messages.
 #[derive(Debug)]
-struct Client {
+struct Link {
     conn: Connection,
     unique_name: OwnedUniqueName,
     runtime: SharedRuntime,
@@ -195,34 +196,17 @@ struct Client {
     disconnecting: AtomicBool,
 }
 
-impl Client {
+impl Link {
     /// Send `msgs`, and return those that the client can't take, for their file descriptors.
     async fn send(&self, msgs: &[Message]) -> Vec<Message> {
         if self.disconnecting.load(Ordering::SeqCst) {
             return Vec::new();
         }
-        let (failure, first) = {
-            let send = pin!(self.runtime.timeout(self.timeout, self.send_in_turn(msgs)));
-            let failure = match send.await {
-                Ok(Ok(dropped)) => return dropped,
-                Ok(Err(e)) => Failure::Error(e),
-                Err(_) => Failure::Timeout,
-            };
-            // A send that timed out is still there, with whatever part of its message it wrote,
-            // and it may hold the connection until the end of this block. Flag the client before
-            // it lets go, so that no other send writes after that part.
-            let first = !self.disconnecting.swap(true, Ordering::SeqCst);
+        let what = || format!("{} messages", msgs.len());
 
-            (failure, first)
-        };
-        // Another send got here first, and disconnects the client.
-        if !first {
-            return Vec::new();
-        }
-        self.disconnect(failure, &format!("{} messages", msgs.len()))
-            .await;
-
-        Vec::new()
+        self.in_time(self.send_in_turn(msgs), what)
+            .await
+            .unwrap_or_default()
     }
 
     /// Write what the connection has left to write, in turn with the sends, within the time limit
@@ -233,24 +217,39 @@ impl Client {
             return;
         }
         let unwritten = self.conn.unwritten_len();
+        let what = || format!("the {unwritten} bytes that were left to write to it");
+        self.in_time(self.flush_in_turn(), what).await;
+    }
+
+    /// Await `write`, a write to the client that runs in its turn, within the client's time limit.
+    /// The outcome is `None` if the write fails or takes longer. The bus then disconnects the
+    /// client because writing `what` to it failed, unless another write got there first.
+    async fn in_time<F, T, W>(&self, write: F, what: W) -> Option<T>
+    where
+        F: Future<Output = zbus::Result<T>>,
+        W: FnOnce() -> String,
+    {
         let (failure, first) = {
-            let flush = pin!(self.runtime.timeout(self.timeout, self.flush_in_turn()));
-            let failure = match flush.await {
-                Ok(Ok(())) => return,
+            let write = pin!(self.runtime.timeout(self.timeout, write));
+            let failure = match write.await {
+                Ok(Ok(written)) => return Some(written),
                 Ok(Err(e)) => Failure::Error(e),
                 Err(_) => Failure::Timeout,
             };
-            // As for a send: see `Client::send`.
+            // A write that timed out still exists, with whatever part of its message it wrote, and
+            // it may hold the connection until the end of this block. Flag the client before the
+            // write releases the connection, so that no other write writes after that part.
             let first = !self.disconnecting.swap(true, Ordering::SeqCst);
 
             (failure, first)
         };
-        // Another send got here first, and disconnects the client.
+        // Another write got here first, and disconnects the client.
         if !first {
-            return;
+            return None;
         }
-        let what = format!("the {unwritten} bytes that were left to write to it");
-        self.disconnect(failure, &what).await;
+        self.disconnect(failure, &what()).await;
+
+        None
     }
 
     /// Disconnect the client, as sending it `what` failed, or timed out, as `failure` says.

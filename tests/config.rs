@@ -1,8 +1,8 @@
 use std::{path::PathBuf, str::FromStr};
 
 use busd::config::{
-    Access, BusType, Config, ConnectOperation, MessageType, Name, NameOwnership, Operation, Policy,
-    ReceiveOperation, SendOperation,
+    Access, BusType, Config, ConnectOperation, MessageMatch, MessageType, Name, NameOwnership,
+    Operation, Policy, ReceiveOperation, Rule, SendOperation,
 };
 use zbus::Address;
 
@@ -17,32 +17,32 @@ fn config_read_file_with_includes_ok() {
             listen: Some(Address::from_str("unix:path=/tmp/a").expect("should parse address")),
             policies: vec![
                 Policy::DefaultContext(vec![
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Deny,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
+                    },
                 ]),
                 Policy::MandatoryContext(vec![
-                    (
-                        Access::Deny,
-                        Operation::Own(NameOwnership {
+                    Rule {
+                        access: Access::Deny,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
-                    (
-                        Access::Allow,
-                        Operation::Own(NameOwnership {
+                    },
+                    Rule {
+                        access: Access::Allow,
+                        operation: Operation::Own(NameOwnership {
                             own: Some(Name::Any)
                         })
-                    ),
+                    },
                 ],),
             ],
             ..Default::default()
@@ -58,20 +58,17 @@ fn config_read_file_example_session_disable_stats_conf_ok() {
     assert_eq!(
         got,
         Config {
-            policies: vec![Policy::DefaultContext(vec![(
-                Access::Deny,
-                Operation::Send(SendOperation {
-                    broadcast: None,
+            policies: vec![Policy::DefaultContext(vec![Rule {
+                access: Access::Deny,
+                operation: Operation::Send(SendOperation {
                     destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                    error: None,
-                    interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                    max_fds: None,
-                    member: None,
-                    min_fds: None,
-                    path: None,
-                    r#type: None
-                }),
-            ),]),],
+                    broadcast: None,
+                    message: MessageMatch {
+                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                        ..Default::default()
+                    }
+                })
+            },]),],
             ..Default::default()
         }
     );
@@ -86,20 +83,17 @@ fn config_read_file_example_system_enable_stats_conf_ok() {
         got,
         Config {
             policies: vec![Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
-                        broadcast: None,
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None
-                    }),
-                )],
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                            ..Default::default()
+                        }
+                    })
+                }],
                 String::from("USERNAME"),
             ),],
             ..Default::default()
@@ -125,40 +119,28 @@ fn config_read_file_session_conf_ok() {
             ),
             keep_umask: true,
             policies: vec![Policy::DefaultContext(vec![
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
-                        broadcast: None,
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: Some(Name::Any),
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
-                    }),
-                ),
+                        broadcast: None,
+                        message: MessageMatch::default()
+                    })
+                },
                 // `<allow eavesdrop="true"/>` is a receive rule with no restriction.
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         sender: None,
-                        r#type: None,
-                    }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Own(NameOwnership {
+                        message: MessageMatch::default()
+                    })
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Own(NameOwnership {
                         own: Some(Name::Any),
-                    }),
-                ),
+                    })
+                },
             ]),],
             r#type: Some(BusType::Session),
             ..Default::default()
@@ -177,275 +159,222 @@ fn config_read_file_system_conf_ok() {
         pidfile: Some(PathBuf::from("@DBUS_SYSTEM_PID_FILE@")),
         policies: vec![
             Policy::DefaultContext(vec![
-                (
-                    Access::Allow,
-                    Operation::Connect(ConnectOperation {
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Connect(ConnectOperation {
                         group: None,
                         user: Some(String::from("*")),
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Own(NameOwnership {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Own(NameOwnership {
                         own: Some(Name::Any),
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
-                        broadcast: None,
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::MethodCall),
-                    }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
                         broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodCall),
+                            ..Default::default()
+                        },
+                    }),
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::Signal),
-                    }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
                         broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Signal),
+                            ..Default::default()
+                        },
+                    }),
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::MethodReturn),
-                    }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
                         broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodReturn),
+                            ..Default::default()
+                        },
+                    }),
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: None,
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: Some(MessageType::Error),
+                        broadcast: None,
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Error),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         sender: None,
-                        r#type: Some(MessageType::MethodCall),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodCall),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         sender: None,
-                        r#type: Some(MessageType::MethodReturn),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::MethodReturn),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         sender: None,
-                        r#type: Some(MessageType::Error),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Error),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Receive(ReceiveOperation {
-                        error: None,
-                        interface: None,
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Receive(ReceiveOperation {
                         sender: None,
-                        r#type: Some(MessageType::Signal),
+                        message: MessageMatch {
+                            r#type: Some(MessageType::Signal),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
-                        broadcast: None,
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
-                    }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
                         broadcast: None,
-                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Introspectable")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus")),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
+                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         broadcast: None,
-                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Properties")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Introspectable")),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Allow,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
+                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         broadcast: None,
-                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Containers1")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Properties")),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
+                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         broadcast: None,
-                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus")),
-                        max_fds: None,
-                        member: Some(String::from("UpdateActivationEnvironment")),
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Containers1")),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
+                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         broadcast: None,
-                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus")),
+                            member: Some(String::from("UpdateActivationEnvironment")),
+                            ..Default::default()
+                        },
                     }),
-                ),
-                (
-                    Access::Deny,
-                    Operation::Send(SendOperation {
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
+                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
                         broadcast: None,
-                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.systemd1.Activator")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                            ..Default::default()
+                        },
                     }),
-                ),
+                },
+                Rule {
+                    access: Access::Deny,
+                    operation: Operation::Send(SendOperation {
+                        destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.systemd1.Activator")),
+                            ..Default::default()
+                        },
+                    }),
+                },
             ]),
             Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
-                        broadcast: None,
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.systemd1.Activator")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.systemd1.Activator")),
+                            ..Default::default()
+                        },
                     }),
-                )],
+                }],
                 String::from("root"),
             ),
             Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
-                        broadcast: None,
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Monitoring")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Monitoring")),
+                            ..Default::default()
+                        },
                     }),
-                )],
+                }],
                 String::from("root"),
             ),
             Policy::User(
-                vec![(
-                    Access::Allow,
-                    Operation::Send(SendOperation {
-                        broadcast: None,
+                vec![Rule {
+                    access: Access::Allow,
+                    operation: Operation::Send(SendOperation {
                         destination: Some(Name::Exact(String::from("org.freedesktop.DBus"))),
-                        error: None,
-                        interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
-                        max_fds: None,
-                        member: None,
-                        min_fds: None,
-                        path: None,
-                        r#type: None,
+                        broadcast: None,
+                        message: MessageMatch {
+                            interface: Some(String::from("org.freedesktop.DBus.Debug.Stats")),
+                            ..Default::default()
+                        },
                     }),
-                )],
+                }],
                 String::from("root"),
             ),
         ],
@@ -559,18 +488,18 @@ fn config_read_file_with_file_included_twice_ok() {
         .expect("should read and parse XML input");
 
     let mandatory = Policy::MandatoryContext(vec![
-        (
-            Access::Deny,
-            Operation::Own(NameOwnership {
+        Rule {
+            access: Access::Deny,
+            operation: Operation::Own(NameOwnership {
                 own: Some(Name::Any),
             }),
-        ),
-        (
-            Access::Allow,
-            Operation::Own(NameOwnership {
+        },
+        Rule {
+            access: Access::Allow,
+            operation: Operation::Own(NameOwnership {
                 own: Some(Name::Any),
             }),
-        ),
+        },
     ]);
     assert_eq!(
         got,
@@ -583,10 +512,10 @@ fn config_read_file_with_file_included_twice_ok() {
 
 /// A default-context policy that allows owning `name`.
 fn allow_own(name: &str) -> Policy {
-    Policy::DefaultContext(vec![(
-        Access::Allow,
-        Operation::Own(NameOwnership {
+    Policy::DefaultContext(vec![Rule {
+        access: Access::Allow,
+        operation: Operation::Own(NameOwnership {
             own: Some(Name::Exact(String::from(name))),
         }),
-    )])
+    }])
 }

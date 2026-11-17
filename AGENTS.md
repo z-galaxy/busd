@@ -52,19 +52,28 @@ The crate is both a library (`src/lib.rs`) and a thin CLI binary (`src/bin/busd.
 argument parsing via clap). Key modules:
 
 - **`bus/`** — the broker core: accepts peer connections and routes messages between them.
-- **`bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket activation,
-  readiness notifications, and restarts through systemd's file descriptor store, which hand the
-  clients over to the next instance. The protocols of systemd, and the layout of a hand-over in
-  the store, are [zoter]'s; zbus's hand-over of each connection is an item of zoter's hand-over.
+  `listener.rs` is the socket that the bus accepts connections on.
+- **`bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket activation, and
+  restarts through systemd's file descriptor store, which hand the clients over to the next
+  instance. The protocols of systemd, telling it that the bus has started among them, and the
+  layout of a hand-over in the store, are [zoter]'s; zbus's hand-over of each connection is an
+  item of zoter's hand-over.
   The bus hands over the connection on which it serves the D-Bus API as well, both ends of it,
   with what is on its way between the bus and its clients, so it waits for nothing to get through
   before it stops: the two go together as one item too, the first, which the next instance takes
   nothing over without.
   The module docs of `bus/systemd.rs` describe the hand-over, with a diagram of a restart
   (`bus/systemd/restart.mmd`, in mermaid), and name the many kinds of FDs that it takes. The
-  tests and the benchmark restart busd through zoter's fake service manager.
-- **`peer/`, `peers.rs`** — per-connection peer state and the set of connected peers,
-  including monitor (eavesdropping) support.
+  tests restart busd through zoter's fake service manager, and the benchmark through a fake
+  systemd of its own (`benches/bus/handover.rs`).
+- **`peer/`** — the state of one connection. A connection starts as a peer and can become a
+  monitor (an eavesdropper); `client.rs` holds the state that both share.
+- **`peers/`** — the set of connected peers, as a handle that the bus and the `fdo` interfaces
+  share. `routing.rs` holds the peers, the monitors and the name registry behind one lock.
+  `serve.rs` is the task that reads a peer's messages, `forward.rs` picks the recipients of each
+  message, and `outbox.rs` collects what a batch sends to each recipient. `chores.rs` counts the
+  bus's own work, which a hand-over waits for, `stats.rs` gathers the statistics, and
+  `handover.rs` builds and restores the state that goes to the next instance.
 - **`name_registry.rs`** — ownership of well-known bus names.
 - **`match_rules.rs`** — match-rule parsing and signal delivery.
 - **`fdo/`** — the standard `org.freedesktop.DBus` interfaces (`dbus.rs`), monitoring
@@ -76,6 +85,8 @@ argument parsing via clap). Key modules:
   the names of users and groups.
 - **`tracing_subscriber.rs`** — logging setup (behind the default `tracing-subscriber`
   feature).
+- **`testing.rs`** — the helpers that the tests under `tests/` share: a bus for a test to run
+  against, and its clients.
 
 The library is internal to busd: it's only there for the binary, the tests and the
 benchmarks to share the code, and is only published along with the binary. Its `pub` items

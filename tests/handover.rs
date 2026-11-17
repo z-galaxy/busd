@@ -4,8 +4,6 @@
 
 use std::{
     collections::HashSet,
-    env::temp_dir,
-    future::IntoFuture,
     io::{self, IoSlice, Read, Write},
     mem::MaybeUninit,
     net::Shutdown,
@@ -18,7 +16,7 @@ use std::{
     pin::pin,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Once,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -29,16 +27,13 @@ use busd::{
     config::Config,
     peer::SEND_TIMEOUT,
     policy::{Ids, Policy},
+    testing::{self, init_tracing, unix_address, within, WAIT},
 };
 use futures_util::{
     future::{select, Either},
     StreamExt,
 };
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use rustix::{
     cmsg_space,
     net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags},
@@ -54,7 +49,7 @@ use zbus::{
     Connection, MatchRule, Message, MessageStream,
 };
 use zoter::Save;
-use zruntime::{Event, SharedRuntime, Task};
+use zruntime::SharedRuntime;
 
 /// The clients keep their unique names and the names that they own, and a client that connects
 /// once the next instance runs gets the number after theirs.
@@ -80,7 +75,7 @@ fn smoke() {
         assert_eq!(owner.as_str(), service.unique_name().unwrap().as_str());
 
         let handover = bus.hand_over().await;
-        assert_eq!(handover.clients.len(), 2);
+        assert_eq!(handover.clients().len(), 2);
         let bus = Running::take_over(handover).await;
 
         let owner = dbus
@@ -434,7 +429,7 @@ fn hand_over_does_not_wait_for_a_slow_receiver() {
         // The receiver takes no signal while the bus hands over, which the bus doesn't wait for.
         let handover = within(bus.hand_over()).await;
         let unwritten = handover
-            .clients
+            .clients()
             .iter()
             .find(|client| client.id == id_of(&receiver))
             .expect("The receiver wasn't handed over")
@@ -491,7 +486,7 @@ fn messages_that_the_bus_did_not_take_are_handed_over() {
 
         let handover = within(bus.hand_over()).await;
         let client = handover
-            .clients
+            .clients()
             .iter()
             .find(|client| client.id == id_of(&sender))
             .expect("The sender wasn't handed over");
@@ -670,7 +665,7 @@ fn bus_on_a_given_socket_hands_over() {
         let client = connect(&address).await;
 
         let handover = bus.hand_over().await;
-        assert!(handover.listener.is_none());
+        assert!(handover.listener().is_none());
         let bus = Bus::take_over(handover, Some(activator_copy), SEND_TIMEOUT, Arc::default())
             .await
             .unwrap();
@@ -727,7 +722,7 @@ fn stalled_receivers_are_handed_over() {
         runtime.sleep(FILL_UP).await;
 
         let handover = within(bus.hand_over()).await;
-        let mut clients: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
+        let mut clients: Vec<_> = handover.clients().iter().map(|client| client.id).collect();
         clients.sort();
         let mut expected: Vec<_> = stalled
             .iter()
@@ -740,7 +735,7 @@ fn stalled_receivers_are_handed_over() {
         assert_eq!(clients, expected);
         for (receiver, _) in &stalled {
             let id = id_of(receiver);
-            let client = handover.clients.iter().find(|client| client.id == id);
+            let client = handover.clients().iter().find(|client| client.id == id);
             assert!(
                 client.unwrap().connection.unwritten_len() > 0,
                 "The bus wrote `:busd.{id}` all that it sent"
@@ -828,7 +823,7 @@ fn writing_what_was_left_unwritten_holds_no_hand_over_up() {
 
         let handover = within(bus.hand_over()).await;
         let unwritten = handover
-            .clients
+            .clients()
             .iter()
             .find(|client| client.id == id_of(&receiver))
             .expect("The receiver wasn't handed over")
@@ -898,7 +893,7 @@ fn signal_of_a_client_that_goes_while_the_bus_pauses_is_passed_on() {
         leaver.send(&[bye]).unwrap();
         leaver.0.shutdown(Shutdown::Write).unwrap();
         let handover = handing_over.await;
-        let clients: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
+        let clients: Vec<_> = handover.clients().iter().map(|client| client.id).collect();
         assert!(
             !clients.contains(&leaver_id),
             "The client that went was handed over"
@@ -952,7 +947,9 @@ fn names_of_missing_clients_pass_on() {
 
         let mut handover = bus.hand_over().await;
         let gone: Vec<_> = leavers.iter().map(id_of).collect();
-        handover.clients.retain(|client| !gone.contains(&client.id));
+        handover
+            .clients_mut()
+            .retain(|client| !gone.contains(&client.id));
         // The calls wait in the socket of the caller, which no instance of the bus reads now.
         let mut serials = Vec::new();
         for name in &names {
@@ -1047,7 +1044,7 @@ fn client_in_the_middle_of_a_message_is_handed_over() {
         let handover = bus.hand_over().await;
         let took = started.elapsed();
         assert!(took < STOP_TIMEOUT, "The bus handed over after {took:?}");
-        let mut clients: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
+        let mut clients: Vec<_> = handover.clients().iter().map(|client| client.id).collect();
         clients.sort();
         assert_eq!(clients, [id_of(&bystander), stuck_id]);
         let bus = Running::take_over(handover).await;
@@ -1083,7 +1080,7 @@ fn fds_sent_ahead_are_handed_over() {
 
         let handover = bus.hand_over().await;
         let client = handover
-            .clients
+            .clients()
             .iter()
             .find(|client| client.id == sender_id)
             .expect("The sender wasn't handed over");
@@ -1141,7 +1138,7 @@ fn client_whose_handshake_ends_while_the_bus_pauses_is_handed_over() {
             took < STOP_TIMEOUT,
             "The bus handed over after {took:?}, once the time for handshakes was up"
         );
-        let clients: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
+        let clients: Vec<_> = handover.clients().iter().map(|client| client.id).collect();
         assert!(
             clients.contains(&late_id),
             "The client wasn't handed over: {clients:?}"
@@ -1201,7 +1198,7 @@ fn client_whose_handshake_ends_too_late_is_disconnected() {
             ),
             "The client wasn't disconnected: {error}"
         );
-        let clients: Vec<_> = handover.clients.iter().map(|client| client.id).collect();
+        let clients: Vec<_> = handover.clients().iter().map(|client| client.id).collect();
         assert_eq!(clients, [id_of(&watcher)]);
         let bus = Running::take_over(handover).await;
 
@@ -1248,7 +1245,7 @@ async fn client_leaves(how: Leaves) {
         // This ends the connection of the client, whatever copies of its socket the bus holds.
         Leaves::Closes => leaver.clone().close().await.unwrap(),
         Leaves::Missing => handover
-            .clients
+            .clients_mut()
             .retain(|client| client.id != id_of(&leaver)),
     }
     let bus = Running::take_over(handover).await;
@@ -1840,19 +1837,6 @@ where
     .await;
 }
 
-/// Wait for `future`, for as long as a test can wait for what should come soon, rather than hang
-/// if it never does.
-async fn within<F>(future: F) -> F::Output
-where
-    F: IntoFuture,
-{
-    SharedRuntime::current()
-        .unwrap()
-        .timeout(WAIT, future)
-        .await
-        .expect("Timed out")
-}
-
 /// The file of the UNIX socket that `address` is of.
 fn socket_path(address: &str) -> String {
     let path = address.strip_prefix("unix:path=").unwrap();
@@ -1883,12 +1867,6 @@ fn owns_no_name() -> Policy {
     Policy::new(&config, &Ids::default(), rustix::process::getuid().as_raw())
 }
 
-/// Set the tracing subscriber up, once for all the tests of this file, which run in one process.
-fn init_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(busd::tracing_subscriber::init);
-}
-
 /// Run a bus on a UNIX socket of a random name, and return the address that its clients connect
 /// to.
 async fn start() -> (Running, String) {
@@ -1902,39 +1880,13 @@ fn serve(bus: Bus) -> (Running, String) {
     (Running::new(bus), address)
 }
 
-/// The address of a UNIX socket of a random name.
-fn unix_address() -> String {
-    let name = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(name);
-
-    format!("unix:path={}", path.display())
-}
-
-/// A bus that runs until it is stopped.
-struct Running {
-    stop: Event,
-    task: Task<Bus, zruntime::Shared>,
-}
+/// A bus that runs until it is stopped, and that can hand over to its next instance.
+struct Running(testing::Running);
 
 impl Running {
     /// Run `bus`.
-    fn new(mut bus: Bus) -> Self {
-        let stop = Event::new();
-        let stopped = stop.listen();
-        let task = zruntime::spawn(async move {
-            {
-                let running = pin!(bus.run());
-                match select(stopped, running).await {
-                    Either::Left(_) => (),
-                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-                }
-            }
-
-            bus
-        });
-
-        Self { stop, task }
+    fn new(bus: Bus) -> Self {
+        Self(testing::Running::new(bus))
     }
 
     /// Hand the bus over to its next instance, and run that.
@@ -1962,7 +1914,7 @@ impl Running {
 
     /// Stop the bus and clean up after it.
     async fn finish(self) {
-        self.stop().await.cleanup().await.unwrap();
+        self.0.finish().await;
         let _ = SharedRuntime::current()
             .unwrap()
             .sleep(Duration::ZERO)
@@ -1971,9 +1923,7 @@ impl Running {
 
     /// Stop the bus, and take it back.
     async fn stop(self) -> Bus {
-        self.stop.notify(usize::MAX);
-
-        self.task.await.unwrap()
+        self.0.stop().await
     }
 }
 
@@ -1988,9 +1938,6 @@ const LEAVER: &str = "org.zbus.Handover.Leaver";
 /// The name, interface and path of the bus.
 const BUS_NAME: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";
-
-/// How long a test waits for what should come soon, such as a message that is on its way.
-const WAIT: Duration = Duration::from_secs(10);
 
 /// How long a test waits to see that nothing more comes.
 const QUIET: Duration = Duration::from_millis(200);

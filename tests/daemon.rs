@@ -1,7 +1,7 @@
 //! The busd binary, run the way that a service manager or a script runs it.
 
 #[cfg(target_os = "linux")]
-use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::os::unix::net::UnixDatagram;
 use std::{
     env::temp_dir,
     fs,
@@ -13,6 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use busd::testing::socket_path;
+#[cfg(target_os = "linux")]
+use busd::testing::unix_address;
 use ntest::timeout;
 use rand::{
     distr::{Alphanumeric, SampleString},
@@ -20,15 +23,13 @@ use rand::{
 };
 use rustix::process::{kill_process, Pid, Signal};
 use zbus::{connection, fdo, Address, Connection};
-use zruntime::SharedRuntime;
 
 /// On SIGTERM, which service managers and `kill` send to stop a service, busd stops as it does on
 /// SIGINT: it removes the file of its socket, and exits successfully.
 #[test]
 #[timeout(30000)]
 fn sigterm() {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
+    let path = socket_path();
     let mut busd = Busd::spawn(&format!("unix:path={}", path.display()), None);
     // Once busd prints its address, it listens.
     busd.address();
@@ -44,8 +45,7 @@ fn sigterm() {
 #[test]
 #[timeout(30000)]
 fn print_address() {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
+    let path = socket_path();
     let mut busd = Busd::spawn(&format!("unix:path={}", path.display()), Some("trace"));
     busd.address();
 
@@ -61,7 +61,7 @@ fn print_address() {
 #[test]
 #[timeout(30000)]
 fn logs_plainly_by_default() {
-    let path = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+    let path = socket_path();
     let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
     command.stderr(Stdio::piped());
     let mut busd = Busd::start(command);
@@ -76,58 +76,28 @@ fn logs_plainly_by_default() {
     assert!(!logs.contains('\x1b'), "{logs:?}");
 }
 
-/// Under systemd, busd tells the service manager once it listens, for a service of `Type=notify` to
-/// be ready then.
+/// Under a unit that systemd takes notifications from, but keeps no file descriptor store for,
+/// busd fails to start, as it tells systemd that it has started through the store: it says which
+/// setting the unit lacks.
 #[cfg(target_os = "linux")]
 #[test]
 #[timeout(30000)]
-fn notifies_readiness() {
-    let path = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
-    let notify_socket = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
-    let manager = UnixDatagram::bind(&notify_socket).unwrap();
-    manager
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
-    command.env("NOTIFY_SOCKET", &notify_socket);
+fn no_start_without_a_store() {
+    let notify_socket = socket_path();
+    let _manager = UnixDatagram::bind(&notify_socket).unwrap();
+    let mut command = Busd::command(&unix_address(), None);
+    command
+        .env("NOTIFY_SOCKET", &notify_socket)
+        .stderr(Stdio::piped());
     let mut busd = Busd::start(command);
 
-    let mut state = [0; 4096];
-    let len = manager.recv(&mut state).unwrap();
-    assert_eq!(&state[..len], b"READY=1");
-    UnixStream::connect(&path).expect("busd doesn't listen once it's ready");
-
-    let status = busd.stop(Signal::TERM);
-    assert!(status.success(), "busd exited with {status}");
+    let status = busd.wait();
+    assert!(!status.success(), "busd started without a store");
+    let mut errors = String::new();
+    let mut stderr = busd.child.stderr.take().unwrap();
+    stderr.read_to_string(&mut errors).unwrap();
+    assert!(errors.contains("`FileDescriptorStoreMax=`"), "{errors}");
     fs::remove_file(&notify_socket).unwrap();
-}
-
-/// A `$NOTIFY_SOCKET` that no one listens on doesn't keep busd from starting and serving: it only
-/// can't tell systemd that it's ready.
-#[test]
-#[timeout(30000)]
-fn notify_socket_nobody_listens_on() {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
-    let address = format!("unix:path={}", path.display());
-    let mut command = Busd::command(&address, None);
-    command.env("NOTIFY_SOCKET", temp_dir().join("busd-nobody-listens-here"));
-    let mut busd = Busd::start(command);
-    let address = busd.address();
-
-    let connection = zruntime::block_on(async {
-        let connecting = connection::Builder::address(address).build();
-        SharedRuntime::current()
-            .unwrap()
-            .timeout(Duration::from_secs(10), connecting)
-            .await
-            .expect("Timed out")
-    })
-    .unwrap();
-    assert!(connection.unique_name().is_some());
-
-    let status = busd.stop(Signal::TERM);
-    assert!(status.success(), "busd exited with {status}");
 }
 
 /// On `ReloadConfig`, busd reads its configuration again, and goes by the policy of it from then
@@ -277,12 +247,20 @@ impl Busd {
     fn stop(&mut self, signal: Signal) -> ExitStatus {
         kill_process(Pid::from_child(&self.child), signal).unwrap();
 
+        self.wait()
+    }
+
+    /// Waits a few seconds at most for busd to exit.
+    ///
+    /// A busd that doesn't exit so fails the test, which then kills it, rather than hang the test
+    /// until it times out, which would leave busd running.
+    fn wait(&mut self) -> ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 return status;
             }
-            assert!(Instant::now() < deadline, "busd didn't exit on {signal:?}");
+            assert!(Instant::now() < deadline, "busd didn't exit");
             thread::sleep(Duration::from_millis(10));
         }
     }

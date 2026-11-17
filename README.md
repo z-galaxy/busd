@@ -124,7 +124,7 @@ busctl call --user com.intel.dleyna-renderer /com/intel/dLeynaRenderer com.intel
 ### Under systemd
 
 On Linux, busd listens on the socket that systemd's [socket activation] passes, if any, rather than
-on one of its own, and tells systemd once it's ready, for a service of `Type=notify`.
+on one of its own.
 
 With socket activation and a [file descriptor store], under systemd 254 or later, busd survives its
 restarts without its clients noticing anything but a pause. On `SIGTERM`, rather than disconnect
@@ -150,6 +150,10 @@ WantedBy=sockets.target
 
 ```ini
 # ~/.config/systemd/user/busd.service
+[Unit]
+# systemd otherwise starts the service without its socket where the socket unit isn't active.
+Requires=busd.socket
+
 [Service]
 Type=notify
 ExecStart=/usr/bin/busd --session
@@ -160,12 +164,25 @@ FileDescriptorStoreMax=16
 `systemctl --user restart busd` then restarts busd, as after an update, with its clients connected
 throughout, while those that connect meanwhile wait in the socket, which systemd keeps open. The
 store only keeps what busd hands over until the next instance takes it, which `systemctl restart`
-starts right away, while `systemctl stop` followed by `systemctl start` doesn't keep it. Without
-socket activation, busd doesn't hand over: it disconnects its clients as it stops. The next
-instance raises its limit of open files to the hard limit of `LimitNOFILE=` as it takes what busd
-handed over out of the store, and needs to be able to open all of it: if it can't, it takes nothing
-over, which disconnects all of the clients. So lower that limit with a stop and a start, rather than
-a restart.
+starts right away, while `systemctl stop` followed by `systemctl start` doesn't keep it. The
+hand-over needs all three: the socket unit, `FileDescriptorStoreMax=` of 2 at least, and systemd 254
+or later. The next instance raises its limit of open files to the hard limit of `LimitNOFILE=` as it
+takes what busd handed over out of the store, and needs to be able to open all of it: if it can't,
+it takes nothing over, which disconnects all of the clients. So lower that limit with a stop and a
+start, rather than a restart.
+
+busd tells systemd that it has started as it takes over through the store, which a unit of
+`Type=notify` has systemd wait for, while its clients wait in the socket. So under a unit
+that systemd takes notifications from, as one of `Type=notify` or with `FileDescriptorStoreMax=`,
+busd needs the socket unit and the store, and fails to start without either, saying what the unit
+lacks. The `Requires=` has systemd start the service only with its socket. A unit with neither
+`Type=notify` nor `FileDescriptorStoreMax=` runs busd without a hand-over, with a socket unit or
+without: it disconnects its clients as it stops. Under a systemd older than 254, leave both
+`Type=notify` and `FileDescriptorStoreMax=` out of the unit.
+
+busd listens on one socket. If systemd passes it more than one, as for a socket unit with two
+`ListenStream=`, it listens on the first, and ignores the others with a warning: the clients that
+connect to those get no answer.
 
 ### Profile-guided optimization
 

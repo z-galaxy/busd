@@ -1,53 +1,18 @@
-use std::{env::temp_dir, pin::pin};
-
-use busd::bus::Bus;
-use futures_util::future::{join_all, select, Either};
+use busd::testing::{init_tracing, with_bus};
+use futures_util::future::join_all;
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use tracing::instrument;
 use zbus::connection;
-use zruntime::Event;
 
 #[test]
 #[instrument]
 #[timeout(30000)]
-fn multi_conenct() {
-    busd::tracing_subscriber::init();
+fn multi_connect() {
+    init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        multi_conenct_(&address).await;
-    });
-}
-
-async fn multi_conenct_(socket_addr: &str) {
-    let mut bus = Bus::for_address(Some(socket_addr)).await.unwrap();
-    let stop = Event::new();
-    let stopped = stop.listen();
-
-    let handle = zruntime::spawn(async move {
-        {
-            let running = pin!(bus.run());
-            match select(stopped, running).await {
-                Either::Left(_) => (),
-                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-            }
-        }
-
-        bus
-    });
-
-    let ret = multi_clients_connect(socket_addr).await;
-    stop.notify(usize::MAX);
-    let bus = handle.await.unwrap();
-    bus.cleanup().await.unwrap();
-    ret.unwrap();
+    zruntime::block_on(with_bus(|address| async move {
+        multi_clients_connect(&address).await
+    }));
 }
 
 #[instrument]

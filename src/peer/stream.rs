@@ -32,7 +32,7 @@ impl Stream {
     pub fn for_peer(peer: &Peer, msg_stream: MessageStream) -> Self {
         Self {
             msg_stream,
-            unique_name: peer.unique_name().clone(),
+            unique_name: peer.client().unique_name().clone(),
         }
     }
 

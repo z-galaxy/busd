@@ -1,22 +1,13 @@
-use std::{
-    collections::HashMap,
-    env::temp_dir,
-    os::unix::net::UnixStream,
-    pin::pin,
-    sync::{Arc, Once},
-};
+use std::collections::HashMap;
 
 use anyhow::{ensure, Context};
-use busd::{bus::Bus, peer::SEND_TIMEOUT, peers::Peers};
-use futures_util::{
-    future::{join, select, Either},
-    StreamExt, TryStreamExt,
+use busd::{
+    bus::Bus,
+    peers::Peers,
+    testing::{connect_as, init_tracing, unix_address, with, with_bus},
 };
+use futures_util::{StreamExt, TryStreamExt};
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use tracing::instrument;
 use zbus::{
     connection,
@@ -27,9 +18,8 @@ use zbus::{
     message,
     names::BusName,
     proxy::CacheProperties,
-    Connection, MessageStream, OwnedGuid,
+    MessageStream, OwnedGuid,
 };
-use zruntime::Event;
 
 #[test]
 #[instrument]
@@ -37,33 +27,9 @@ use zruntime::Event;
 fn become_monitor() {
     init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        let mut bus = Bus::for_address(Some(&address)).await.unwrap();
-        let stop = Event::new();
-        let stopped = stop.listen();
-
-        let handle = zruntime::spawn(async move {
-            {
-                let running = pin!(bus.run());
-                match select(stopped, running).await {
-                    Either::Left(_) => (),
-                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-                }
-            }
-
-            bus
-        });
-
-        let ret = become_monitor_client(&address).await;
-        stop.notify(usize::MAX);
-        let bus = handle.await.unwrap();
-        bus.cleanup().await.unwrap();
-        ret.unwrap();
-    });
+    zruntime::block_on(with_bus(|address| async move {
+        become_monitor_client(&address).await
+    }));
 }
 
 /// A name of a peer that becomes a monitor passes on to the peer that queued for it, and both the
@@ -74,33 +40,9 @@ fn become_monitor() {
 fn name_of_a_monitor_passes_on() {
     init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        let mut bus = Bus::for_address(Some(&address)).await.unwrap();
-        let stop = Event::new();
-        let stopped = stop.listen();
-
-        let handle = zruntime::spawn(async move {
-            {
-                let running = pin!(bus.run());
-                match select(stopped, running).await {
-                    Either::Left(_) => (),
-                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-                }
-            }
-
-            bus
-        });
-
-        let ret = name_of_a_monitor_passes_on_client(&address).await;
-        stop.notify(usize::MAX);
-        let bus = handle.await.unwrap();
-        bus.cleanup().await.unwrap();
-        ret.unwrap();
-    });
+    zruntime::block_on(with_bus(|address| async move {
+        name_of_a_monitor_passes_on_client(&address).await
+    }));
 }
 
 /// Only the peers of root and of the user of the bus may become monitors, or update the activation
@@ -112,40 +54,18 @@ fn unprivileged() {
     init_tracing();
 
     zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        let mut bus = Bus::for_address(Some(&address)).await.unwrap();
-        let peers = bus.peers().clone();
-        let guid = bus.guid().clone();
-        let stop = Event::new();
-        let stopped = stop.listen();
-
-        let handle = zruntime::spawn(async move {
-            {
-                let running = pin!(bus.run());
-                match select(stopped, running).await {
-                    Either::Left(_) => (),
-                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-                }
-            }
-
-            bus
-        });
-
-        let ret = unprivileged_clients(&address, &peers, &guid).await;
-        stop.notify(usize::MAX);
-        let bus = handle.await.unwrap();
-        bus.cleanup().await.unwrap();
-        ret.unwrap();
+        let bus = Bus::for_address(Some(&unix_address())).await.unwrap();
+        with(bus, |bus| async move {
+            unprivileged_clients(bus.address(), bus.peers(), bus.guid()).await
+        })
+        .await;
     });
 }
 
 #[instrument(skip(peers, guid))]
 async fn unprivileged_clients(
     address: &str,
-    peers: &Arc<Peers>,
+    peers: &Peers,
     guid: &OwnedGuid,
 ) -> anyhow::Result<()> {
     // A client of a user that is neither root nor the user of the bus.
@@ -209,28 +129,6 @@ async fn unprivileged_clients(
     );
 
     Ok(())
-}
-
-/// A client of the bus numbered `id`, of the user of `uid`, whatever the user that runs the test.
-async fn connect_as(
-    peers: &Arc<Peers>,
-    guid: &OwnedGuid,
-    id: usize,
-    uid: u32,
-) -> anyhow::Result<Connection> {
-    let (ours, theirs) = UnixStream::pair()?;
-    let adding = peers.add(
-        guid,
-        id,
-        connection::Builder::unix_stream(theirs),
-        SEND_TIMEOUT,
-        uid,
-    );
-    let connecting = connection::Builder::unix_stream(ours).build();
-    let (added, conn) = join(adding, connecting).await;
-    added?;
-
-    Ok(conn?)
 }
 
 #[instrument]
@@ -392,10 +290,4 @@ async fn name_of_a_monitor_passes_on_client(address: &str) -> anyhow::Result<()>
     ensure!(now == *queued_name, "the owner is {now}");
 
     Ok(())
-}
-
-/// Set the tracing subscriber up, once for all the tests of this file, which run in one process.
-fn init_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(busd::tracing_subscriber::init);
 }

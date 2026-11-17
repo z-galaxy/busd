@@ -1,31 +1,30 @@
-use crate::{debug, info, trace, warn};
+use crate::{debug, trace, warn};
 use anyhow::{bail, Context, Ok, Result};
-#[cfg(target_os = "linux")]
-use rustix::net::{sockopt, AddressFamily, SocketType};
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::{
-    env, io,
+    env,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 use zbus::{
-    address::{
-        transport::{Unix, UnixSocket},
-        Transport,
-    },
+    address::Transport,
     connection::{self, socket::Channel},
     fdo::ConnectionCredentials,
     Address, Connection, Guid, OwnedGuid,
 };
-use zruntime::{fs::remove_file, spawn, Shared, SharedRuntime};
+use zruntime::spawn;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod handover;
+mod listener;
 #[cfg(target_os = "linux")]
-pub use handover::{ClientHandover, Handover, OwnHandover, STOP_TIMEOUT};
+pub use crate::peers::handover::{ClientHandover, OwnHandover};
+#[cfg(target_os = "linux")]
+pub use handover::{Handover, STOP_TIMEOUT};
+use listener::Listener;
 #[cfg(target_os = "linux")]
 mod systemd;
 #[cfg(target_os = "linux")]
@@ -46,21 +45,15 @@ use crate::{
 /// [zruntime]: https://docs.rs/zruntime
 #[derive(Debug)]
 pub struct Bus {
-    inner: Inner,
-    listener: zruntime::net::unix::UnixListener<Shared>,
-    /// Whether the bus bound the socket that it listens on itself, rather than take it from
-    /// whoever passed it, such as systemd's socket activation, which then owns the socket's file.
-    bound: bool,
-}
-
-// All (cheaply) cloneable fields of `Bus` go here.
-#[derive(Clone, Debug)]
-pub struct Inner {
+    listener: Listener,
     address: Address,
-    peers: Arc<Peers>,
+    peers: Peers,
     guid: OwnedGuid,
+    /// The number of the last client that connected.
     next_id: usize,
     send_timeout: Duration,
+    /// The end of the bus's own connection on which the bus answers the calls to it. The bus
+    /// keeps this end for as long as it lives.
     _self_conn: Connection,
 }
 
@@ -77,15 +70,9 @@ impl Bus {
             Some(guid) => guid.to_owned().into(),
             None => Guid::generate().into(),
         };
-        // Resolve address specification into address that clients can use.
-        let (addr, socket) = Self::unix_addr(unix)?;
-        let unix = Unix::new(socket);
-        let listener = Self::unix_stream(addr)
-            .await
-            .with_context(|| format!("failed to listen on {unix}"))?;
-        let address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
+        let listener = Listener::bind(unix).await?;
 
-        Self::new(listener, address, guid, true).await
+        Self::new(listener, guid).await
     }
 
     /// Create a bus that listens on `listener`, a socket that listens already, such as the one that
@@ -95,15 +82,13 @@ impl Bus {
     /// stays with whoever passed it: the bus doesn't remove its file as it goes.
     #[cfg(target_os = "linux")]
     pub async fn for_listener(listener: OwnedFd) -> Result<Self> {
-        let (listener, unix) = Self::listener(listener)?;
-        let guid = Guid::generate();
-        let address = Address::new(Transport::Unix(unix)).set_guid(guid.clone())?;
+        let listener = Listener::from_fd(listener, false)?;
 
-        Self::new(listener, address, guid.into(), false).await
+        Self::new(listener, Guid::generate().into()).await
     }
 
     pub fn address(&self) -> &Address {
-        &self.inner.address
+        &self.address
     }
 
     /// Set how long the bus waits for a client to take a message, before it disconnects the client.
@@ -111,7 +96,7 @@ impl Bus {
     /// It is [`SEND_TIMEOUT`] unless set otherwise, or given to `Bus::take_over`, and applies to
     /// the clients that connect from then on.
     pub fn set_send_timeout(&mut self, timeout: Duration) {
-        self.inner.send_timeout = timeout;
+        self.send_timeout = timeout;
     }
 
     /// Set how many objects the bus keeps for each user at most: its connections, and the calls to
@@ -125,7 +110,7 @@ impl Bus {
     /// [`Charge::new`]: crate::user::Charge::new
     /// [`MAX_OBJECTS`]: crate::user::MAX_OBJECTS
     pub fn set_max_objects_per_user(&mut self, max: usize) {
-        self.inner.peers.users().set_max_objects(max);
+        self.peers.users().set_max_objects(max);
     }
 
     /// Set the policy that the bus goes by: who may connect, own which names, and send and receive
@@ -135,7 +120,7 @@ impl Bus {
     /// `Bus::take_over`, and applies to the clients that connect from then on, and to those that
     /// the bus has.
     pub async fn set_policy(&mut self, policy: Arc<Policy>) {
-        self.inner.peers.set_policy(policy).await;
+        self.peers.set_policy(policy).await;
     }
 
     /// Have `ReloadConfig` set the policy that `read` returns, as [`Bus::set_policy`] does.
@@ -149,7 +134,7 @@ impl Bus {
     where
         F: Fn() -> Result<Policy> + Send + Sync + 'static,
     {
-        self.inner.peers.set_reload(read).await;
+        self.peers.set_reload(read).await;
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -160,34 +145,20 @@ impl Bus {
 
     // AsyncDrop would have been nice!
     pub async fn cleanup(self) -> Result<()> {
-        if !self.bound {
-            return Ok(());
-        }
-        match self.inner.address.transport() {
-            Transport::Unix(unix) => match unix.path() {
-                UnixSocket::File(path) => remove_file(path).await.map_err(Into::into),
-                _ => Ok(()),
-            },
-            _ => Ok(()),
-        }
+        self.listener.remove().await.map_err(Into::into)
     }
 
-    pub fn peers(&self) -> &Arc<Peers> {
-        &self.inner.peers
+    pub fn peers(&self) -> &Peers {
+        &self.peers
     }
 
     pub fn guid(&self) -> &OwnedGuid {
-        &self.inner.guid
+        &self.guid
     }
 
-    /// A bus that listens on `listener`, at `address`: `bound` says whether it bound the listener
-    /// itself.
-    async fn new(
-        listener: zruntime::net::unix::UnixListener<Shared>,
-        address: Address,
-        guid: OwnedGuid,
-        bound: bool,
-    ) -> Result<Self> {
+    /// Create a bus with `guid` that listens on `listener`.
+    async fn new(listener: Listener, guid: OwnedGuid) -> Result<Self> {
+        let address = listener.address(&guid)?;
         let peers = Peers::new();
         let us = Self::us(
             &peers,
@@ -203,33 +174,29 @@ impl Bus {
             listener,
             address,
             guid,
-            bound,
             peers,
             service_conn,
         ))
     }
 
-    /// A bus that listens on `listener`, at `address`, with `peers`, the bus itself among them, on
-    /// `service_conn`: `bound` says whether it bound the listener itself.
+    /// Create a bus with `guid` that listens on `listener` at `address`. `peers` are its peers,
+    /// the bus itself among them, and `service_conn` is the connection on which it serves the
+    /// D-Bus API.
     fn with_peers(
-        listener: zruntime::net::unix::UnixListener<Shared>,
+        listener: Listener,
         address: Address,
         guid: OwnedGuid,
-        bound: bool,
-        peers: Arc<Peers>,
+        peers: Peers,
         service_conn: Connection,
     ) -> Self {
         Self {
             listener,
-            inner: Inner {
-                address,
-                peers,
-                guid,
-                next_id: 0,
-                send_timeout: SEND_TIMEOUT,
-                _self_conn: service_conn,
-            },
-            bound,
+            address,
+            peers,
+            guid,
+            next_id: 0,
+            send_timeout: SEND_TIMEOUT,
+            _self_conn: service_conn,
         }
     }
 
@@ -240,7 +207,7 @@ impl Bus {
     ///
     /// The bus talks to itself over a channel, which is in this process alone.
     pub(crate) async fn us(
-        peers: &Arc<Peers>,
+        peers: &Peers,
         guid: &OwnedGuid,
         #[cfg(target_os = "linux")] own: Option<OwnHandover>,
     ) -> Result<Us> {
@@ -265,119 +232,23 @@ impl Bus {
         let stream = peer.build_message_stream().await?;
         let service = service
             .name(fdo::BUS_NAME)
-            .serve_at(fdo::DBus::PATH, DBus::new(peers.clone(), guid.clone()))
-            .serve_at(fdo::Monitoring::PATH, Monitoring::new(peers.clone()))
-            .serve_at(fdo::Stats::PATH, Stats::new(peers.clone()));
+            .serve_at(fdo::DBus::PATH, DBus::new(peers, guid.clone()))
+            .serve_at(fdo::Monitoring::PATH, Monitoring::new(peers))
+            .serve_at(fdo::Stats::PATH, Stats::new(peers));
 
         Ok(Us { service, stream })
     }
 
-    /// The listener on `listener`, a socket that listens already, and the socket that clients
-    /// connect to, to reach it.
-    #[cfg(target_os = "linux")]
-    fn listener(listener: OwnedFd) -> Result<(zruntime::net::unix::UnixListener<Shared>, Unix)> {
-        if !sockopt::socket_acceptconn(&listener)? {
-            bail!("The socket to listen on doesn't listen.");
-        }
-        if sockopt::socket_type(&listener)? != SocketType::STREAM {
-            bail!("The socket to listen on isn't a stream socket.");
-        }
-        let family = sockopt::socket_domain(&listener)?;
-        if family != AddressFamily::UNIX {
-            bail!(
-                "The socket to listen on is of the {family:?} family: the bus only listens on unix \
-                 sockets."
-            );
-        }
-        let listener = std::os::unix::net::UnixListener::from(listener);
-        let socket = Self::unix_socket(&listener.local_addr()?)?;
-        info!("Listening on the UNIX socket `{socket}` that was passed.");
-        let runtime = SharedRuntime::current()?;
-        let listener = zruntime::net::unix::UnixListener::from_std(&runtime, listener)?;
-
-        Ok((listener, Unix::new(socket)))
-    }
-
-    /// The address to listen on for `unix`, and the socket that clients connect to.
-    ///
-    /// For a directory, the socket is a file of a random name in it.
-    fn unix_addr(unix: &Unix) -> Result<(std::os::unix::net::SocketAddr, UnixSocket)> {
-        use std::os::unix::net::SocketAddr;
-
-        Ok(match unix.path() {
-            #[cfg(target_os = "linux")]
-            UnixSocket::Abstract(name) => {
-                use std::os::linux::net::SocketAddrExt;
-
-                let addr = SocketAddr::from_abstract_name(name.as_encoded_bytes())?;
-                info!(
-                    "Listening on abstract UNIX socket `{}`.",
-                    name.to_string_lossy()
-                );
-
-                (addr, UnixSocket::Abstract(name.clone()))
-            }
-            UnixSocket::File(path) => {
-                let addr = SocketAddr::from_pathname(path)?;
-                info!(
-                    "Listening on UNIX socket file `{}`.",
-                    path.to_string_lossy()
-                );
-
-                (addr, UnixSocket::File(path.clone()))
-            }
-            UnixSocket::Dir(dir) | UnixSocket::TmpDir(dir) => {
-                let path = dir.join(format!("dbus-{}", fastrand::u32(1_000_000..u32::MAX)));
-                let addr = SocketAddr::from_pathname(&path)?;
-                info!(
-                    "Listening on UNIX socket file `{}`.",
-                    path.to_string_lossy()
-                );
-
-                (addr, UnixSocket::File(path))
-            }
-            _ => bail!("Unsupported address."),
-        })
-    }
-
-    async fn unix_stream(
-        addr: std::os::unix::net::SocketAddr,
-    ) -> Result<zruntime::net::unix::UnixListener<Shared>> {
-        let runtime = SharedRuntime::current()?;
-        let std_listener = zruntime::unblock(move || bind(&addr)).await?;
-
-        zruntime::net::unix::UnixListener::from_std(&runtime, std_listener).map_err(Into::into)
-    }
-
-    /// The socket that clients connect to, to reach a listener bound to `addr`.
-    #[cfg(target_os = "linux")]
-    fn unix_socket(addr: &std::os::unix::net::SocketAddr) -> Result<UnixSocket> {
-        use std::{
-            ffi::OsStr,
-            os::{linux::net::SocketAddrExt, unix::ffi::OsStrExt},
-        };
-
-        if let Some(path) = addr.as_pathname() {
-            return Ok(UnixSocket::File(path.to_owned()));
-        }
-        if let Some(name) = addr.as_abstract_name() {
-            return Ok(UnixSocket::Abstract(OsStr::from_bytes(name).to_owned()));
-        }
-
-        bail!("The UNIX socket to listen on has no name.")
-    }
-
     async fn accept_next(&mut self) -> Result<()> {
-        let (stream, _) = self.listener.accept().await?;
-        debug!("Accepted connection on address `{}`", self.inner.address);
+        let stream = self.listener.accept().await?;
+        debug!("Accepted connection on address `{}`", self.address);
 
         let id = self.next_id();
-        let inner = self.inner.clone();
+        let peers = self.peers.clone();
+        let guid = self.guid.clone();
+        let send_timeout = self.send_timeout;
         spawn(async move {
             let res = async {
-                // zbus is given the standard library stream that the zruntime one wraps, and the
-                // connection then drives it on the runtime it is built on.
-                let stream = stream.into_std();
                 // The client is an object of its user from the start, before its handshake, so
                 // its user is the one that its socket tells, as zbus looks it up for a connection
                 // over the socket, for a client in another PID namespace too.
@@ -385,7 +256,7 @@ impl Bus {
                 let uid = creds.unix_user_id().context("The client has no user")?;
                 let gids = creds.unix_group_ids().map_or(&[][..], Vec::as_slice);
                 // Dropping the stream closes the connection.
-                if !inner.peers.may_connect(uid, gids).await {
+                if !peers.may_connect(uid, gids).await {
                     warn!(
                         "Refusing a client of the user {uid}, as the policy does not let it \
                          connect"
@@ -395,11 +266,7 @@ impl Bus {
                 }
                 let builder = connection::Builder::unix_stream(stream);
 
-                inner
-                    .peers
-                    .clone()
-                    .add(&inner.guid, id, builder, inner.send_timeout, uid)
-                    .await
+                peers.add(&guid, id, builder, send_timeout, uid).await
             };
             if let Err(e) = res.await {
                 warn!("Failed to establish connection: {}", e);
@@ -411,15 +278,15 @@ impl Bus {
     }
 
     fn next_id(&mut self) -> usize {
-        self.inner.next_id += 1;
+        self.next_id += 1;
 
-        self.inner.next_id
+        self.next_id
     }
 }
 
 impl Drop for Bus {
     fn drop(&mut self) {
-        self.inner.peers.remove_us();
+        self.peers.remove_us();
     }
 }
 
@@ -437,167 +304,4 @@ fn default_address() -> String {
         .unwrap_or_else(env::temp_dir);
 
     format!("unix:dir={}", dir.display())
-}
-
-/// A socket bound to `addr`, in place of a socket file there that no one listens on anymore, as one
-/// that a bus left behind when it was killed.
-///
-/// On Linux, the file goes only if it's a socket that refuses connections. Elsewhere, as on macOS,
-/// a socket also refuses connections while more of them wait for its bus than it takes, so the file
-/// stays. The reference implementation of D-Bus removes any socket file in its way, even one that
-/// another bus still listens on, which this leaves alone.
-fn bind(addr: &std::os::unix::net::SocketAddr) -> io::Result<std::os::unix::net::UnixListener> {
-    let error = match std::os::unix::net::UnixListener::bind_addr(addr) {
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => e,
-        result => return result,
-    };
-    #[cfg(target_os = "linux")]
-    if let Some(path) = addr.as_pathname() {
-        return replace_stale(addr, path, error);
-    }
-
-    Err(error)
-}
-
-/// A socket bound to `addr` in place of the socket file at `path`, the path of `addr`, if no one
-/// listens on that anymore, or else `error`, which binding `addr` failed with.
-#[cfg(target_os = "linux")]
-fn replace_stale(
-    addr: &std::os::unix::net::SocketAddr,
-    path: &Path,
-    error: io::Error,
-) -> io::Result<std::os::unix::net::UnixListener> {
-    use std::os::unix::{fs::FileTypeExt, net::UnixListener};
-
-    // The file goes as the bus that it's of does, which may be in the meantime.
-    let is_socket = match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return UnixListener::bind_addr(addr),
-        Err(e) => return Err(e),
-        io::Result::Ok(metadata) => metadata.file_type().is_socket(),
-    };
-    if !is_socket {
-        return Err(error);
-    }
-    match probe(path)? {
-        Probe::InUse => return Err(error),
-        Probe::Gone => return UnixListener::bind_addr(addr),
-        Probe::Stale => (),
-    }
-    info!(
-        "Replacing the socket file `{}`, which no one listens on.",
-        path.display()
-    );
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => (),
-    }
-
-    UnixListener::bind_addr(addr)
-}
-
-/// What connecting to the socket at `path` tells of it.
-///
-/// The connection doesn't wait: a bus that listens on the socket but doesn't accept the connections
-/// that wait for it, as one that hangs, would have it wait for ever.
-#[cfg(target_os = "linux")]
-fn probe(path: &Path) -> io::Result<Probe> {
-    use rustix::{
-        io::{ioctl_fionbio, Errno},
-        net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType},
-    };
-
-    let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
-    ioctl_fionbio(&socket, true)?;
-    let addr = SocketAddrUnix::new(path)?;
-
-    io::Result::Ok(match connect(&socket, &addr) {
-        Err(Errno::CONNREFUSED) => Probe::Stale,
-        Err(Errno::NOENT) => Probe::Gone,
-        _ => Probe::InUse,
-    })
-}
-
-/// What connecting to a socket file tells of it.
-#[cfg(target_os = "linux")]
-enum Probe {
-    /// A bus listens on it, or it can't be told whether one does.
-    InUse,
-    /// No one listens on it anymore: it refuses connections.
-    Stale,
-    /// The file went in the meantime.
-    Gone,
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use std::{
-        fs,
-        os::unix::net::{SocketAddr, UnixListener, UnixStream},
-    };
-
-    use ntest::timeout;
-    use rand::{
-        distr::{Alphanumeric, SampleString},
-        rng,
-    };
-
-    use super::*;
-
-    /// A socket file that no one listens on gets replaced, but not one that a bus listens on, nor a
-    /// file of another kind.
-    #[test]
-    fn bind_replaces_a_stale_socket_file() {
-        let path = env::temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
-        let addr = SocketAddr::from_pathname(&path).unwrap();
-        // A listener that goes leaves its file behind.
-        UnixListener::bind_addr(&addr).unwrap();
-        assert!(path.exists());
-
-        {
-            let _listener = bind(&addr).unwrap();
-            UnixStream::connect(&path).unwrap();
-            let error = bind(&addr).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-        }
-
-        fs::remove_file(&path).unwrap();
-        fs::write(&path, b"").unwrap();
-        let error = bind(&addr).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-        assert!(path.is_file());
-        fs::remove_file(&path).unwrap();
-    }
-
-    /// A socket file that a bus listens on stays, and the bus finds so at once, even if the bus
-    /// doesn't accept the connections that wait for it.
-    #[test]
-    #[timeout(10000)]
-    fn bind_leaves_a_busy_socket_file() {
-        use rustix::{
-            io::{ioctl_fionbio, Errno},
-            net::{self, connect, listen, socket, AddressFamily, SocketAddrUnix, SocketType},
-        };
-
-        let path = env::temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
-        let unix = SocketAddrUnix::new(&path).unwrap();
-        let listener = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
-        net::bind(&listener, &unix).unwrap();
-        listen(&listener, 0).unwrap();
-        // The connections wait until the queue of the listener is full.
-        let mut waiting = Vec::new();
-        loop {
-            let client = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
-            ioctl_fionbio(&client, true).unwrap();
-            match connect(&client, &unix) {
-                Err(Errno::AGAIN) => break,
-                Err(e) => panic!("Failed to connect: {e}"),
-                _ => waiting.push(client),
-            }
-        }
-
-        let error = bind(&SocketAddr::from_pathname(&path).unwrap()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-        assert!(path.exists());
-        fs::remove_file(&path).unwrap();
-    }
 }

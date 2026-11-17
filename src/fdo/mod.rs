@@ -6,7 +6,7 @@ mod stats;
 pub use stats::*;
 use zbus::{message, names::UniqueName};
 
-use crate::peers::Peers;
+use crate::peers::{Peers, WeakPeers};
 
 pub const BUS_NAME: &str = "org.freedesktop.DBus";
 
@@ -22,6 +22,15 @@ async fn ensure_privileged(peers: &Peers, hdr: &message::Header<'_>) -> zbus::fd
             "No such peer: {name}"
         ))),
     }
+}
+
+/// Upgrade `peers` to the peers it refers to. Fails with the error that a call gets while the bus
+/// shuts down.
+fn upgrade(peers: &WeakPeers) -> zbus::fdo::Result<Peers> {
+    peers
+        .upgrade()
+        // Can it happen in any other situation than the bus shutting down?
+        .ok_or_else(|| zbus::fdo::Error::Failed("Bus shutting down.".to_string()))
 }
 
 /// The description of the error for a peer that is not privileged, worded (grammar included) as

@@ -1,29 +1,20 @@
 use std::{
-    env::temp_dir,
     future::Future,
     num::{NonZeroU32, NonZeroUsize},
-    pin::pin,
-    sync::Once,
 };
 
 use anyhow::{ensure, Context};
-use busd::bus::Bus;
-use futures_util::{
-    future::{join, select, Either},
-    TryStreamExt,
+use busd::{
+    bus::Bus,
+    testing::{connect, init_tracing, unix_address, with},
 };
+use futures_util::{future::join, TryStreamExt};
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use tracing::instrument;
 use zbus::{
-    connection,
     fdo::{self, DBusProxy, MonitoringProxy},
     message, Connection, MatchRule, Message, MessageStream,
 };
-use zruntime::Event;
 
 const PATH: &str = "/org/zbus/Replies";
 const INTERFACE: &str = "org.zbus.Replies";
@@ -560,16 +551,6 @@ async fn next_reply(msgs: &mut MessageStream) -> anyhow::Result<Message> {
     }
 }
 
-async fn connect(address: &str) -> zbus::Result<Connection> {
-    connection::Builder::address(address).build().await
-}
-
-/// Set the tracing subscriber up, once for all the tests of this file, which run in one process.
-fn init_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(busd::tracing_subscriber::init);
-}
-
 /// Run `test` against a bus of its own, at an address that it is given, which keeps
 /// [`OBJECTS_PER_USER`] objects for each user at most.
 async fn with_bus<F, T>(test: F)
@@ -577,30 +558,8 @@ where
     F: FnOnce(String) -> T,
     T: Future<Output = anyhow::Result<()>>,
 {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
-    let address = format!("unix:path={}", path.display());
-    let mut bus = Bus::for_address(Some(&address)).await.unwrap();
+    let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
     bus.set_max_objects_per_user(OBJECTS_PER_USER);
-    let stop = Event::new();
-    let stopped = stop.listen();
 
-    let handle = zruntime::spawn(async move {
-        {
-            let running = pin!(bus.run());
-            match select(stopped, running).await {
-                Either::Left(_) => (),
-                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-            }
-        }
-
-        bus
-    });
-
-    let ret = test(address).await;
-    stop.notify(usize::MAX);
-    let bus = handle.await.unwrap();
-    bus.cleanup().await.unwrap();
-    ret.unwrap();
+    with(bus, |bus| test(bus.address().to_owned())).await;
 }

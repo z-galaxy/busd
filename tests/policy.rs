@@ -1,30 +1,19 @@
 use std::{
     collections::VecDeque,
-    env::temp_dir,
     fmt::Debug,
     future::Future,
-    os::unix::net::UnixStream,
-    pin::pin,
-    sync::{mpsc, Arc, Mutex, Once},
+    sync::{mpsc, Arc, Mutex},
 };
 
 use anyhow::{anyhow, bail, ensure, Context};
 use busd::{
     bus::Bus,
     config::Config,
-    peer::SEND_TIMEOUT,
-    peers::Peers,
     policy::{Ids, Policy},
+    testing::{init_tracing, unix_address, with, TestBus},
 };
-use futures_util::{
-    future::{join, select, Either},
-    TryStreamExt,
-};
+use futures_util::{future::join, TryStreamExt};
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use tracing::instrument;
 use zbus::{
     connection,
@@ -32,9 +21,8 @@ use zbus::{
     message,
     names::BusName,
     proxy::CacheProperties,
-    Connection, DBusError, MatchRule, Message, MessageStream, OwnedGuid,
+    Connection, DBusError, MatchRule, Message, MessageStream,
 };
-use zruntime::Event;
 
 /// A peer may own the names that the policy lets it own, by name or by prefix, and is refused the
 /// others.
@@ -197,9 +185,7 @@ fn connect() {
     );
     zruntime::block_on(async {
         with_bus(&denied, |bus| async move {
-            let result = connection::Builder::address(bus.address.as_str())
-                .build()
-                .await;
+            let result = connection::Builder::address(bus.address()).build().await;
             ensure!(result.is_err(), "the client connected: {result:?}");
 
             Ok(())
@@ -498,7 +484,7 @@ async fn set_policy_applies_to_connected_peers_(bus: TestBus) -> anyhow::Result<
             <deny own="*"/>
         </policy>"#
     );
-    bus.peers.set_policy(Arc::new(policy(&policies)?)).await;
+    bus.peers().set_policy(Arc::new(policy(&policies)?)).await;
     let result = request_name(&dbus, "org.busd.Policy.After").await;
     ensure_denied(result, OWN_REFUSED)?;
 
@@ -520,7 +506,7 @@ async fn reload_(bus: TestBus) -> anyhow::Result<()> {
         </policy>"#
     );
     let read = Mutex::new(VecDeque::from([policy(&policies)]));
-    bus.peers
+    bus.peers()
         .set_reload(move || {
             let next = read.lock().unwrap().pop_front();
 
@@ -560,7 +546,7 @@ async fn forwards_during_a_reload_(bus: TestBus) -> anyhow::Result<()> {
     let (started, starts) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
-    bus.peers
+    bus.peers()
         .set_reload(move || {
             started.send(()).ok();
             released.lock().unwrap().recv().ok();
@@ -638,7 +624,7 @@ async fn system_bus_without_a_policy_(bus: TestBus) -> anyhow::Result<()> {
 }
 
 async fn stock_system_configuration_(bus: TestBus) -> anyhow::Result<()> {
-    let mut msgs = connection::Builder::address(bus.address.as_str())
+    let mut msgs = connection::Builder::address(bus.address())
         .build_message_stream()
         .await?;
     let conn = Connection::from(&msgs);
@@ -688,50 +674,6 @@ async fn stock_system_configuration_(bus: TestBus) -> anyhow::Result<()> {
     next_owner_change(&mut ordinary_msgs, later.unique_name().unwrap()).await?;
 
     Ok(())
-}
-
-/// A bus that a test runs against.
-struct TestBus {
-    address: String,
-    peers: Arc<Peers>,
-    guid: OwnedGuid,
-}
-
-impl TestBus {
-    /// A client that connects to the bus through its socket.
-    async fn connect(&self) -> zbus::Result<Connection> {
-        connection::Builder::address(self.address.as_str())
-            .build()
-            .await
-    }
-
-    /// A client of the bus numbered `id`, of the user of `uid`, whatever the user that runs the
-    /// test.
-    async fn connect_as(&self, id: usize, uid: u32) -> anyhow::Result<Connection> {
-        connect_as(&self.peers, &self.guid, id, uid).await
-    }
-}
-
-/// A client of the bus numbered `id`, of the user of `uid`, whatever the user that runs the test.
-async fn connect_as(
-    peers: &Arc<Peers>,
-    guid: &OwnedGuid,
-    id: usize,
-    uid: u32,
-) -> anyhow::Result<Connection> {
-    let (ours, theirs) = UnixStream::pair()?;
-    let adding = peers.add(
-        guid,
-        id,
-        connection::Builder::unix_stream(theirs),
-        SEND_TIMEOUT,
-        uid,
-    );
-    let connecting = connection::Builder::unix_stream(ours).build();
-    let (added, conn) = join(adding, connecting).await;
-    added?;
-
-    Ok(conn?)
 }
 
 async fn dbus_proxy(conn: &Connection) -> zbus::Result<DBusProxy<'_>> {
@@ -897,12 +839,6 @@ fn policy(policies: &str) -> anyhow::Result<Policy> {
     Ok(Policy::new(&config, &Ids::default(), our_uid()))
 }
 
-/// Set the tracing subscriber up, once for all the tests of this file, which run in one process.
-fn init_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(busd::tracing_subscriber::init);
-}
-
 /// Run `test` against a bus of its own, which goes by the `<policy>` elements of `policies`.
 async fn with_bus<F, T>(policies: &str, test: F)
 where
@@ -918,38 +854,11 @@ where
     F: FnOnce(TestBus) -> T,
     T: Future<Output = anyhow::Result<()>>,
 {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
-    let address = format!("unix:path={}", path.display());
-    let mut bus = Bus::for_address(Some(&address)).await.unwrap();
+    let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
     // Before the bus serves anyone.
     bus.set_policy(Arc::new(policy)).await;
-    let test_bus = TestBus {
-        address,
-        peers: bus.peers().clone(),
-        guid: bus.guid().clone(),
-    };
-    let stop = Event::new();
-    let stopped = stop.listen();
 
-    let handle = zruntime::spawn(async move {
-        {
-            let running = pin!(bus.run());
-            match select(stopped, running).await {
-                Either::Left(_) => (),
-                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-            }
-        }
-
-        bus
-    });
-
-    let ret = test(test_bus).await;
-    stop.notify(usize::MAX);
-    let bus = handle.await.unwrap();
-    bus.cleanup().await.unwrap();
-    ret.unwrap();
+    with(bus, test).await;
 }
 
 const PATH: &str = "/org/busd/Policy";
