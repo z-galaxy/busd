@@ -112,15 +112,11 @@ async fn run(
         [Signal::Interrupt, Signal::Terminate],
     )?;
 
-    // The store of systemd, which keeps what the bus hands over to its next instance. The next
-    // instance raises its limit of open file descriptors as this one did, and takes what this one
-    // hands over under it, or nothing if that doesn't fit.
+    // The store of systemd, which keeps what the bus hands over to its next instance, if systemd
+    // keeps one. The next instance raises its limit of open file descriptors as this one did, and
+    // takes what this one hands over under it, or nothing if that doesn't fit.
     #[cfg(target_os = "linux")]
-    let mut store = zoter::Store::from_env(bus::STORE_KEY).unwrap_or_else(|e| {
-        warn!("Ignoring `$NOTIFY_SOCKET`: {e}");
-
-        None
-    });
+    let mut store = systemd_store(&passed)?;
     // Under systemd, the bus takes over from its previous instance, or listens on the socket of the
     // socket activation, if systemd passes either. The clients that it takes over go by the policy
     // from the start.
@@ -150,14 +146,6 @@ async fn run(
         Ok(policy_of(&config))
     })
     .await;
-
-    // Under systemd, a service of `Type=notify` tells systemd once it's ready.
-    #[cfg(target_os = "linux")]
-    if let Some(store) = &store {
-        if let Err(e) = store.notifier().notify("READY=1") {
-            warn!("Failed to tell systemd that the bus is ready: {e}");
-        }
-    }
 
     {
         let signaled = pin!(signals.recv());
@@ -189,6 +177,29 @@ async fn run(
     }
 
     Ok(())
+}
+
+/// The store that systemd keeps for the bus to hand over to its next instance through, if systemd
+/// takes notifications from the bus. `passed` is what systemd passed the bus.
+///
+/// systemd keeps one for a unit that sets `FileDescriptorStoreMax=`, as the README shows, and
+/// passes the bus a socket of socket activation for a unit that has a socket unit, which the unit
+/// of the bus has `Requires=` on. The store is `None` where systemd takes no notifications from
+/// the bus, as when it doesn't run it at all: the bus doesn't hand over then, and disconnects its
+/// clients as it stops. Where systemd does take them, as under a unit of `Type=notify`, the bus
+/// can't do without the store and the socket: it tells systemd that it has started as it takes
+/// over, while its clients wait in the socket. So this fails then, and says what the unit lacks.
+#[cfg(target_os = "linux")]
+fn systemd_store(passed: &zoter::Passed) -> Result<Option<zoter::Store>> {
+    match zoter::Store::from_env(bus::STORE_KEY, passed) {
+        Ok(store) => Ok(Some(store)),
+        Err(zoter::Error::NoManager) => Ok(None),
+        Err(e) => Err(e).context(
+            "Failed to get the file descriptor store and the socket of socket activation that the \
+             bus needs where systemd takes notifications from it, as under a unit of \
+             `Type=notify`",
+        ),
+    }
 }
 
 /// Raise the soft limit of the file descriptors that busd may have open to the hard limit, or to

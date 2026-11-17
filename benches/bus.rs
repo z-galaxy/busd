@@ -89,7 +89,7 @@ use rustix::{
 use shared::SharedConnection;
 use zbus::{connection, names::BusName};
 #[cfg(target_os = "linux")]
-use zoter::{Notifier, Passed, Store};
+use zoter::{testing, Passed, Store};
 use zruntime::{mpmc, SharedRuntime};
 
 #[path = "common/calls.rs"]
@@ -887,11 +887,10 @@ async fn restart_through(
 /// sends once it stored all.
 #[cfg(target_os = "linux")]
 struct FakeSystemd {
-    /// What the bus sends its notifications to the fake with.
-    notifier: Notifier,
     /// What the bus stored up to each of its barriers, in turn.
     stored: mpsc::Receiver<Vec<(String, OwnedFd)>>,
-    /// The path of the notification socket, removed once this is dropped.
+    /// The path of the notification socket, which the bus sends its notifications to, removed once
+    /// this is dropped.
     path: PathBuf,
     /// The listening socket of the socket activation, which the bus listens on.
     activation: UnixListener,
@@ -909,7 +908,6 @@ impl FakeSystemd {
         let activation = UnixListener::bind(activation_path).expect("the listening socket");
         let path = socket_path("systemd");
         let socket = UnixDatagram::bind(&path).expect("the notification socket");
-        let notifier = Notifier::new(&path).expect("a notifier of the fake systemd");
         let (storing, stored) = mpsc::channel();
         let thread = thread::spawn(move || {
             let _abort = AbortOnPanic;
@@ -935,7 +933,6 @@ impl FakeSystemd {
         });
 
         Self {
-            notifier,
             stored,
             path,
             activation,
@@ -947,12 +944,7 @@ impl FakeSystemd {
     /// The store that an instance of the bus hands over through, which takes `FD_STORE_MAX` file
     /// descriptors.
     fn store(&self) -> Store {
-        let notifier = self
-            .notifier
-            .try_clone()
-            .expect("a notifier of the fake systemd");
-
-        Store::new(notifier, STORE_KEY, Some(FD_STORE_MAX)).expect("a store of the fake systemd")
+        testing::store(&self.path, STORE_KEY, FD_STORE_MAX).expect("a store of the fake systemd")
     }
 
     /// What the bus stored as it handed over.
@@ -980,8 +972,8 @@ impl FakeSystemd {
 impl Drop for FakeSystemd {
     fn drop(&mut self) {
         // The fake waits for notifications, and ends with this one.
-        self.notifier
-            .notify(STOP_FAKE_SYSTEMD)
+        UnixDatagram::unbound()
+            .and_then(|socket| socket.send_to(STOP_FAKE_SYSTEMD.as_bytes(), &self.path))
             .expect("the fake systemd takes notifications");
         if let Some(thread) = self.thread.take() {
             thread

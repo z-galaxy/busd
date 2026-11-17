@@ -155,13 +155,20 @@ debug = "full"
 split-debuginfo = "off"
 strip = "none"
 
-# busd stores a hand-over whole, and takes one over whole, or fails, which zoter does from 0.2.0
-# on, a version that it is yet to release: until it does, busd builds on the revision of zoter
-# that has it. That has to be the revision that zbus takes zoter from, for Cargo to build one
-# zoter for both. This goes as busd takes that release from crates.io.
+# busd needs these zoter changes:
+# - A hand-over is stored whole and taken over whole, or either fails.
+# - A store exists only where systemd keeps one that can hold a hand-over, and has passed busd a
+#   socket of socket activation (`Error::NoSocket`): zoter fails to create it otherwise. Its error
+#   tells a process that systemd takes no notifications from apart (`Error::NoManager`), which
+#   busd runs without a store on.
+# - The store itself stores the hand-over (`Store::hand_over`), and tells systemd that busd has
+#   started as busd takes over (`Store::take_over`).
+# zoter has them from 0.2.0 on, which is not released yet. Until it is, busd builds on the zoter
+# revision that has them. It must be the revision that zbus uses, so that Cargo builds a single
+# zoter for both. This patch goes away when busd takes that release from crates.io.
 [patch.crates-io.zoter]
 git = "https://github.com/z-galaxy/zoter"
-rev = "fd146b63bbdf7771e9548aceab8623ee0a102b39"
+rev = "4a89183d62ed13ae3278e38c0565de6b98122707"
 
 # The zbus on crates.io builds on zoter 0.1, and busd stores the hand-overs of zbus in those of the
 # zoter that it builds on itself, so the two have to build on one. busd also hands the connection
@@ -173,4 +180,4 @@ rev = "fd146b63bbdf7771e9548aceab8623ee0a102b39"
 # that release from crates.io.
 [patch.crates-io.zbus]
 git = "https://github.com/z-galaxy/zbus"
-rev = "3a05c2121cf0c363177d5ade259d50b38470eaa2"
+rev = "941b3a699dfa888e95309b5469671d06e666c41e"

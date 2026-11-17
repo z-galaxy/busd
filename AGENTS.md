@@ -53,10 +53,11 @@ argument parsing via clap). Key modules:
 
 - **`bus/`** — the broker core: accepts peer connections and routes messages between them.
   `listener.rs` is the socket that the bus accepts connections on.
-- **`bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket activation,
-  readiness notifications, and restarts through systemd's file descriptor store, which hand the
-  clients over to the next instance. The protocols of systemd, and the layout of a hand-over in
-  the store, are [zoter]'s; zbus's hand-over of each connection is an item of zoter's hand-over.
+- **`bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket activation, and
+  restarts through systemd's file descriptor store, which hand the clients over to the next
+  instance. The protocols of systemd, telling it that the bus has started among them, and the
+  layout of a hand-over in the store, are [zoter]'s; zbus's hand-over of each connection is an
+  item of zoter's hand-over.
   The bus hands over the connection on which it serves the D-Bus API as well, both ends of it,
   with what is on its way between the bus and its clients, so it waits for nothing to get through
   before it stops: the two go together as one item too, the first, which the next instance takes

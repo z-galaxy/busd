@@ -24,8 +24,8 @@
 //! - The **process FD** of a client is the pidfd of its process, which the next instance opens to
 //!   look the credentials of the client up.
 //!
-//! The bus hands over under socket activation alone, as [Socket activation](#socket-activation)
-//! tells. On `SIGTERM`, it pauses its clients and itself, finishes what it took, and hands their
+//! The bus hands over under socket activation, as [Socket activation](#socket-activation) tells.
+//! On `SIGTERM`, it pauses its clients and itself, finishes what it took, and hands their
 //! connections and its own over ([`Bus::hand_over`]). It hands its state and, as the items of the
 //! hand-over, its own connection, and the connections of the clients, each under the number of its
 //! client, to zoter, which stores them under `busd/` and waits for systemd to
@@ -59,6 +59,25 @@
 //! client-sent FD that is of the same open file description as another, as one that a client sent
 //! twice, goes as it is, unlike in the store, which keeps one FD of each.
 //!
+//! # What the units need
+//!
+//! The hand-over is systemd's work as much as the bus's, so it takes units that have systemd do
+//! its part, as the README of busd shows: a socket unit, for
+//! [socket activation](#socket-activation), and a service unit that sets
+//! `FileDescriptorStoreMax=` to 2 at least, under systemd 254 or later, and has `Requires=` on the
+//! socket unit, as systemd starts a service without its socket where the socket unit isn't active
+//! (systemd.socket(5): "the service may be started without the socket"). zoter gives the bus the
+//! store of such a service, and fails to otherwise ([`zoter::Store::from_env`]).
+//!
+//! The bus tells systemd that it has started as it takes over through the store, which a unit of
+//! `Type=notify` has systemd wait for, before it restores the connections that it took over. Its
+//! clients wait for it in the socket of socket activation meanwhile. So busd needs both the store
+//! and the socket under a unit that systemd takes notifications from, and fails to start without
+//! either: zoter's error says what the unit lacks. Where systemd takes no notifications from the
+//! bus, as when it doesn't run it at all, the bus runs without a store, and never hands over: it
+//! disconnects its clients as it stops. It listens on the socket of socket activation if systemd
+//! passed one, and on a socket of its own otherwise.
+//!
 //! # Socket activation
 //!
 //! The hand-over takes socket activation, which makes the listening socket systemd's: systemd
@@ -66,11 +85,11 @@
 //! instance runs, with the clients that connect meanwhile in its backlog. The bus listens on it
 //! whatever its address says.
 //!
-//! Without socket activation, the bus binds a listening socket of its own, which nothing keeps for
-//! the next instance, so it doesn't hand over: it disconnects its clients as it goes, and removes
-//! the file of its listening socket, as busd does without systemd. Nor does the next instance take
-//! over without socket activation, as when its socket unit went meanwhile: it drops what was handed
-//! over, which disconnects the clients, and binds a listening socket of its own.
+//! A bus with a store never binds a listening socket of its own, which nothing would keep for the
+//! next instance: it fails to start without the socket of socket activation, as when its socket
+//! unit went before a restart, and leaves what the previous instance handed over in the store. The
+//! bus without a store binds one at its address if systemd passed no socket, and removes the file
+//! of it as it stops, as busd does without systemd.
 //!
 //! [zoter]: https://github.com/z-galaxy/zoter
 
@@ -91,19 +110,22 @@ use crate::{
 
 impl Bus {
     /// Create a bus that systemd runs, out of the FDs that systemd passed, `passed`, and the store
-    /// of the service, `store`, if any.
+    /// of the service, `store`, if systemd keeps one.
     ///
-    /// The bus listens on the listening socket of the socket activation, if systemd passed one,
-    /// whatever `address` says, and takes over there from the instance that handed over through
-    /// the store, as [`Bus::hand_over_to_systemd`] does, if one did. Taking over may fail, as when
-    /// the previous instance encoded its state otherwise, or when what it handed over doesn't fit
-    /// under the limit of open FDs of this one: the clients that were handed over get disconnected
-    /// then, and the bus starts as if nothing was handed over. Without socket activation, the bus
-    /// listens at `address`, as [`Bus::for_address`] does, and drops what was handed over, if
-    /// anything, which disconnects the clients. busd listens on one socket, so this fails if
-    /// systemd passed more than one listening socket of socket activation. What was
-    /// stored is removed from the store first, so that whatever comes of it, the instances that
-    /// come after don't find it again.
+    /// With a store, the bus takes over from the instance that handed over through it, as
+    /// [`Bus::hand_over_to_systemd`] does, if one did, and tells systemd that it has started as it
+    /// does, while its clients wait in the socket of the socket activation. The bus listens on
+    /// that socket, whatever `address` says: the store of [`zoter::Store::from_env`] comes with
+    /// one, and this fails if systemd passed none, as it does if systemd passed more than one,
+    /// since busd listens on one socket. Taking over may fail, as when the previous instance
+    /// encoded its state otherwise, or when what it handed over doesn't fit under the limit of
+    /// open FDs of this one: the clients that were handed over get disconnected then, and the bus
+    /// starts as if nothing was handed over. What was stored is removed from the store first, so
+    /// that whatever comes of it, the instances that come after don't find it again.
+    ///
+    /// Without a store, the bus takes nothing over, and doesn't tell systemd anything. It listens
+    /// on the socket of the socket activation, if systemd passed one, and otherwise at `address`,
+    /// as [`Bus::for_address`] does.
     ///
     /// The bus goes by `policy`, as [`Bus::set_policy`] sets it, and the clients that it takes over
     /// do from the start, as with [`Bus::take_over`].
@@ -113,35 +135,23 @@ impl Bus {
         address: Option<&str>,
         policy: Arc<Policy>,
     ) -> Result<Self> {
-        let restored = match store {
-            Some(store) => store.take_over(&mut passed).unwrap_or_else(|e| {
+        let has_store = store.is_some();
+        let restored = store.and_then(|store| {
+            store.take_over(&mut passed).unwrap_or_else(|e| {
                 error!(
                     "Failed to take over from the previous instance of the bus, which disconnects \
                      its clients: {e}"
                 );
 
                 None
-            }),
-            // Without a store to remove it from, what was stored is left alone, rather than taken
-            // for sockets of socket activation.
-            None => {
-                drop(take_stored(&mut passed));
-
-                None
-            }
-        };
+            })
+        });
         let mut bus = match (Self::take_activation(passed)?, restored) {
-            (None, restored) => {
-                if restored.is_some() {
-                    warn!(
-                        "Dropping what the previous instance of the bus handed over, which \
-                         disconnects its clients, as systemd passed no socket of socket \
-                         activation to take over on"
-                    );
-                }
-
-                Self::for_address(address).await?
-            }
+            (None, _) if has_store => bail!(
+                "A bus with a file descriptor store needs a socket of socket activation to \
+                 listen on, and systemd passed none."
+            ),
+            (None, _) => Self::for_address(address).await?,
             (Some(activation), None) => Self::for_listener(activation).await?,
             (Some(activation), Some(restored)) => {
                 Self::out_of_restored(restored, activation, policy.clone()).await?
@@ -153,11 +163,10 @@ impl Bus {
         Ok(bus)
     }
 
-    /// Hand the bus over to its next instance, through `store`, the store of systemd, if the bus
+    /// Hand the bus over to its next instance, through `store`, the store of systemd. The bus
     /// listens on the listening socket of the socket activation, which systemd keeps for the next
-    /// instance, and the store takes a hand-over. Otherwise, the bus says why it doesn't hand over,
-    /// and cleans up as [`Bus::cleanup`] does, only logging a failure to, as busd does without
-    /// systemd.
+    /// instance. A bus that listens on a socket of its own instead has nothing to hand over to: it
+    /// cleans up as [`Bus::cleanup`] does, only logging a failure to, and fails.
     ///
     /// The bus hands over as [`Bus::hand_over`] does, and stores what it hands over, for
     /// [`Bus::for_systemd`] to take over from on the restart: its state, the connection on which it
@@ -169,13 +178,17 @@ impl Bus {
     /// bus stored, and the process FD of each client, under its limit of open FDs: it takes nothing
     /// over if it can't open those that were stored, which disconnects the clients.
     pub async fn hand_over_to_systemd(self, store: Store) -> Result<()> {
-        let Some(to_store) = self.start_hand_over(store) else {
+        if self.listener.is_bound() {
             if let Err(e) = self.cleanup().await {
                 error!("Failed to clean up: {e}");
             }
 
-            return Ok(());
-        };
+            bail!(
+                "The bus listens on a socket of its own, rather than on one of socket activation, \
+                 which systemd would keep for the next instance: a bus with a file descriptor \
+                 store needs a socket of socket activation to listen on."
+            );
+        }
         info!("Handing over to the next instance of the bus..");
         let handover = SharedRuntime::current()?
             .timeout(HAND_OVER_TIMEOUT, self.hand_over())
@@ -194,7 +207,7 @@ impl Bus {
             .iter()
             .map(|client| (client.id as u64, &client.connection as &dyn Save));
         let items = iter::once((OWN_ID, &own as &dyn Save)).chain(clients);
-        let stored = to_store.store(&state[..], items)?;
+        let stored = store.hand_over(&state[..], items)?;
         debug!(
             "Stored the state of the bus, its own connection and {} file descriptors of {} \
              clients for the next instance",
@@ -203,37 +216,6 @@ impl Bus {
         );
 
         Ok(())
-    }
-
-    /// The hand-over of the bus to its next instance through `store`, started, if the bus can hand
-    /// over: the store takes a hand-over, and the bus listens on the listening socket of the socket
-    /// activation, which systemd keeps for the next instance, rather than on one of its own. It
-    /// says why the bus can't otherwise.
-    fn start_hand_over(&self, store: Store) -> Option<zoter::Handover> {
-        let max = store.max();
-        let handover = match store.handover() {
-            Ok(handover) => handover,
-            Err(e) => {
-                // Most services that systemd runs keep no store, unlike one that is too small.
-                match max {
-                    Some(_) => warn!("Not handing over to the next instance of the bus: {e}"),
-                    None => info!("Not handing over to the next instance of the bus: {e}"),
-                }
-
-                return None;
-            }
-        };
-        if self.listener.is_bound() {
-            warn!(
-                "Not handing over to the next instance of the bus, as it listens on a socket of \
-                 its own rather than on one of socket activation, which systemd would keep for \
-                 the next instance: add a socket unit for the service."
-            );
-
-            return None;
-        }
-
-        Some(handover)
     }
 
     /// The listening socket of the socket activation, if systemd passed one, out of `passed`, from
@@ -356,30 +338,12 @@ impl From<ChannelHandover> for OwnHandover {
     }
 }
 
-/// What was stored under the names of busd, out of `passed`, for a bus without a store to take it
-/// over from.
-fn take_stored(passed: &mut Passed) -> Vec<OwnedFd> {
-    let names: Vec<_> = passed
-        .iter()
-        .map(|(name, _)| name)
-        .filter(|name| name.starts_with(STORE_PREFIX))
-        .map(str::to_owned)
-        .collect();
-
-    names
-        .iter()
-        .flat_map(|name| passed.take_all(name))
-        .collect()
-}
-
 /// The key that busd hands over under, in the store of systemd.
 pub const STORE_KEY: &str = "busd";
 /// The id of the item of a hand-over that is the connection on which the bus serves the D-Bus
 /// API, both of its ends: the number of the peer of the bus, which no client has, as the clients go
 /// under their numbers.
 const OWN_ID: u64 = BUS_ID as u64;
-/// What the names that zoter stores what busd hands over under start with.
-const STORE_PREFIX: &str = "busd/";
 /// How long the bus may take to hand over, before busd gives up on it, and its clients get
 /// disconnected as it goes.
 ///
@@ -389,40 +353,3 @@ const STORE_PREFIX: &str = "busd/";
 /// take what the instance before it left unwritten. This is longer, with room for the rest of the
 /// hand-over, and well within the 90 s that systemd gives a service to stop by default.
 const HAND_OVER_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[cfg(test)]
-mod tests {
-    use std::fs::File;
-
-    use super::*;
-
-    /// What was stored under the names of busd is taken out of what systemd passed, the names
-    /// that another version of busd may store it under included, while the sockets of socket
-    /// activation stay, even one whose unit has a name that starts like those of busd.
-    #[test]
-    fn stored_fds_are_told_apart() {
-        let names = [
-            "busd/state",
-            "busd.socket",
-            "busd/fds",
-            "busd-session.socket",
-            "busd/other",
-        ];
-        let mut passed = Passed::new(
-            names
-                .iter()
-                .map(|name| (name.to_string(), null()))
-                .collect(),
-        );
-
-        assert_eq!(take_stored(&mut passed).len(), 3);
-        let left: Vec<_> = passed.iter().map(|(name, _)| name).collect();
-        assert_eq!(left, ["busd.socket", "busd-session.socket"]);
-        assert!(Bus::take_activation(passed).is_err());
-    }
-
-    /// An FD of no consequence.
-    fn null() -> OwnedFd {
-        File::open("/dev/null").unwrap().into()
-    }
-}

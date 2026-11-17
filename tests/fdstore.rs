@@ -21,7 +21,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    process::{Child, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant},
@@ -429,12 +429,12 @@ fn failed_take_over() {
 }
 
 /// A next instance that systemd starts with the stored FDs but without the listening socket, as
-/// once the socket unit went, doesn't take over: it removes everything from the store, disconnects
-/// the clients of the previous instance, and serves new clients at its address, on a listening
-/// socket of its own, in place of the one that systemd closed.
+/// once the socket unit went, fails to start, before it takes anything over: it tells systemd
+/// nothing, leaves the hand-over in the store for an instance that has the socket, and leaves the
+/// file of the listening socket, which is systemd's, where it is.
 #[test]
 #[timeout(60000)]
-fn no_take_over_without_socket_activation() {
+fn no_start_without_socket_activation_after_a_hand_over() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
@@ -442,74 +442,82 @@ fn no_take_over_without_socket_activation() {
 
     let mut first = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
     systemd.until_ready();
-    let client = Client::connect(&address, Some(NAME));
+    let _client = Client::connect(&address, Some(NAME));
     hand_over(&mut first, &mut systemd, &socket);
     assert_eq!(systemd.check_stored(), 1);
     systemd.deactivate();
 
     let stored = systemd.names();
-    let _second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
-    systemd.until_ready();
-    assert_eq!(systemd.take_removed(), stored);
-
-    assert!(
-        try_owner(&client, NAME).is_err(),
-        "the old client is connected"
-    );
-    let late = Client::connect(&address, None);
-    assert!(
-        try_owner(&late, NAME).is_err(),
-        "the new bus has the old names"
-    );
-    assert_eq!(owner(&late, "org.freedesktop.DBus"), "org.freedesktop.DBus");
-}
-
-/// A file descriptor store that takes one stored FD is too small to hand over with: the bus stops
-/// as it does without systemd. It stores nothing, exits successfully and leaves the file of the
-/// listening socket, which is systemd's, where it is.
-#[test]
-#[timeout(60000)]
-fn no_hand_over_with_a_small_store() {
-    let _serial = serialize();
-    let socket = Removed(temp_path());
-    let address = socket.address();
-    let mut systemd = Systemd::activating(&socket.0);
-
-    let mut busd = Busd::spawn(&mut systemd, &address, 1);
-    systemd.until_ready();
-    let _client = Client::connect(&address, Some(NAME));
-
-    busd.signal(Signal::TERM);
-    let status = busd.wait();
-    assert!(status.success(), "busd exited with {status}");
+    let mut second = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
+    let status = second.wait();
+    assert!(!status.success(), "busd started without a socket");
     assert!(socket.0.exists(), "busd removed {}", socket.0.display());
+    assert_eq!(systemd.names(), stored);
+    assert!(systemd.take_removed().is_empty());
     systemd.assert_silent();
 }
 
-/// A bus that listens on a socket of its own, without socket activation, doesn't hand over, however
-/// many stored FDs the store takes: it stops as it does without systemd. It stores nothing, exits
-/// successfully and removes the file of its listening socket.
+/// Under a unit that systemd takes notifications from, the bus needs a file descriptor store that
+/// it can hand over through: with none, or with one that takes one stored FD, which is too small,
+/// it fails to start. It tells systemd nothing, and leaves the file of the listening socket, which
+/// is systemd's, where it is.
 #[test]
 #[timeout(60000)]
-fn no_hand_over_without_socket_activation() {
+fn no_start_without_a_usable_store() {
+    let _serial = serialize();
+    for store_max in [0, 1] {
+        let socket = Removed(temp_path());
+        let address = socket.address();
+        let mut systemd = Systemd::activating(&socket.0);
+
+        let mut busd = Busd::spawn(&mut systemd, &address, store_max);
+        let status = busd.wait();
+        assert!(
+            !status.success(),
+            "busd started with a store of {store_max}"
+        );
+        assert!(socket.0.exists(), "busd removed {}", socket.0.display());
+        systemd.assert_silent();
+    }
+}
+
+/// A bus with a store that systemd passed no socket of socket activation for fails to start, as
+/// it tells systemd that it has started while its clients wait in such a socket. It tells systemd
+/// nothing, and binds no socket at its address.
+#[test]
+#[timeout(60000)]
+fn no_start_without_socket_activation() {
     let _serial = serialize();
     let socket = Removed(temp_path());
     let address = socket.address();
     let mut systemd = Systemd::bind();
 
     let mut busd = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
-    systemd.until_ready();
-    let _client = Client::connect(&address, Some(NAME));
+    let status = busd.wait();
+    assert!(!status.success(), "busd started without a socket");
+    assert!(!socket.0.exists(), "busd created {}", socket.0.display());
+    systemd.assert_silent();
+}
+
+/// A notification socket that no one listens on doesn't keep busd from starting and serving, with a
+/// store and a socket of socket activation: it can't tell systemd that it has started. Nor can it
+/// store a hand-over as it stops: it exits with a failure then, which disconnects its clients.
+#[test]
+#[timeout(60000)]
+fn notify_socket_nobody_listens_on() {
+    let _serial = serialize();
+    let socket = Removed(temp_path());
+    let address = socket.address();
+    let mut systemd = Systemd::activating(&socket.0);
+
+    let mut busd = Busd::spawn_unheard(&mut systemd, &address, FDSTORE_MAX);
+    let client = Client::connect(&address, Some(NAME));
+    assert_eq!(owner(&client, NAME), client.unique_name);
 
     busd.signal(Signal::TERM);
     let status = busd.wait();
-    assert!(status.success(), "busd exited with {status}");
-    assert!(
-        !socket.0.exists(),
-        "busd left {} behind",
-        socket.0.display()
-    );
-    systemd.assert_silent();
+    assert!(!status.success(), "busd handed over to no one");
+    assert!(try_owner(&client, NAME).is_err(), "the client is connected");
 }
 
 /// Keep the tests from running at the same time.
@@ -771,14 +779,7 @@ impl Busd {
         store_max: usize,
         nofile: Option<libc::rlim_t>,
     ) -> Self {
-        systemd.manager.set_store_max(store_max);
-        let mut command = systemd.manager.command(BUSD).unwrap();
-        // The bus reads the session configuration of the tests, rather than the one of the
-        // system.
-        command
-            .args(["--config", CONFIG, "--address", address])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null());
+        let mut command = Self::command(systemd, address, store_max);
         if let Some(nofile) = nofile {
             // SAFETY: The closure runs in the child, between `fork` and `exec`, where only
             // async-signal-safe functions may be called: it calls `setrlimit`, and `last_os_error`
@@ -801,6 +802,30 @@ impl Busd {
         let child = command.spawn().unwrap();
 
         Self { child }
+    }
+
+    /// Starts busd as `spawn` does, with the notification socket that it is told of one that no
+    /// one listens on.
+    fn spawn_unheard(systemd: &mut Systemd, address: &str, store_max: usize) -> Self {
+        let mut command = Self::command(systemd, address, store_max);
+        command.env("NOTIFY_SOCKET", temp_path());
+        let child = command.spawn().unwrap();
+
+        Self { child }
+    }
+
+    /// The command that starts busd as systemd starts a service, as [`Busd::spawn`] runs it.
+    fn command(systemd: &mut Systemd, address: &str, store_max: usize) -> Command {
+        systemd.manager.set_store_max(store_max);
+        let mut command = systemd.manager.command(BUSD).unwrap();
+        // The bus reads the session configuration of the tests, rather than the one of the
+        // system.
+        command
+            .args(["--config", CONFIG, "--address", address])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+
+        command
     }
 
     /// How many file descriptors busd has open.
@@ -936,7 +961,7 @@ impl Systemd {
     /// For a busd that has exited, as what it sent is in the socket by then, which the manager
     /// deals with before the barrier of the test.
     fn assert_silent(&self) {
-        self.manager.notifier().unwrap().barrier(WAIT).unwrap();
+        self.manager.barrier(WAIT).unwrap();
         assert_eq!(self.manager.take_notifications(), ["BARRIER=1"]);
     }
 }

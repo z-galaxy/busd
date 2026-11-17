@@ -1560,7 +1560,7 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.3.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=3a05c2121cf0c363177d5ade259d50b38470eaa2#3a05c2121cf0c363177d5ade259d50b38470eaa2"
+source = "git+https://github.com/z-galaxy/zbus?rev=941b3a699dfa888e95309b5469671d06e666c41e#941b3a699dfa888e95309b5469671d06e666c41e"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -1590,7 +1590,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "6.3.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=3a05c2121cf0c363177d5ade259d50b38470eaa2#3a05c2121cf0c363177d5ade259d50b38470eaa2"
+source = "git+https://github.com/z-galaxy/zbus?rev=941b3a699dfa888e95309b5469671d06e666c41e#941b3a699dfa888e95309b5469671d06e666c41e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1601,7 +1601,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.1.0"
-source = "git+https://github.com/z-galaxy/zbus?rev=3a05c2121cf0c363177d5ade259d50b38470eaa2#3a05c2121cf0c363177d5ade259d50b38470eaa2"
+source = "git+https://github.com/z-galaxy/zbus?rev=941b3a699dfa888e95309b5469671d06e666c41e#941b3a699dfa888e95309b5469671d06e666c41e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1648,7 +1648,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zoter"
 version = "0.2.0"
-source = "git+https://github.com/z-galaxy/zoter?rev=fd146b63bbdf7771e9548aceab8623ee0a102b39#fd146b63bbdf7771e9548aceab8623ee0a102b39"
+source = "git+https://github.com/z-galaxy/zoter?rev=4a89183d62ed13ae3278e38c0565de6b98122707#4a89183d62ed13ae3278e38c0565de6b98122707"
 dependencies = [
  "libc",
  "rustix",
