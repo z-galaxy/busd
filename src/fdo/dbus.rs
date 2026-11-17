@@ -12,7 +12,7 @@ use zbus::{
     Optional, OwnedGuid, OwnedMatchRule,
 };
 
-use super::msg_sender;
+use super::{msg_sender, upgrade};
 use crate::{
     name_registry::NameOwnerChanged,
     peers::{Peers, WeakPeers},
@@ -36,10 +36,7 @@ impl DBus {
     }
 
     fn peers(&self) -> Result<Peers> {
-        self.peers
-            .upgrade()
-            // Can it happen in any other situation than the bus shutting down?
-            .ok_or_else(|| Error::Failed("Bus shutting down.".to_string()))
+        upgrade(&self.peers)
     }
 
     /// Fails for the name of the bus itself, which no client may ask for or let go of, as with

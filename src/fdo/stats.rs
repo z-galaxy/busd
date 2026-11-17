@@ -8,7 +8,7 @@ use zbus::{
 };
 
 use crate::{
-    fdo::BUS_NAME,
+    fdo::{upgrade, BUS_NAME},
     peers::{ConnectionCounts, Counts, Peers, WeakPeers},
 };
 
@@ -36,10 +36,7 @@ impl Stats {
 
     /// The peers of the bus, unless the bus is shutting down.
     fn peers(&self) -> Result<Peers> {
-        self.peers
-            .upgrade()
-            // Can it happen in any other situation than the bus shutting down?
-            .ok_or_else(|| Error::Failed("Bus shutting down.".to_string()))
+        upgrade(&self.peers)
     }
 }
 

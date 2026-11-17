@@ -5,7 +5,7 @@ use zbus::{
     object_server::{ResponseDispatchNotifier, SignalEmitter},
 };
 
-use super::{ensure_privileged, msg_sender};
+use super::{ensure_privileged, msg_sender, upgrade};
 use crate::{
     match_rules::MatchRules,
     name_registry::NameOwnerChanged,
@@ -44,11 +44,7 @@ impl Monitoring {
         #[zbus(signal_emitter)] ctxt: SignalEmitter<'_>,
     ) -> Result<ResponseDispatchNotifier<()>> {
         let owner = msg_sender(&hdr).to_owned();
-        let peers = self
-            .peers
-            .upgrade()
-            // Can it happen in any other situation than the bus shutting down?
-            .ok_or_else(|| Error::Failed("Bus shutting down.".to_string()))?;
+        let peers = upgrade(&self.peers)?;
         ensure_privileged(&peers, &hdr).await?;
         if !peers.make_monitor(&owner, match_rules).await {
             return Err(Error::NameHasNoOwner(format!("No such peer: {owner}")));
