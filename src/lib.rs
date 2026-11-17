@@ -13,5 +13,7 @@ pub mod name_registry;
 pub mod peer;
 pub mod peers;
 pub mod policy;
+#[doc(hidden)]
+pub mod testing;
 pub mod tracing_subscriber;
 pub mod user;

@@ -85,6 +85,8 @@ argument parsing via clap). Key modules:
   the names of users and groups.
 - **`tracing_subscriber.rs`** — logging setup (behind the default `tracing-subscriber`
   feature).
+- **`testing.rs`** — the helpers that the tests under `tests/` share: a bus for a test to run
+  against, and its clients.
 
 The library is internal to busd: it's only there for the binary, the tests and the
 benchmarks to share the code, and is only published along with the binary. Its `pub` items
