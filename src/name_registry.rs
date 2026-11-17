@@ -82,6 +82,15 @@ impl NameOwner {
         }
     }
 
+    /// An owner of a name, or one that queues for it, configured by the flags of its request.
+    pub fn with_flags(unique_name: OwnedUniqueName, flags: RequestNameFlags) -> Self {
+        Self::new(
+            unique_name,
+            flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
+            flags.contains(RequestNameFlags::DO_NOT_QUEUE),
+        )
+    }
+
     pub fn unique_name(&self) -> &OwnedUniqueName {
         &self.unique_name
     }
@@ -126,11 +135,7 @@ impl NameRegistry {
                     && entry.owner.allow_replacement
                 {
                     let unique_name = OwnedUniqueName::from(unique_name.clone());
-                    let new_owner = NameOwner::new(
-                        unique_name.clone(),
-                        flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
-                        flags.contains(RequestNameFlags::DO_NOT_QUEUE),
-                    );
+                    let new_owner = NameOwner::with_flags(unique_name.clone(), flags);
                     let replaced = std::mem::replace(&mut entry.owner, new_owner);
                     let old_owner = replaced.unique_name.clone();
                     // It has the name now, so it queues for it no more: left in the queue, it
@@ -183,11 +188,7 @@ impl NameRegistry {
             None => {
                 let unique_name = OwnedUniqueName::from(unique_name.clone());
                 let name = OwnedWellKnownName::from(name);
-                let owner = NameOwner::new(
-                    unique_name.clone(),
-                    flags.contains(RequestNameFlags::ALLOW_REPLACEMENT),
-                    flags.contains(RequestNameFlags::DO_NOT_QUEUE),
-                );
+                let owner = NameOwner::with_flags(unique_name.clone(), flags);
 
                 self.names.insert(
                     name.clone(),
