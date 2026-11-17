@@ -4,7 +4,11 @@ use crate::name_registry::NameRegistry;
 
 use super::Client;
 
-/// A peer connection.
+/// A monitor: a client that, as a peer, asked the bus to see the messages that go through it
+/// (`org.freedesktop.DBus.Monitoring.BecomeMonitor`), and is not a peer anymore.
+///
+/// The bus sends it the messages that it is [`interested`](Self::interested) in, and takes no
+/// messages from it: the bus disconnects a monitor that sends a message.
 #[derive(Debug)]
 pub struct Monitor {
     client: Client,
@@ -16,6 +20,9 @@ impl Monitor {
         &self.client
     }
 
+    /// Whether the monitor gets `msg`. A monitor without match rules gets every message. Otherwise
+    /// it gets the messages that one of its rules matches, and the messages for the monitor itself.
+    ///
     /// # Panics
     ///
     /// Same as [`MatchRules::matches`].
