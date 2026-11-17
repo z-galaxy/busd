@@ -267,23 +267,9 @@ impl NameRegistry {
     }
 
     pub fn release_all(&mut self, owner: UniqueName<'_>) -> Vec<NameOwnerChanged> {
-        // Find all names registered and queued by the given owner.
-        let names: Vec<_> = self
-            .names
-            .iter()
-            .filter_map(|(name, entry)| {
-                if *entry.owner.unique_name == owner
-                    || entry
-                        .waiting_list
-                        .iter()
-                        .any(|waiting| *waiting.unique_name == owner)
-                {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Find all names registered and queued by the given owner. The list is cloned because
+        // releasing the names changes it.
+        let names = self.names_of(owner.as_str()).to_vec();
         // Now release our claim or waiting list tickets from all these names.
         let mut all_changed = vec![];
         for name in names {
