@@ -13,6 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use busd::testing::socket_path;
+#[cfg(target_os = "linux")]
+use busd::testing::unix_address;
 use ntest::timeout;
 use rand::{
     distr::{Alphanumeric, SampleString},
@@ -26,8 +29,7 @@ use zbus::{connection, fdo, Address, Connection};
 #[test]
 #[timeout(30000)]
 fn sigterm() {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
+    let path = socket_path();
     let mut busd = Busd::spawn(&format!("unix:path={}", path.display()), None);
     // Once busd prints its address, it listens.
     busd.address();
@@ -43,8 +45,7 @@ fn sigterm() {
 #[test]
 #[timeout(30000)]
 fn print_address() {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
+    let path = socket_path();
     let mut busd = Busd::spawn(&format!("unix:path={}", path.display()), Some("trace"));
     busd.address();
 
@@ -60,7 +61,7 @@ fn print_address() {
 #[test]
 #[timeout(30000)]
 fn logs_plainly_by_default() {
-    let path = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+    let path = socket_path();
     let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
     command.stderr(Stdio::piped());
     let mut busd = Busd::start(command);
@@ -82,10 +83,9 @@ fn logs_plainly_by_default() {
 #[test]
 #[timeout(30000)]
 fn no_start_without_a_store() {
-    let path = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
-    let notify_socket = temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+    let notify_socket = socket_path();
     let _manager = UnixDatagram::bind(&notify_socket).unwrap();
-    let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
+    let mut command = Busd::command(&unix_address(), None);
     command
         .env("NOTIFY_SOCKET", &notify_socket)
         .stderr(Stdio::piped());

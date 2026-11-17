@@ -10,7 +10,6 @@
 use std::{
     env::temp_dir,
     fs::{self, File},
-    future::IntoFuture,
     io::{self, IoSlice, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::{
@@ -27,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use busd::testing::{socket_path, within, WAIT};
 use futures_util::StreamExt;
 use ntest::timeout;
 use rand::{
@@ -60,7 +60,7 @@ use zruntime::SharedRuntime;
 #[timeout(60000)]
 fn restart() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -101,7 +101,7 @@ fn restart() {
 #[timeout(60000)]
 fn restart_with_calls_to_the_bus_on_their_way() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -167,7 +167,7 @@ fn restart_with_calls_to_the_bus_on_their_way() {
 #[timeout(60000)]
 fn restart_with_fds_sent_ahead() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -203,7 +203,7 @@ fn restart_with_fds_sent_ahead() {
 #[timeout(60000)]
 fn restart_with_more_fds_sent_ahead_than_a_datagram_takes() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
     // Pairs go first, last, and right after those of the first datagram, and the others are of no
@@ -247,7 +247,7 @@ fn restart_with_more_fds_sent_ahead_than_a_datagram_takes() {
 #[timeout(60000)]
 fn restart_with_the_same_fd_sent_ahead_twice() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -283,7 +283,7 @@ fn restart_with_the_same_fd_sent_ahead_twice() {
 #[timeout(60000)]
 fn restart_with_fds_of_one_file_sent_ahead() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
     let file = Removed(temp_path());
@@ -327,7 +327,7 @@ fn restart_with_fds_of_one_file_sent_ahead() {
 #[timeout(60000)]
 fn no_take_over_under_too_low_an_fd_limit() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -362,7 +362,7 @@ fn no_take_over_under_too_low_an_fd_limit() {
 #[timeout(60000)]
 fn hand_over_at_the_hard_fd_limit() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -398,7 +398,7 @@ fn hand_over_at_the_hard_fd_limit() {
 #[timeout(60000)]
 fn failed_take_over() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -436,7 +436,7 @@ fn failed_take_over() {
 #[timeout(60000)]
 fn no_start_without_socket_activation_after_a_hand_over() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -466,7 +466,7 @@ fn no_start_without_socket_activation_after_a_hand_over() {
 fn no_start_without_a_usable_store() {
     let _serial = serialize();
     for store_max in [0, 1] {
-        let socket = Removed(temp_path());
+        let socket = Removed(socket_path());
         let address = socket.address();
         let mut systemd = Systemd::activating(&socket.0);
 
@@ -488,7 +488,7 @@ fn no_start_without_a_usable_store() {
 #[timeout(60000)]
 fn no_start_without_socket_activation() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::bind();
 
@@ -506,7 +506,7 @@ fn no_start_without_socket_activation() {
 #[timeout(60000)]
 fn notify_socket_nobody_listens_on() {
     let _serial = serialize();
-    let socket = Removed(temp_path());
+    let socket = Removed(socket_path());
     let address = socket.address();
     let mut systemd = Systemd::activating(&socket.0);
 
@@ -745,19 +745,6 @@ fn expect_line(stream: &mut UnixStream, start: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Wait for `future`, for as long as a test can wait for what should come soon, rather than hang
-/// if it never does.
-async fn within<F>(future: F) -> F::Output
-where
-    F: IntoFuture,
-{
-    SharedRuntime::current()
-        .unwrap()
-        .timeout(WAIT, future)
-        .await
-        .expect("Timed out")
-}
-
 /// A busd process, killed if it's still running when dropped.
 struct Busd {
     child: Child,
@@ -808,7 +795,7 @@ impl Busd {
     /// one listens on.
     fn spawn_unheard(systemd: &mut Systemd, address: &str, store_max: usize) -> Self {
         let mut command = Self::command(systemd, address, store_max);
-        command.env("NOTIFY_SOCKET", temp_path());
+        command.env("NOTIFY_SOCKET", socket_path());
         let child = command.spawn().unwrap();
 
         Self { child }
@@ -1008,8 +995,6 @@ const FREE_FDS: libc::rlim_t = 2;
 const HIGH_NOFILE: libc::rlim_t = 4 * HARD_NOFILE;
 /// How many calls a client makes to a bus that is told to stop while it answers them.
 const CALLS_ON_THEIR_WAY: u32 = 5000;
-/// How long the test waits for what should come soon, rather than hang if it never does.
-const WAIT: Duration = Duration::from_secs(10);
 /// The name of the unit of socket activation, which starts like the names of the stored FDs.
 const ACTIVATION: &str = "busd-session.socket";
 /// How many file descriptors fit in a message: `SCM_MAX_FD` of Linux, as unix(7) tells.

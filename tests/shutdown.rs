@@ -1,15 +1,13 @@
-use std::{env::temp_dir, pin::pin, time::Duration};
+use std::time::Duration;
 
-use busd::bus::Bus;
-use futures_util::future::{select, Either};
-use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
+use busd::{
+    bus::Bus,
+    testing::{init_tracing, unix_address, Running},
 };
+use ntest::timeout;
 use tracing::instrument;
 use zbus::{connection, fdo::DBusProxy, names::WellKnownName};
-use zruntime::{Event, SharedRuntime};
+use zruntime::SharedRuntime;
 
 /// Once a bus goes, and its clients with it, nothing is left of it: its peers, monitors and names
 /// go too.
@@ -17,29 +15,13 @@ use zruntime::{Event, SharedRuntime};
 #[instrument]
 #[timeout(30000)]
 fn shutdown() {
-    busd::tracing_subscriber::init();
+    init_tracing();
 
     zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        let mut bus = Bus::for_address(Some(&address)).await.unwrap();
+        let address = unix_address();
+        let bus = Bus::for_address(Some(&address)).await.unwrap();
         let peers = bus.peers().downgrade();
-        let stop = Event::new();
-        let stopped = stop.listen();
-
-        let handle = zruntime::spawn(async move {
-            {
-                let running = pin!(bus.run());
-                match select(stopped, running).await {
-                    Either::Left(_) => (),
-                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-                }
-            }
-
-            bus
-        });
+        let running = Running::new(bus);
 
         // A client that owns a name, and goes, which has the bus signal changes of owners.
         let client = connection::Builder::address(address.as_str())
@@ -55,8 +37,7 @@ fn shutdown() {
             .unwrap();
         drop(client);
 
-        stop.notify(usize::MAX);
-        let bus = handle.await.unwrap();
+        let bus = running.stop().await;
         bus.cleanup().await.unwrap();
 
         // The tasks that served the peers end in their own time.

@@ -278,23 +278,20 @@ fn unix_socket(addr: &SocketAddr) -> Result<UnixSocket> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
-        env, fs,
+        fs,
         os::unix::net::{SocketAddr, UnixListener, UnixStream},
     };
 
     use ntest::timeout;
-    use rand::{
-        distr::{Alphanumeric, SampleString},
-        rng,
-    };
 
     use super::*;
+    use crate::testing::socket_path;
 
     /// A socket file that no one listens on gets replaced, but not one that a bus listens on, nor a
     /// file of another kind.
     #[test]
     fn bind_replaces_a_stale_socket_file() {
-        let path = env::temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+        let path = socket_path();
         let addr = SocketAddr::from_pathname(&path).unwrap();
         // A listener that goes leaves its file behind.
         UnixListener::bind_addr(&addr).unwrap();
@@ -325,7 +322,7 @@ mod tests {
             net::{self, connect, listen, socket, AddressFamily, SocketAddrUnix, SocketType},
         };
 
-        let path = env::temp_dir().join(Alphanumeric.sample_string(&mut rng(), 10));
+        let path = socket_path();
         let unix = SocketAddrUnix::new(&path).unwrap();
         let listener = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
         net::bind(&listener, &unix).unwrap();

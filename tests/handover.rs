@@ -4,8 +4,6 @@
 
 use std::{
     collections::HashSet,
-    env::temp_dir,
-    future::IntoFuture,
     io::{self, IoSlice, Read, Write},
     mem::MaybeUninit,
     net::Shutdown,
@@ -18,7 +16,7 @@ use std::{
     pin::pin,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Once,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -29,16 +27,13 @@ use busd::{
     config::Config,
     peer::SEND_TIMEOUT,
     policy::{Ids, Policy},
+    testing::{self, init_tracing, unix_address, within, WAIT},
 };
 use futures_util::{
     future::{select, Either},
     StreamExt,
 };
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use rustix::{
     cmsg_space,
     net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags},
@@ -54,7 +49,7 @@ use zbus::{
     Connection, MatchRule, Message, MessageStream,
 };
 use zoter::Save;
-use zruntime::{Event, SharedRuntime, Task};
+use zruntime::SharedRuntime;
 
 /// The clients keep their unique names and the names that they own, and a client that connects
 /// once the next instance runs gets the number after theirs.
@@ -1842,19 +1837,6 @@ where
     .await;
 }
 
-/// Wait for `future`, for as long as a test can wait for what should come soon, rather than hang
-/// if it never does.
-async fn within<F>(future: F) -> F::Output
-where
-    F: IntoFuture,
-{
-    SharedRuntime::current()
-        .unwrap()
-        .timeout(WAIT, future)
-        .await
-        .expect("Timed out")
-}
-
 /// The file of the UNIX socket that `address` is of.
 fn socket_path(address: &str) -> String {
     let path = address.strip_prefix("unix:path=").unwrap();
@@ -1885,12 +1867,6 @@ fn owns_no_name() -> Policy {
     Policy::new(&config, &Ids::default(), rustix::process::getuid().as_raw())
 }
 
-/// Set the tracing subscriber up, once for all the tests of this file, which run in one process.
-fn init_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(busd::tracing_subscriber::init);
-}
-
 /// Run a bus on a UNIX socket of a random name, and return the address that its clients connect
 /// to.
 async fn start() -> (Running, String) {
@@ -1904,39 +1880,13 @@ fn serve(bus: Bus) -> (Running, String) {
     (Running::new(bus), address)
 }
 
-/// The address of a UNIX socket of a random name.
-fn unix_address() -> String {
-    let name = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(name);
-
-    format!("unix:path={}", path.display())
-}
-
-/// A bus that runs until it is stopped.
-struct Running {
-    stop: Event,
-    task: Task<Bus, zruntime::Shared>,
-}
+/// A bus that runs until it is stopped, and that can hand over to its next instance.
+struct Running(testing::Running);
 
 impl Running {
     /// Run `bus`.
-    fn new(mut bus: Bus) -> Self {
-        let stop = Event::new();
-        let stopped = stop.listen();
-        let task = zruntime::spawn(async move {
-            {
-                let running = pin!(bus.run());
-                match select(stopped, running).await {
-                    Either::Left(_) => (),
-                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-                }
-            }
-
-            bus
-        });
-
-        Self { stop, task }
+    fn new(bus: Bus) -> Self {
+        Self(testing::Running::new(bus))
     }
 
     /// Hand the bus over to its next instance, and run that.
@@ -1964,7 +1914,7 @@ impl Running {
 
     /// Stop the bus and clean up after it.
     async fn finish(self) {
-        self.stop().await.cleanup().await.unwrap();
+        self.0.finish().await;
         let _ = SharedRuntime::current()
             .unwrap()
             .sleep(Duration::ZERO)
@@ -1973,9 +1923,7 @@ impl Running {
 
     /// Stop the bus, and take it back.
     async fn stop(self) -> Bus {
-        self.stop.notify(usize::MAX);
-
-        self.task.await.unwrap()
+        self.0.stop().await
     }
 }
 
@@ -1990,9 +1938,6 @@ const LEAVER: &str = "org.zbus.Handover.Leaver";
 /// The name, interface and path of the bus.
 const BUS_NAME: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";
-
-/// How long a test waits for what should come soon, such as a message that is on its way.
-const WAIT: Duration = Duration::from_secs(10);
 
 /// How long a test waits to see that nothing more comes.
 const QUIET: Duration = Duration::from_millis(200);

@@ -2,7 +2,6 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    env::temp_dir,
     fs,
     net::TcpListener,
     os::{
@@ -13,7 +12,7 @@ use std::{
     pin::pin,
 };
 
-use busd::bus::Bus;
+use busd::{bus::Bus, testing::socket_path};
 use futures_util::future::{select, Either};
 use ntest::timeout;
 use rand::{
@@ -28,7 +27,7 @@ use zbus::{connection, fdo::DBusProxy};
 #[timeout(30000)]
 fn socket_file() {
     zruntime::block_on(async {
-        let path = temp_dir().join(random_name());
+        let path = socket_path();
         let listener = UnixListener::bind(&path).unwrap();
 
         let bus = Bus::for_listener(OwnedFd::from(listener)).await.unwrap();

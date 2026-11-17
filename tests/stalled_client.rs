@@ -1,5 +1,4 @@
 use std::{
-    env::temp_dir,
     fs::File,
     future::Future,
     io::{self, Read, Write},
@@ -9,22 +8,21 @@ use std::{
         fd::{BorrowedFd, OwnedFd},
         unix::net::UnixStream,
     },
-    pin::pin,
-    sync::{Arc, Once},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{ensure, Context};
-use busd::{bus::Bus, user::MAX_OBJECTS};
+use busd::{
+    bus::Bus,
+    testing::{connect, init_tracing, unix_address, with},
+    user::MAX_OBJECTS,
+};
 use futures_util::{
-    future::{join, select, try_join_all, Either},
+    future::{join, try_join_all},
     stream::StreamExt,
 };
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use tracing::instrument;
 use zbus::{
     connection::{
@@ -39,7 +37,7 @@ use zbus::{
     wire::Fd,
     Connection, MatchRule, Message, MessageStream,
 };
-use zruntime::{AsyncIo, Event, Shared, SharedRuntime};
+use zruntime::{AsyncIo, Shared, SharedRuntime};
 #[cfg(target_os = "linux")]
 use {
     busd::peer::MAX_MESSAGE_FDS,
@@ -1052,12 +1050,6 @@ const FLOOD_PAYLOAD: usize = 4096;
 const SEQUENCE: u32 = 200;
 const NAME_ROUNDS: usize = 20;
 
-/// Set the tracing subscriber up, once for all the tests of this file, which run in one process.
-fn init_tracing() {
-    static INIT: Once = Once::new();
-    INIT.call_once(busd::tracing_subscriber::init);
-}
-
 /// Run `test` against a bus of its own, at an address that it is given, which waits for each
 /// client to take a message for `send_timeout`.
 async fn with_bus<F, T>(send_timeout: Duration, test: F)
@@ -1075,37 +1067,11 @@ where
     F: FnOnce(String) -> T,
     T: Future<Output = anyhow::Result<()>>,
 {
-    let s = Alphanumeric.sample_string(&mut rng(), 10);
-    let path = temp_dir().join(s);
-    let address = format!("unix:path={}", path.display());
-    let mut bus = Bus::for_address(Some(&address)).await.unwrap();
+    let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
     bus.set_send_timeout(send_timeout);
     bus.set_max_objects_per_user(max_objects);
-    let stop = Event::new();
-    let stopped = stop.listen();
 
-    let handle = zruntime::spawn(async move {
-        {
-            let running = pin!(bus.run());
-            match select(stopped, running).await {
-                Either::Left(_) => (),
-                Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-            }
-        }
-
-        bus
-    });
-
-    let ret = test(address).await;
-    stop.notify(usize::MAX);
-    let bus = handle.await.unwrap();
-    bus.cleanup().await.unwrap();
-    ret.unwrap();
-}
-
-async fn connect(address: &str) -> zbus::Result<Connection> {
-    connection::Builder::address(address).build().await
+    with(bus, |bus| test(bus.address().to_owned())).await;
 }
 
 /// A client that is subscribed to every signal, and reads none, as [`stall`] has it.

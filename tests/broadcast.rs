@@ -1,16 +1,7 @@
-use std::{env::temp_dir, pin::pin};
-
 use anyhow::ensure;
-use busd::bus::Bus;
-use futures_util::{
-    future::{select, Either},
-    TryStreamExt,
-};
+use busd::testing::{init_tracing, with_bus};
+use futures_util::TryStreamExt;
 use ntest::timeout;
-use rand::{
-    distr::{Alphanumeric, SampleString},
-    rng,
-};
 use tracing::instrument;
 use zbus::{
     connection,
@@ -19,7 +10,6 @@ use zbus::{
     proxy::CacheProperties,
     MatchRule, MessageStream,
 };
-use zruntime::Event;
 
 /// Broadcast signals, which have no destination, reach the match rules that they match, and
 /// leave the bus running.
@@ -27,35 +17,11 @@ use zruntime::Event;
 #[instrument]
 #[timeout(30000)]
 fn broadcast_signals() {
-    busd::tracing_subscriber::init();
+    init_tracing();
 
-    zruntime::block_on(async {
-        let s = Alphanumeric.sample_string(&mut rng(), 10);
-        let path = temp_dir().join(s);
-        let address = format!("unix:path={}", path.display());
-        let mut bus = Bus::for_address(Some(&address)).await.unwrap();
-        let stop = Event::new();
-        let stopped = stop.listen();
-
-        let handle = zruntime::spawn(async move {
-            {
-                let running = pin!(bus.run());
-                match select(stopped, running).await {
-                    Either::Left(_) => (),
-                    Either::Right((Ok(()), _)) => panic!("Bus exited unexpectedly"),
-                    Either::Right((Err(e), _)) => panic!("Bus exited with an error: {e}"),
-                }
-            }
-
-            bus
-        });
-
-        let ret = broadcast_signals_(&address).await;
-        stop.notify(usize::MAX);
-        let bus = handle.await.unwrap();
-        bus.cleanup().await.unwrap();
-        ret.unwrap();
-    });
+    zruntime::block_on(with_bus(|address| async move {
+        broadcast_signals_(&address).await
+    }));
 }
 
 #[instrument]
