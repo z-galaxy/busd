@@ -131,7 +131,8 @@ serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtr
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2.191"
 
-# The tests and the benchmark restart busd through the fake service manager of zoter.
+# The tests restart busd through zoter's fake service manager, and the fake systemd of the
+# benchmark creates its stores with zoter's `testing::store`.
 [target.'cfg(target_os = "linux")'.dev-dependencies.zoter]
 version = "0.2.0"
 default-features = false
