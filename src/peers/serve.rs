@@ -17,20 +17,14 @@ use crate::{
 };
 
 impl Peers {
-    /// Serve `peer`, whose messages come out of `peer_stream`, until it goes, and then the monitor
-    /// that it becomes, if it becomes one.
+    /// Serve the peer represented by `served`, whose messages come from `peer_stream`, until the
+    /// peer goes. Then serve the monitor that it becomes, if it becomes one.
     pub(super) async fn serve_peer(
         self,
         mut peer_stream: Stream,
         mut cancellation_listener: EventListener,
-        peer: Served,
+        served: Served,
     ) -> Result<()> {
-        let Served {
-            unique_name,
-            id,
-            pending_calls,
-            caller,
-        } = peer;
         let mut batch = Vec::new();
         let mut outbox = Outbox::default();
         // Whether the peer became a monitor, or the bus pauses to hand over, rather than the peer
@@ -76,18 +70,13 @@ impl Peers {
                 }
             }
 
-            self.forward(
-                &unique_name,
-                id,
-                &caller,
-                &pending_calls,
-                &batch,
-                &mut outbox,
-            )
-            .await?;
+            self.forward(&served, &batch, &mut outbox).await?;
             batch.clear();
             if let Some(violation) = violation {
-                warn!("Disconnecting `{unique_name}`, as it sent {violation}");
+                warn!(
+                    "Disconnecting `{}`, as it sent {violation}",
+                    served.unique_name
+                );
 
                 break false;
             }
@@ -96,12 +85,12 @@ impl Peers {
             }
         };
         if canceled {
-            self.serve_on(peer_stream.into_inner(), unique_name, id)
+            self.serve_on(peer_stream.into_inner(), served.unique_name, served.id)
                 .await;
 
             return Ok(());
         }
-        trace!("Peer `{}` disconnected", unique_name);
+        trace!("Peer `{}` disconnected", served.unique_name);
 
         // The bus sends what follows on its own, which a hand-over has to wait for.
         let _chore = self.chore();
@@ -110,14 +99,14 @@ impl Peers {
         // one meanwhile: that, and the end of its stream, close its connection.
         {
             let mut routing = self.routing_mut().await;
-            if routing.remove_peer(unique_name.as_str()).is_none() {
+            if routing.remove_peer(served.unique_name.as_str()).is_none() {
                 // The bus cleaned up after the peer as it turned it into a monitor, and the
                 // `Monitoring` interface emits the signals then.
-                routing.monitors.remove(&unique_name);
+                routing.monitors.remove(&served.unique_name);
                 // This task may have forwarded calls that the peer sent after the one that made it
                 // a monitor, which can't get their replies to it either.
                 for peer in routing.peers.values() {
-                    peer.pending_calls().forget(id);
+                    peer.pending_calls().forget(served.id);
                 }
                 // A pause waits for the monitor no more.
                 #[cfg(target_os = "linux")]
@@ -130,8 +119,9 @@ impl Peers {
         #[cfg(target_os = "linux")]
         self.inner.paused_changed.notify(usize::MAX);
 
-        self.clean_up(&unique_name, id, pending_calls.take().collect())
-            .await
+        let waiting = served.pending_calls.take().collect();
+
+        self.clean_up(&served.unique_name, served.id, waiting).await
     }
 
     /// Go on with the peer `unique_name`, numbered `id`, whose messages come out of `stream`, now
@@ -270,13 +260,13 @@ impl Peers {
 
 /// What the task that serves a peer keeps of the peer: see [`Peers::serve_peer`].
 pub(super) struct Served {
-    unique_name: OwnedUniqueName,
+    pub(super) unique_name: OwnedUniqueName,
     /// The number of the peer.
-    id: usize,
+    pub(super) id: usize,
     /// The calls to the peer that wait for its reply.
-    pending_calls: Arc<PendingCalls>,
+    pub(super) pending_calls: Arc<PendingCalls>,
     /// The peer, as the caller of the calls that wait for replies.
-    caller: Arc<Caller>,
+    pub(super) caller: Arc<Caller>,
 }
 
 impl Served {

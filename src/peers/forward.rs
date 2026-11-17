@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::num::NonZeroU32;
 
 use anyhow::{bail, Result};
 use zbus::{
@@ -7,29 +7,29 @@ use zbus::{
     Message,
 };
 
-use super::{outbox::Outbox, Peers, Routing};
+use super::{outbox::Outbox, serve::Served, Peers, Routing};
 use crate::{
     debug, fdo,
     name_registry::NameRegistry,
-    peer::{Caller, Peer, PendingCalls, Refusal},
+    peer::{Peer, Recipient, Refusal},
     policy::Facts,
     trace, warn,
 };
 
 impl Peers {
-    /// Forward `msgs`, which the peer `sender`, numbered `sender_id`, sent in this order, to their
-    /// recipients, through the empty `outbox` of the task that serves `sender`. `caller` is
-    /// `sender`, as the caller of its calls that wait for replies.
+    /// Forward `msgs` from the peer represented by `sender`, preserving their order and using its
+    /// task's empty `outbox`. The bus sends each message to its recipients. The task that serves
+    /// the peer keeps `sender`.
     ///
     /// Each recipient gets those of `msgs` that go to it in one go, in order, and all of them get
     /// theirs at once.
     ///
-    /// A call that expects a reply is recorded as one that waits on its callee as it goes to the
-    /// callee, unless its caller has a call of the same serial waiting there already, or the user
-    /// of its caller has as many of the objects of the user of the callee as it may, in which case
-    /// the bus refuses it, with an error, as dbus-broker does. A reply, or an error, of `sender`
-    /// only goes on to its destination if it answers one of the calls that wait on `sender`,
-    /// `pending_calls`. The calls to the bus itself are not recorded, as with dbus-broker: the bus
+    /// When a call that expects a reply goes to its callee, the bus records it as a call that waits
+    /// on the callee. The bus refuses the call with an error instead, as dbus-broker does, in two
+    /// cases: the caller already has a call with the same serial waiting on the callee, or the
+    /// caller's user already has as many objects of the callee's user as it may. A reply or an
+    /// error from `sender` goes on to its destination only if it answers one of the calls that
+    /// wait on `sender`. As in dbus-broker, the bus doesn't record the calls to the bus itself: it
     /// answers them itself, so it refuses none of them, and its own replies go on whatever they
     /// answer.
     ///
@@ -52,190 +52,35 @@ impl Peers {
     /// passes every message on to its monitors before it routes it.
     pub(super) async fn forward(
         &self,
-        sender: &OwnedUniqueName,
-        sender_id: usize,
-        caller: &Arc<Caller>,
-        pending_calls: &PendingCalls,
+        sender: &Served,
         msgs: &[Message],
         outbox: &mut Outbox,
     ) -> Result<()> {
-        let from_bus = *sender == fdo::BUS_NAME;
         // The calls that the bus answers with an error of its own, and why.
         let mut rejected = Vec::new();
         // The recipients are picked under the lock, and only sent their messages without it.
         {
             let routing = self.routing().await;
-            let Routing {
-                peers,
-                monitors,
-                name_registry,
-                ..
-            } = &*routing;
-            // The sender is a peer no more if it became a monitor meanwhile.
-            let sender_peer = peers.get(sender.as_str());
+            let router = Router::new(&routing, sender);
             for (i, msg) in msgs.iter().enumerate() {
                 if msg.message_type() == message::Type::Signal {
-                    trace!("Broadcasting message: {:?}", msg);
-                    if let Some(sender_peer) = sender_peer {
-                        // Parsed only for the policy to look at, if it has to.
-                        let mut header = None;
-                        for (name, peer) in peers.iter() {
-                            if !peer.interested(msg, name_registry) {
-                                trace!("Peer {} not interested in {msg:?}", name);
-                                continue;
-                            }
-                            if denial(
-                                sender_peer,
-                                peer,
-                                || Facts::new(msg, header.get_or_insert_with(|| msg.header())),
-                                name_registry,
-                            )
-                            .is_some()
-                            {
-                                continue;
-                            }
-
+                    router.signal(msgs, i, outbox);
+                } else {
+                    match router.unicast(msg)? {
+                        Unicast::Deliver(peer) => {
                             let client = peer.client();
                             outbox.add(msgs, client.id(), client.recipient(), i);
                         }
-                    } else {
-                        trace!("Dropping {msg:?}, as `{sender}` is a peer no more");
-                    }
-                } else {
-                    let header = msg.header();
-                    // peer::Stream ensures a valid destination so this isn't exactly needed.
-                    let Some(destination) = header.destination() else {
-                        bail!("invalid message: {:?}", msg);
-                    };
-                    trace!(
-                        "Forwarding message: {:?}, destination: {}",
-                        msg,
-                        destination
-                    );
-                    let peer = match destination {
-                        BusName::Unique(name) => peers.get_key_value(name.as_str()),
-                        BusName::WellKnown(name) => name_registry
-                            .lookup(name)
-                            .and_then(|owner| peers.get_key_value(owner.as_str())),
-                    };
-                    let msg_type = msg.message_type();
-                    // A reply takes the record of the call that it answers away. One of the bus,
-                    // which keeps no records of the calls to it, goes on whatever it answers.
-                    let answers_none = !from_bus
-                        && matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
-                        && !match (peer, header.reply_serial()) {
-                            (Some((_, peer)), Some(serial)) => {
-                                pending_calls.remove(peer.client().id(), serial)
-                            }
-                            _ => false,
-                        };
-                    let primary = msg.primary_header();
-                    let flags = primary.flags();
-                    let is_call = msg_type == message::Type::MethodCall;
-                    let expects_reply =
-                        is_call && !flags.contains(message::Flags::NO_REPLY_EXPECTED);
-                    // The policy has its say on a call before the call waits for its reply.
-                    let denied = match (peer, sender_peer) {
-                        (Some((_, peer)), Some(sender_peer)) if is_call => denial(
-                            sender_peer,
-                            peer,
-                            || Facts::new(msg, &header),
-                            name_registry,
-                        ),
-                        _ => None,
-                    };
-                    match (peer, denied) {
-                        _ if answers_none => {
-                            debug!("{msg:?} answers no call that waits on {sender}")
-                        }
-                        _ if is_call && sender_peer.is_none() => {
-                            trace!("Dropping {msg:?}, as `{sender}` is a peer no more")
-                        }
-                        (Some(_), Some(rejection)) => {
-                            if expects_reply {
-                                rejected.push((msg.clone(), rejection));
-                            }
-                        }
-                        (Some((name, peer)), None) => {
-                            // The bus answers the calls to it itself, so they wait on no record.
-                            let refusal = if expects_reply && *name != fdo::BUS_NAME {
-                                peer.pending_calls()
-                                    .add(sender_id, caller, primary.serial_num())
-                                    .err()
-                            } else {
-                                None
-                            };
-                            match refusal {
-                                Some(refusal) => {
-                                    rejected.push((msg.clone(), Rejection::from(refusal)))
-                                }
-                                None => {
-                                    let client = peer.client();
-                                    outbox.add(msgs, client.id(), client.recipient(), i)
-                                }
-                            }
-                        }
-                        (None, _) => {
-                            debug!("no peer for destination `{destination}`");
-                            // The bus starts no services, so no name is one that a service can be
-                            // started for.
-                            if expects_reply {
-                                let rejection = if flags.contains(message::Flags::NO_AUTO_START) {
-                                    Rejection::NameHasNoOwner
-                                } else {
-                                    Rejection::ServiceUnknown
-                                };
-                                rejected.push((msg.clone(), rejection));
-                            }
-                        }
+                        Unicast::Reject(rejection) => rejected.push((msg.clone(), rejection)),
+                        Unicast::Drop => (),
                     }
                 }
-                if monitors.is_empty() {
-                    continue;
-                }
-                trace!(
-                    "Broadcasting message to {} monitors: {:?}",
-                    monitors.len(),
-                    msg
-                );
-                for (name, monitor) in monitors.iter() {
-                    if !monitor.interested(msg, name_registry) {
-                        trace!("Monitor {} not interested in {msg:?}", name);
-                        continue;
-                    }
-
-                    let client = monitor.client();
-                    outbox.add(msgs, client.id(), client.recipient(), i);
-                }
+                router.monitors(msgs, i, outbox);
             }
         }
 
         let dropped = outbox.send(msgs).await;
-        // A call that its callee can't take, for its file descriptors, waits for no reply, and gets
-        // an error from the bus instead, as with dbus-broker.
-        if !dropped.is_empty() {
-            let routing = self.routing().await;
-            for (recipient, msg) in dropped {
-                let primary = msg.primary_header();
-                if msg.message_type() != message::Type::MethodCall
-                    || primary.flags().contains(message::Flags::NO_REPLY_EXPECTED)
-                {
-                    continue;
-                }
-                let Some(callee) = recipient
-                    .unique_name()
-                    .and_then(|name| routing.peers.get(name))
-                else {
-                    continue;
-                };
-                if callee
-                    .pending_calls()
-                    .remove(sender_id, primary.serial_num())
-                {
-                    rejected.push((msg, Rejection::UnexpectedFds));
-                }
-            }
-        }
+        self.reject_dropped(sender, dropped, &mut rejected).await;
         for (msg, rejection) in rejected {
             let (name, description) = rejection.error();
             let error = Message::error(&msg.header(), name)
@@ -246,6 +91,231 @@ impl Peers {
 
         Ok(())
     }
+
+    /// Add the calls among `dropped` to `rejected`. `dropped` holds the messages from the peer
+    /// represented by `sender` that their recipients can't take because of their file descriptors,
+    /// each with its recipient.
+    ///
+    /// A call that its callee can't take doesn't wait for a reply. Instead, the bus answers it with
+    /// an error, as dbus-broker does.
+    async fn reject_dropped(
+        &self,
+        sender: &Served,
+        dropped: Vec<(Recipient, Message)>,
+        rejected: &mut Vec<(Message, Rejection)>,
+    ) {
+        if dropped.is_empty() {
+            return;
+        }
+        let routing = self.routing().await;
+        for (recipient, msg) in dropped {
+            let primary = msg.primary_header();
+            if msg.message_type() != message::Type::MethodCall
+                || primary.flags().contains(message::Flags::NO_REPLY_EXPECTED)
+            {
+                continue;
+            }
+            let Some(callee) = recipient
+                .unique_name()
+                .and_then(|name| routing.peers.get(name))
+            else {
+                continue;
+            };
+            if callee
+                .pending_calls()
+                .remove(sender.id, primary.serial_num())
+            {
+                rejected.push((msg, Rejection::UnexpectedFds));
+            }
+        }
+    }
+}
+
+/// Picks the recipients of one sender's messages, while the routing lock is held.
+struct Router<'r> {
+    routing: &'r Routing,
+    /// The sender's state, as kept by the task that serves the sender.
+    sender: &'r Served,
+    /// The sender, or `None` if it is not a peer anymore because it became a monitor meanwhile.
+    sender_peer: Option<&'r Peer>,
+    /// Whether the sender is the bus itself.
+    from_bus: bool,
+}
+
+impl<'r> Router<'r> {
+    fn new(routing: &'r Routing, sender: &'r Served) -> Self {
+        Self {
+            routing,
+            sender,
+            sender_peer: routing.peers.get(sender.unique_name.as_str()),
+            from_bus: sender.unique_name == fdo::BUS_NAME,
+        }
+    }
+
+    /// Add the signal at `i` in `msgs` to the share of each peer that it goes to and that the
+    /// policy lets receive it from the sender. If the sender is not a peer anymore, add the signal
+    /// to no share.
+    fn signal(&self, msgs: &[Message], i: usize, outbox: &mut Outbox) {
+        let msg = &msgs[i];
+        trace!("Broadcasting message: {:?}", msg);
+        let Some(sender_peer) = self.sender_peer else {
+            trace!(
+                "Dropping {msg:?}, as `{}` is a peer no more",
+                self.sender.unique_name
+            );
+
+            return;
+        };
+        let name_registry = &self.routing.name_registry;
+        // Parsed only for the policy to look at, if it has to.
+        let mut header = None;
+        for (name, peer) in self.routing.peers.iter() {
+            if !peer.interested(msg, name_registry) {
+                trace!("Peer {} not interested in {msg:?}", name);
+                continue;
+            }
+            if denial(
+                sender_peer,
+                peer,
+                || Facts::new(msg, header.get_or_insert_with(|| msg.header())),
+                name_registry,
+            )
+            .is_some()
+            {
+                continue;
+            }
+
+            let client = peer.client();
+            outbox.add(msgs, client.id(), client.recipient(), i);
+        }
+    }
+
+    /// Decide what becomes of `msg`, a call, a reply or an error from the sender.
+    ///
+    /// A reply or an error removes the record of the call that it answers. A call that goes on to
+    /// its callee and expects a reply is recorded as a call that waits on the callee.
+    fn unicast(&self, msg: &Message) -> Result<Unicast<'r>> {
+        let Routing {
+            peers,
+            name_registry,
+            ..
+        } = self.routing;
+        let sender = &self.sender.unique_name;
+        let header = msg.header();
+        // peer::Stream ensures a valid destination so this isn't exactly needed.
+        let Some(destination) = header.destination() else {
+            bail!("invalid message: {:?}", msg);
+        };
+        trace!(
+            "Forwarding message: {:?}, destination: {}",
+            msg,
+            destination
+        );
+        let peer = match destination {
+            BusName::Unique(name) => peers.get_key_value(name.as_str()),
+            BusName::WellKnown(name) => name_registry
+                .lookup(name)
+                .and_then(|owner| peers.get_key_value(owner.as_str())),
+        };
+        let msg_type = msg.message_type();
+        // A reply removes the record of the call that it answers. A reply from the bus goes on
+        // whatever it answers, because the bus keeps no records of the calls to it.
+        let answers_none = !self.from_bus
+            && matches!(msg_type, message::Type::MethodReturn | message::Type::Error)
+            && !match (peer, header.reply_serial()) {
+                (Some((_, peer)), Some(serial)) => {
+                    self.sender.pending_calls.remove(peer.client().id(), serial)
+                }
+                _ => false,
+            };
+        let primary = msg.primary_header();
+        let flags = primary.flags();
+        let is_call = msg_type == message::Type::MethodCall;
+        let expects_reply = is_call && !flags.contains(message::Flags::NO_REPLY_EXPECTED);
+        // The policy has its say on a call before the call waits for its reply.
+        let denied = match (peer, self.sender_peer) {
+            (Some((_, peer)), Some(sender_peer)) if is_call => denial(
+                sender_peer,
+                peer,
+                || Facts::new(msg, &header),
+                name_registry,
+            ),
+            _ => None,
+        };
+
+        Ok(match (peer, denied) {
+            _ if answers_none => {
+                debug!("{msg:?} answers no call that waits on {sender}");
+
+                Unicast::Drop
+            }
+            _ if is_call && self.sender_peer.is_none() => {
+                trace!("Dropping {msg:?}, as `{sender}` is a peer no more");
+
+                Unicast::Drop
+            }
+            (Some(_), Some(rejection)) if expects_reply => Unicast::Reject(rejection),
+            (Some(_), Some(_)) => Unicast::Drop,
+            (Some((name, peer)), None) => {
+                // The bus answers the calls to it itself, so they wait on no record.
+                let refusal = if expects_reply && *name != fdo::BUS_NAME {
+                    peer.pending_calls()
+                        .add(self.sender.id, &self.sender.caller, primary.serial_num())
+                        .err()
+                } else {
+                    None
+                };
+                match refusal {
+                    Some(refusal) => Unicast::Reject(Rejection::from(refusal)),
+                    None => Unicast::Deliver(peer),
+                }
+            }
+            (None, _) => {
+                debug!("no peer for destination `{destination}`");
+                // The bus starts no services, so no service can be started for any name.
+                if !expects_reply {
+                    Unicast::Drop
+                } else if flags.contains(message::Flags::NO_AUTO_START) {
+                    Unicast::Reject(Rejection::NameHasNoOwner)
+                } else {
+                    Unicast::Reject(Rejection::ServiceUnknown)
+                }
+            }
+        })
+    }
+
+    /// Add the message at `i` in `msgs` to the share of each monitor that watches it.
+    fn monitors(&self, msgs: &[Message], i: usize, outbox: &mut Outbox) {
+        let monitors = &self.routing.monitors;
+        if monitors.is_empty() {
+            return;
+        }
+        let msg = &msgs[i];
+        trace!(
+            "Broadcasting message to {} monitors: {:?}",
+            monitors.len(),
+            msg
+        );
+        for (name, monitor) in monitors.iter() {
+            if !monitor.interested(msg, &self.routing.name_registry) {
+                trace!("Monitor {} not interested in {msg:?}", name);
+                continue;
+            }
+
+            let client = monitor.client();
+            outbox.add(msgs, client.id(), client.recipient(), i);
+        }
+    }
+}
+
+/// What becomes of a message with a destination: a call, a reply or an error.
+enum Unicast<'r> {
+    /// It goes on to this peer, its destination.
+    Deliver(&'r Peer),
+    /// The bus answers it with an error of its own.
+    Reject(Rejection),
+    /// It goes nowhere, and gets no answer.
+    Drop,
 }
 
 /// Why the policy keeps the message of `facts` from going from `sender` to `receiver`, if it does:
