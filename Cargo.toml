@@ -170,14 +170,17 @@ strip = "none"
 git = "https://github.com/z-galaxy/zoter"
 rev = "4a89183d62ed13ae3278e38c0565de6b98122707"
 
-# The zbus on crates.io builds on zoter 0.1, and busd stores the hand-overs of zbus in those of the
-# zoter that it builds on itself, so the two have to build on one. busd also hands the connection
-# on which it serves the D-Bus API over to its next instance, with its object server
-# (`Connection::hand_over`), has the signals that follow its replies be part of their calls, for
-# that hand-over to wait for them (`ResponseDispatchNotifier::followed_by`), and hands both ends of
-# that connection over as one item of the hand-over (`ChannelHandover`). zbus is yet to release
-# those: until it does, busd builds on the revision of zbus that has them. This goes as busd takes
-# that release from crates.io.
+# The zbus on crates.io builds on zoter 0.1. busd stores zbus's hand-overs inside the hand-overs
+# of its own zoter, so both must build on the same zoter. busd also needs these zbus changes:
+# - It hands the connection on which it serves the D-Bus API over to its next instance, together
+#   with its object server (`Connection::hand_over`).
+# - It makes the signals that follow its replies part of their calls, so that this hand-over
+#   waits for them (`ResponseDispatchNotifier::followed_by`).
+# - It hands both ends of that connection over as one item of the hand-over (`ChannelHandover`).
+# - It answers the calls that wait on a peer that leaves, from the caller and the serial of each
+#   call, which is all it keeps of them (`Message::error_for_serial`).
+# zbus has not released these yet. Until it does, busd builds on the zbus revision that has them.
+# This patch goes away when busd takes that release from crates.io.
 [patch.crates-io.zbus]
 git = "https://github.com/z-galaxy/zbus"
 rev = "941b3a699dfa888e95309b5469671d06e666c41e"

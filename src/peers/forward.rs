@@ -314,14 +314,9 @@ where
 /// The `NoReply` error, from the bus, to the call of `caller` with `serial`, as dbus-broker sends
 /// to each call that waits on a peer that goes.
 pub(super) fn no_reply(caller: &OwnedUniqueName, serial: NonZeroU32) -> zbus::Result<Message> {
-    // zbus only builds an error as the reply to the header of a call, and the bus doesn't keep the
-    // calls themselves. A call of `caller` with `serial` has all that the error takes of it.
-    let call = Message::method_call(fdo::DBus::PATH, "Call")
-        .sender(caller)
-        .serial(serial)
-        .build(&())?;
-
-    Message::error(&call.header(), "org.freedesktop.DBus.Error.NoReply")
+    // The bus doesn't keep the calls themselves. The error needs only the caller and the serial
+    // of a call.
+    Message::error_for_serial(caller, serial, "org.freedesktop.DBus.Error.NoReply")
         .sender(fdo::BUS_NAME)
         .build(&"Remote peer disconnected")
 }
