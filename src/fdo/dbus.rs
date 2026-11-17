@@ -267,7 +267,7 @@ impl DBus {
             .and_then(|c| {
                 c.process_id().ok_or_else(|| {
                     Error::UnixProcessIdUnknown(format!(
-                        "Could not determine Unix user ID of `{bus_name}`"
+                        "Could not determine Unix process ID of `{bus_name}`"
                     ))
                 })
             })
