@@ -481,6 +481,34 @@ fn no_start_without_a_usable_store() {
     }
 }
 
+/// The bus listens on one socket: with a second socket of socket activation, it listens on the
+/// first, where it serves its clients, and ignores the second, whose file, which is systemd's, it
+/// leaves where it is.
+#[test]
+#[timeout(60000)]
+fn start_on_the_first_of_two_sockets() {
+    let _serial = serialize();
+    let socket = Removed(socket_path());
+    let address = socket.address();
+    let mut systemd = Systemd::activating(&socket.0);
+    let second = Removed(socket_path());
+    let listener = UnixListener::bind(&second.0).unwrap();
+    systemd
+        .manager
+        .add_socket("busd-other.socket", listener.into());
+
+    let mut busd = Busd::spawn(&mut systemd, &address, FDSTORE_MAX);
+    systemd.until_ready();
+    let client = Client::connect(&address, None);
+    assert_eq!(
+        owner(&client, "org.freedesktop.DBus"),
+        "org.freedesktop.DBus"
+    );
+
+    hand_over(&mut busd, &mut systemd, &socket);
+    assert!(second.0.exists(), "busd removed {}", second.0.display());
+}
+
 /// A bus with a store that systemd passed no socket of socket activation for fails to start, as
 /// it tells systemd that it has started while its clients wait in such a socket. It tells systemd
 /// nothing, and binds no socket at its address.

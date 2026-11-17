@@ -116,16 +116,18 @@ impl Bus {
     /// [`Bus::hand_over_to_systemd`] does, if one did, and tells systemd that it has started as it
     /// does, while its clients wait in the socket of the socket activation. The bus listens on
     /// that socket, whatever `address` says: the store of [`zoter::Store::from_env`] comes with
-    /// one, and this fails if systemd passed none, as it does if systemd passed more than one,
-    /// since busd listens on one socket. Taking over may fail, as when the previous instance
-    /// encoded its state otherwise, or when what it handed over doesn't fit under the limit of
-    /// open FDs of this one: the clients that were handed over get disconnected then, and the bus
-    /// starts as if nothing was handed over. What was stored is removed from the store first, so
-    /// that whatever comes of it, the instances that come after don't find it again.
+    /// one, and this fails if systemd passed none. busd listens on one socket: where systemd
+    /// passed more than one listening socket of socket activation, it listens on the first, and
+    /// closes the others with a warning, which leaves the clients that connect to those without an
+    /// answer. Taking over may fail, as when the previous instance encoded its state otherwise, or
+    /// when what it handed over doesn't fit under the limit of open FDs of this one: the clients
+    /// that were handed over get disconnected then, and the bus starts as if nothing was handed
+    /// over. What was stored is removed from the store first, so that whatever comes of it, the
+    /// instances that come after don't find it again.
     ///
     /// Without a store, the bus takes nothing over, and doesn't tell systemd anything. It listens
-    /// on the socket of the socket activation, if systemd passed one, and otherwise at `address`,
-    /// as [`Bus::for_address`] does.
+    /// on the first socket of the socket activation, if systemd passed one, as above, and otherwise
+    /// at `address`, as [`Bus::for_address`] does.
     ///
     /// The bus goes by `policy`, as [`Bus::set_policy`] sets it, and the clients that it takes over
     /// do from the start, as with [`Bus::take_over`].
@@ -146,7 +148,7 @@ impl Bus {
                 None
             })
         });
-        let mut bus = match (Self::take_activation(passed)?, restored) {
+        let mut bus = match (Self::take_activation(passed), restored) {
             (None, _) if has_store => bail!(
                 "A bus with a file descriptor store needs a socket of socket activation to \
                  listen on, and systemd passed none."
@@ -219,19 +221,27 @@ impl Bus {
     }
 
     /// The listening socket of the socket activation, if systemd passed one, out of `passed`, from
-    /// which zoter took what was stored.
+    /// which zoter took what was stored: the first of what is left.
     ///
-    /// The others are listening sockets of socket activation too, which have the names of their
-    /// units by default, such as `busd.socket`. busd listens on one, so this fails if there is
-    /// more than one.
-    fn take_activation(passed: Passed) -> Result<Option<OwnedFd>> {
-        let mut sockets = passed.into_vec().into_iter().map(|(_, fd)| fd);
-        let activation = sockets.next();
-        if sockets.next().is_some() {
-            bail!("systemd passed more than one socket to listen on: busd listens on one.");
+    /// What comes after it is listening sockets of socket activation too, which have the names of
+    /// their units by default, such as `busd.socket`, or, for a bus without a store, what was
+    /// stored. busd listens on one socket, so it closes those, with a warning that names them:
+    /// systemd keeps such a socket open, so the clients that connect to it get no answer.
+    fn take_activation(passed: Passed) -> Option<OwnedFd> {
+        let mut passed = passed.into_vec().into_iter();
+        let (kept, activation) = passed.next()?;
+        let ignored: Vec<_> = passed.map(|(name, _)| name).collect();
+        if !ignored.is_empty() {
+            warn!(
+                "Ignoring what systemd passed after `{kept}`, as the bus listens on one socket, \
+                 the first that systemd passed: `{}`. The clients that connect to a socket among \
+                 these get no answer, as systemd keeps it open: remove it from the socket units \
+                 of the service.",
+                ignored.join("`, `")
+            );
         }
 
-        Ok(activation)
+        Some(activation)
     }
 
     /// The next instance of the bus that handed `restored` over, on `activation`, the listening

@@ -180,6 +180,10 @@ lacks. The `Requires=` has systemd start the service only with its socket. A uni
 without: it disconnects its clients as it stops. Under a systemd older than 254, leave both
 `Type=notify` and `FileDescriptorStoreMax=` out of the unit.
 
+busd listens on one socket. If systemd passes it more than one, as for a socket unit with two
+`ListenStream=`, it listens on the first, and ignores the others with a warning: the clients that
+connect to those get no answer.
+
 ### Profile-guided optimization
 
 Those who build busd for others, such as distributions, can optimize it for the traffic of a bus,
