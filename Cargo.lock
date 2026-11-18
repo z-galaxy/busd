@@ -88,7 +88,6 @@ dependencies = [
  "simple-mermaid",
  "tracing",
  "tracing-subscriber",
- "xdg-home",
  "zbus",
  "zoter",
  "zruntime",
@@ -1545,16 +1544,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "xdg-home"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec1cdab258fb55c0da61328dc52c8764709b249011b2cad0454c72f0bf10a1f6"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
 ]
 
 [[package]]

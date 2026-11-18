@@ -71,7 +71,6 @@ anyhow = "1.0.82"
 # Explicitly depend on serde to enable `rc` feature.
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false, features = ["alloc"] }
-xdg-home = "1.1.0"
 zruntime = { version = "0.2.2", features = [
     "fs",
     "helper",
