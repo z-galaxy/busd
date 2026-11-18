@@ -77,22 +77,19 @@ fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     let passed = unsafe { zoter::Passed::from_env() }?;
 
-    zruntime::block_on(run(
-        raised,
-        #[cfg(target_os = "linux")]
-        passed,
-    ))
-}
-
-async fn run(
-    raised: rustix::io::Result<()>,
-    #[cfg(target_os = "linux")] passed: zoter::Passed,
-) -> Result<()> {
+    // Only now, as the subscriber may open file descriptors or start threads of its own.
     busd::tracing_subscriber::init();
     if let Err(e) = raised {
         warn!("Failed to raise the limit of open file descriptors: {e}");
     }
 
+    zruntime::block_on(run(
+        #[cfg(target_os = "linux")]
+        passed,
+    ))
+}
+
+async fn run(#[cfg(target_os = "linux")] passed: zoter::Passed) -> Result<()> {
     let mut args = Args::parse();
     let config = read_config(&args, Path::new(SESSION_CONFIG))?;
 
