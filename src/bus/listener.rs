@@ -6,9 +6,14 @@ use rustix::net::{sockopt, AddressFamily, SocketType};
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::path::Path;
-use std::{io, os::unix::net::SocketAddr};
+use std::{
+    io,
+    os::unix::net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Result};
+use rustix::io::Errno;
 use zbus::{
     address::{
         transport::{Unix, UnixSocket},
@@ -18,12 +23,14 @@ use zbus::{
 };
 use zruntime::{fs::remove_file, Shared, SharedRuntime};
 
-use crate::info;
+use crate::{debug, info, warn};
 
 /// The socket on which the bus accepts its clients.
 #[derive(Debug)]
 pub(super) struct Listener {
     socket: zruntime::net::unix::UnixListener<Shared>,
+    /// When the listener last logged a warning that accepting a connection failed.
+    warned: Option<Instant>,
     /// The socket to which clients connect to reach the bus.
     unix: Unix,
     /// Whether the bus bound the socket itself. If not, the bus took the socket from whoever
@@ -46,6 +53,7 @@ impl Listener {
 
         Ok(Self {
             socket,
+            warned: None,
             unix,
             bound: true,
         })
@@ -77,6 +85,7 @@ impl Listener {
 
         Ok(Self {
             socket,
+            warned: None,
             unix: Unix::new(unix),
             bound,
         })
@@ -90,12 +99,59 @@ impl Listener {
     }
 
     /// The next client that connects.
-    pub(super) async fn accept(&self) -> io::Result<std::os::unix::net::UnixStream> {
-        let (stream, _) = self.socket.accept().await?;
+    ///
+    /// Accepting fails when the bus or the system runs out of resources: file descriptors
+    /// (`EMFILE`, `ENFILE`) or memory (`ENOBUFS`, `ENOMEM`). On Linux, `accept4` reserves a file
+    /// descriptor before it checks for a pending connection, so it fails as soon as the bus has
+    /// none left, even when no client is connecting.
+    ///
+    /// Such a failure pauses accepting new connections, while the bus keeps serving its existing
+    /// clients and new clients wait in the socket's backlog. The listener retries after a delay
+    /// that starts at [`FIRST_WAIT`] and doubles with each failed attempt, up to [`LONGEST_WAIT`].
+    /// It logs a warning at most once every [`WARN_INTERVAL`], and logs again when it accepts a
+    /// connection after a warning. If a client disconnects before its connection is accepted
+    /// (`ECONNABORTED`), the listener retries at once.
+    ///
+    /// This returns an error only when retrying can't help (`EBADF`, `EFAULT`, `EINVAL`,
+    /// `ENOTSOCK` and `EOPNOTSUPP`): the listening socket is broken, or the call is invalid.
+    pub(super) async fn accept(&mut self) -> io::Result<std::os::unix::net::UnixStream> {
+        let mut wait = Duration::ZERO;
+        let mut warned = false;
+        loop {
+            let e = match self.socket.accept().await {
+                Ok((stream, _)) => {
+                    if warned {
+                        info!("Accepting new connections again.");
+                    }
 
-        // zbus is given the standard library stream that the zruntime one wraps, and the
-        // connection then drives it on the runtime it is built on.
-        Ok(stream.into_std())
+                    // zbus is given the standard library stream that the zruntime one wraps, and
+                    // the connection then drives it on the runtime it is built on.
+                    return Ok(stream.into_std());
+                }
+                Err(e) => e,
+            };
+            match Errno::from_io_error(&e) {
+                Some(
+                    Errno::BADF | Errno::FAULT | Errno::INVAL | Errno::NOTSOCK | Errno::OPNOTSUPP,
+                ) => return Err(e),
+                Some(Errno::CONNABORTED) => {
+                    debug!("A client disconnected before its connection was accepted.");
+
+                    continue;
+                }
+                _ => (),
+            }
+            if !warned && self.warned.is_none_or(|at| at.elapsed() >= WARN_INTERVAL) {
+                warn!(
+                    "Failed to accept a new connection: {e}. Retrying, while existing clients are \
+                     still served."
+                );
+                self.warned = Some(Instant::now());
+                warned = true;
+            }
+            wait = (wait * 2).clamp(FIRST_WAIT, LONGEST_WAIT);
+            self.socket.runtime().sleep(wait).await;
+        }
     }
 
     /// Whether the bus bound the socket itself.
@@ -120,6 +176,17 @@ impl Listener {
         }
     }
 }
+
+/// The delay before the first retry, after accepting a connection fails.
+const FIRST_WAIT: Duration = Duration::from_millis(5);
+
+/// The longest delay between retries, however long accepting keeps failing.
+const LONGEST_WAIT: Duration = Duration::from_secs(1);
+
+/// The shortest time between two warnings that accepting a connection failed. A bus that keeps
+/// running out of file descriptors, and accepts a connection each time some are freed, so doesn't
+/// log a warning for every connection.
+const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The address to listen on for `unix`, and the socket that clients connect to.
 ///

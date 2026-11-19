@@ -2,6 +2,14 @@
 
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixDatagram;
+#[cfg(all(target_os = "linux", feature = "tracing-subscriber"))]
+use std::{
+    collections::HashSet,
+    io::Write,
+    os::unix::net::UnixStream,
+    process::ChildStderr,
+    sync::mpsc::{self, Receiver},
+};
 use std::{
     env::temp_dir,
     fs,
@@ -21,6 +29,8 @@ use rand::{
     distr::{Alphanumeric, SampleString},
     rng,
 };
+#[cfg(all(target_os = "linux", feature = "tracing-subscriber"))]
+use rustix::process::{getuid, prlimit, Resource, Rlimit};
 use rustix::process::{kill_process, Pid, Signal};
 use zbus::{connection, fdo, Address, Connection};
 
@@ -146,6 +156,65 @@ fn reloads_its_configuration() {
     assert!(status.success(), "busd exited with {status}");
 }
 
+/// When busd runs out of file descriptors, it keeps serving its existing clients instead of
+/// stopping, and logs a single warning. Once some clients disconnect, it accepts the client that
+/// was waiting.
+#[cfg(all(target_os = "linux", feature = "tracing-subscriber"))]
+#[test]
+#[timeout(30000)]
+fn serves_its_clients_out_of_file_descriptors() {
+    let path = socket_path();
+    let mut command = Busd::command(&format!("unix:path={}", path.display()), None);
+    command.stderr(Stdio::piped());
+    let mut busd = Busd::start(command);
+    let address = busd.address();
+    let logs = Logs::of(busd.child.stderr.take().unwrap());
+    let served = zruntime::block_on(connection::Builder::address(address.clone()).build()).unwrap();
+
+    let late = {
+        // Clients stuck in their handshake: busd keeps file descriptors open for each until it
+        // disconnects.
+        let _held = [authenticating(&path), authenticating(&path)];
+        // From now on, busd can't open another file descriptor: every one below the limit is open,
+        // as the kernel always hands out the lowest free one, the ones held for `_held` included.
+        let pid = Pid::from_child(&busd.child);
+        let limit = Some(lowest_free_fd(pid));
+        let limit = Rlimit {
+            current: limit,
+            maximum: limit,
+        };
+        prlimit(Some(pid), Resource::Nofile, limit).unwrap();
+
+        let late = thread::spawn(move || {
+            zruntime::block_on(async {
+                let conn = connection::Builder::address(address).build().await?;
+                call_bus(&conn, "GetId", &()).await?;
+
+                zbus::Result::Ok(())
+            })
+        });
+        let warning = logs.until("Failed to accept a new connection");
+        assert!(warning.contains("Too many open files"), "{warning}");
+        zruntime::block_on(call_bus(&served, "GetId", &())).unwrap();
+        // Meanwhile, busd keeps retrying to accept the late client.
+        thread::sleep(Duration::from_secs(2));
+        assert!(busd.child.try_wait().unwrap().is_none(), "busd stopped");
+        let warnings: Vec<_> = logs
+            .so_far()
+            .into_iter()
+            .filter(|line| line.contains("Failed to accept a new connection"))
+            .collect();
+        assert!(warnings.is_empty(), "busd warned again: {warnings:?}");
+
+        late
+    };
+
+    late.join().unwrap().unwrap();
+    logs.until("Accepting new connections again");
+    let status = busd.stop(Signal::TERM);
+    assert!(status.success(), "busd exited with {status}");
+}
+
 /// Write a configuration to `path` whose policy lets everyone send and receive everything, and
 /// has the rule `own` for the names that they ask for.
 fn write_config(path: &Path, own: &str) {
@@ -179,6 +248,89 @@ where
         .await?;
 
     Ok(())
+}
+
+/// A client that connects to the bus listening at `path` and authenticates, but never sends
+/// `BEGIN`: busd keeps the file descriptors of its handshake open until the client disconnects.
+///
+/// This waits for busd to accept the authentication, by which time busd has opened all of them.
+#[cfg(all(target_os = "linux", feature = "tracing-subscriber"))]
+fn authenticating(path: &Path) -> UnixStream {
+    let mut client = UnixStream::connect(path).unwrap();
+    let uid: String = getuid()
+        .as_raw()
+        .to_string()
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    write!(client, "\0AUTH EXTERNAL {uid}\r\n").unwrap();
+    let mut reply = String::new();
+    BufReader::new(&client).read_line(&mut reply).unwrap();
+    assert!(reply.starts_with("OK "), "busd replied `{reply}`");
+
+    client
+}
+
+/// The lowest file descriptor number that the process `pid` doesn't have open. With its limit of
+/// open file descriptors set to this, the process can't open any more.
+#[cfg(all(target_os = "linux", feature = "tracing-subscriber"))]
+fn lowest_free_fd(pid: Pid) -> u64 {
+    let open: HashSet<u64> = fs::read_dir(format!("/proc/{}/fd", pid.as_raw_pid()))
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+
+    (0..).find(|fd| !open.contains(fd)).unwrap()
+}
+
+/// The lines that busd logs, as it logs them.
+#[cfg(all(target_os = "linux", feature = "tracing-subscriber"))]
+struct Logs(Receiver<String>);
+
+#[cfg(all(target_os = "linux", feature = "tracing-subscriber"))]
+impl Logs {
+    /// The lines that busd logs to `stderr`, read on a thread of their own.
+    fn of(stderr: ChildStderr) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self(receiver)
+    }
+
+    /// Waits a few seconds at most for busd to log a line that contains `text`, and returns it.
+    fn until(&self, text: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .0
+                .recv_timeout(timeout)
+                .unwrap_or_else(|e| panic!("busd logged no `{text}`: {e}"));
+            if line.contains(text) {
+                return line;
+            }
+        }
+    }
+
+    /// The lines that busd logged since the last of them that was looked at.
+    fn so_far(&self) -> Vec<String> {
+        self.0.try_iter().collect()
+    }
 }
 
 /// A busd process, killed if it's still running when dropped.
