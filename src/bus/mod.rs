@@ -137,6 +137,13 @@ impl Bus {
         self.peers.set_reload(read).await;
     }
 
+    /// Accept new connections, and serve each client in its own task, until the listening socket
+    /// breaks.
+    ///
+    /// When accepting fails because the bus runs out of resources, such as file descriptors, the
+    /// bus pauses accepting new connections, keeps serving its existing clients, and retries until
+    /// accepting succeeds. This returns only when the listening socket is broken, with the error
+    /// that says so.
     pub async fn run(&mut self) -> Result<()> {
         loop {
             self.accept_next().await?;
