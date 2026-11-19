@@ -170,6 +170,16 @@ strip = "none"
 git = "https://github.com/z-galaxy/zoter"
 rev = "4a89183d62ed13ae3278e38c0565de6b98122707"
 
+# busd needs this zruntime change:
+# - Sockets hand out the runtime they run on (`UnixListener::runtime`). The bus waits on that
+#   runtime's timer between retries when accepting a connection fails.
+# zruntime hasn't released it yet. Until it does, busd builds on the zruntime revision that has it.
+# The patch also applies to the zruntime that zbus depends on, so Cargo builds a single zruntime
+# that both share. This patch goes away when busd takes that release from crates.io.
+[patch.crates-io.zruntime]
+git = "https://github.com/z-galaxy/zruntime"
+rev = "26b51091f57ce27a38b4e1f058ef050988d6d491"
+
 # The zbus on crates.io builds on zoter 0.1. busd stores zbus's hand-overs inside the hand-overs
 # of its own zoter, so both must build on the same zoter. busd also needs these zbus changes:
 # - It hands the connection on which it serves the D-Bus API over to its next instance, together
