@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.8.0 - 2026-11-20
+
+### 💥 Breaking
+- Need a socket unit and a file descriptor store under `Type=notify`.
+
+### ♻️ Changed
+- Listen on the first socket that systemd passes and ignore the rest.
+- Hand the bus's own connection over rather than flush it.
+- Set up logging in main rather than in run.
+- Move the hand-over benchmark setup to benches/bus/handover.rs.
+- Move the pairs self-test and statistics into their own files.
+- Split Peers::forward into a Router with one method per step.
+- Narrow the visibility of the fields of Routing, Facts and Handover.
+- Add fdo::upgrade for the interfaces' weak reference to the peers.
+- Send all name-owner signals from Peers::notify_name_changes.
+- Add NameOwner::with_flags to build an owner from request flags.
+- Make the NameRegistry methods and Peer::hello synchronous.
+- Build NoReply errors with Message::error_for_serial.
+- Add peer::Client for the state that Peer and Monitor share.
+- Share the timeout handling of sends and flushes to a client.
+- Extract bus::Listener for the socket that the bus listens on.
+- Flatten Bus by removing bus::Inner.
+- Make Peers a handle that holds its Arc.
+- Move the bus's chore counters into a Chores handle.
+- Move the hand-over state types to peers::handover.
+- Add config::MessageMatch for what a rule says about a message.
+- Convert the XML elements to config types in config::xml.
+- Give config::Rule named fields.
+- Split peers.rs into one module per responsibility.
+- Move the larger unit tests into their own files.
+
+### 📦 Dependencies
+- Take zoter 0.2 and zbus 6.4 from crates.io.
+- Take zruntime 0.2.4 from crates.io.
+- Update the dependencies to their latest compatible releases.
+- Update clap to v4.6.9 (#485).
+- Update rand to v0.10.4 (#479).
+- Drop unused `xdg-home` dep.
+
+### 📝 Documentation
+- Document peer::Monitor and Monitor::interested.
+- Document the next_id and _self_conn fields of Bus.
+- Better describe the project status.
+
+### 🐛 Fixed
+- Keep serving existing clients when accepting a connection fails. #477
+
+### ⚙️ Other
+- 💬 Name the process ID in the GetConnectionUnixProcessID error.
+
+### ⚡️ Performance
+- Release a leaving peer's names without scanning every name.
+
+### ✅ Testing
+- Use busd::testing in the tests.
+- Add busd::testing with the helpers that the tests share.
+- Pin the encoding of the hand-over state with a test.
+
 ## 0.7.0 - 2026-11-13
 
 ### ✨ Added
