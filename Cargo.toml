@@ -49,7 +49,7 @@ harness = false
 bench = false
 
 [dependencies]
-zbus = { version = "6.3.0", features = [
+zbus = { version = "6.4.0", features = [
     "default-rt",
     "bus-impl",
     "service",
@@ -71,7 +71,7 @@ anyhow = "1.0.82"
 # Explicitly depend on serde to enable `rc` feature.
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false, features = ["alloc"] }
-zruntime = { version = "0.2.2", features = [
+zruntime = { version = "0.2.4", features = [
     "fs",
     "helper",
     "lock",
@@ -104,7 +104,7 @@ tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
 [dev-dependencies]
 # The tests drive the bus through proxies, which the binary itself does not need. The benchmarks
 # send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte by byte.
-zbus = { version = "6.3.0", features = [
+zbus = { version = "6.4.0", features = [
     "proxy",
     "serde_bytes",
 ], default-features = false }
@@ -120,7 +120,7 @@ serde = { version = "1.0.200", features = ["derive"] }
 serde_bytes = "0.11.19"
 # The channels that stop the services and the bus of the benchmarks, and hand the replies on a
 # shared connection to their callers.
-zruntime = { version = "0.2.2", features = ["mpmc"], default-features = false }
+zruntime = { version = "0.2.4", features = ["mpmc"], default-features = false }
 # The comparison with other brokers writes its results as JSON, and reads them back: its runs keep
 # the order of their fields, and their numbers read back exactly as they were written.
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
@@ -154,43 +154,3 @@ debug = "full"
 [profile.bench]
 split-debuginfo = "off"
 strip = "none"
-
-# busd needs these zoter changes:
-# - A hand-over is stored whole and taken over whole, or either fails.
-# - A store exists only where systemd keeps one that can hold a hand-over, and has passed busd a
-#   socket of socket activation (`Error::NoSocket`): zoter fails to create it otherwise. Its error
-#   tells a process that systemd takes no notifications from apart (`Error::NoManager`), which
-#   busd runs without a store on.
-# - The store itself stores the hand-over (`Store::hand_over`), and tells systemd that busd has
-#   started as busd takes over (`Store::take_over`).
-# zoter has them from 0.2.0 on, which is not released yet. Until it is, busd builds on the zoter
-# revision that has them. It must be the revision that zbus uses, so that Cargo builds a single
-# zoter for both. This patch goes away when busd takes that release from crates.io.
-[patch.crates-io.zoter]
-git = "https://github.com/z-galaxy/zoter"
-rev = "4a89183d62ed13ae3278e38c0565de6b98122707"
-
-# busd needs this zruntime change:
-# - Sockets hand out the runtime they run on (`UnixListener::runtime`). The bus waits on that
-#   runtime's timer between retries when accepting a connection fails.
-# zruntime hasn't released it yet. Until it does, busd builds on the zruntime revision that has it.
-# The patch also applies to the zruntime that zbus depends on, so Cargo builds a single zruntime
-# that both share. This patch goes away when busd takes that release from crates.io.
-[patch.crates-io.zruntime]
-git = "https://github.com/z-galaxy/zruntime"
-rev = "26b51091f57ce27a38b4e1f058ef050988d6d491"
-
-# The zbus on crates.io builds on zoter 0.1. busd stores zbus's hand-overs inside the hand-overs
-# of its own zoter, so both must build on the same zoter. busd also needs these zbus changes:
-# - It hands the connection on which it serves the D-Bus API over to its next instance, together
-#   with its object server (`Connection::hand_over`).
-# - It makes the signals that follow its replies part of their calls, so that this hand-over
-#   waits for them (`ResponseDispatchNotifier::followed_by`).
-# - It hands both ends of that connection over as one item of the hand-over (`ChannelHandover`).
-# - It answers the calls that wait on a peer that leaves, from the caller and the serial of each
-#   call, which is all it keeps of them (`Message::error_for_serial`).
-# zbus has not released these yet. Until it does, busd builds on the zbus revision that has them.
-# This patch goes away when busd takes that release from crates.io.
-[patch.crates-io.zbus]
-git = "https://github.com/z-galaxy/zbus"
-rev = "941b3a699dfa888e95309b5469671d06e666c41e"
