@@ -71,7 +71,7 @@ anyhow = "1.0.82"
 # Explicitly depend on serde to enable `rc` feature.
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false, features = ["alloc"] }
-zruntime = { version = "0.2.2", features = [
+zruntime = { version = "0.2.4", features = [
     "fs",
     "helper",
     "lock",
@@ -120,7 +120,7 @@ serde = { version = "1.0.200", features = ["derive"] }
 serde_bytes = "0.11.19"
 # The channels that stop the services and the bus of the benchmarks, and hand the replies on a
 # shared connection to their callers.
-zruntime = { version = "0.2.2", features = ["mpmc"], default-features = false }
+zruntime = { version = "0.2.4", features = ["mpmc"], default-features = false }
 # The comparison with other brokers writes its results as JSON, and reads them back: its runs keep
 # the order of their fields, and their numbers read back exactly as they were written.
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
@@ -154,13 +154,3 @@ debug = "full"
 [profile.bench]
 split-debuginfo = "off"
 strip = "none"
-
-# busd needs this zruntime change:
-# - Sockets hand out the runtime they run on (`UnixListener::runtime`). The bus waits on that
-#   runtime's timer between retries when accepting a connection fails.
-# zruntime hasn't released it yet. Until it does, busd builds on the zruntime revision that has it.
-# The patch also applies to the zruntime that zbus depends on, so Cargo builds a single zruntime
-# that both share. This patch goes away when busd takes that release from crates.io.
-[patch.crates-io.zruntime]
-git = "https://github.com/z-galaxy/zruntime"
-rev = "26b51091f57ce27a38b4e1f058ef050988d6d491"
