@@ -243,16 +243,19 @@ mod tests {
     /// `add_sender` builds its message with `Message::from_parts`, which takes the new bytes and
     /// the duplicates of the file descriptors as one whole message. The body of the message still
     /// holds what its signature says.
+    ///
+    /// The bytes that the test expects are those that zbus 6.5's `Message::with_sender` made, which
+    /// `WITH_SENDER` holds. The other header fields stay as they were, before the sender field.
     #[test]
     fn add_sender_matches_with_sender() {
         let sender = UniqueName::try_from(":busd.42").unwrap();
         let files = [(); 2].map(|()| File::open("/dev/null").unwrap());
-        for endian in [Endian::Little, Endian::Big] {
-            for msg in messages(endian, &files) {
-                let ours = add_sender(&msg, &sender).unwrap();
-                let theirs = msg.with_sender(&sender).unwrap();
-                assert_eq!(ours.data().bytes(), theirs.data().bytes(), "{msg:?}");
+        for (endian, pinned) in [Endian::Little, Endian::Big].into_iter().zip(WITH_SENDER) {
+            for (msg, pinned) in messages(endian, &files).iter().zip(pinned) {
+                let ours = add_sender(msg, &sender).unwrap();
+                assert_eq!(ours.data().bytes(), bytes_of(pinned), "{msg:?}");
                 assert_eq!(ours.header().sender(), Some(&sender));
+                assert_eq!(but_sender(&ours.header()), but_sender(&msg.header()));
                 assert_eq!(ours.data().fds().len(), msg.data().fds().len());
                 ours.body().validate().unwrap();
             }
@@ -291,4 +294,86 @@ mod tests {
         ]
         .map(Result::unwrap)
     }
+
+    /// What `header` holds except its sender field: its primary header and its other fields.
+    fn but_sender(header: &message::Header<'_>) -> String {
+        format!(
+            "{:?}",
+            (
+                header.primary(),
+                header.path(),
+                header.interface(),
+                header.member(),
+                header.error_name(),
+                header.reply_serial(),
+                header.destination(),
+                header.signature(),
+                header.unix_fds(),
+            )
+        )
+    }
+
+    /// The bytes that `hex` holds, two hexadecimal digits for each.
+    fn bytes_of(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The bytes that zbus 6.5's `Message::with_sender` gave each of [`messages`] with the sender
+    /// field of `:busd.42`, in hexadecimal. The little-endian messages come first, then the
+    /// big-endian ones.
+    const WITH_SENDER: [[&str; 4]; 2] = [
+        [
+            concat!(
+                "6c0100011c000000010000007900000001016f000e0000002f6f72672f7a6275732f546573740000",
+                "020173000d0000006f72672e7a6275732e54657374000000030173000400000050696e6700000000",
+                "060173000d0000006f72672e7a6275732e5465737400000008016700047973617500000000000000",
+                "07017300080000003a627573642e343200000000000000000100000003000000616263000c000000",
+                "010000000200000003000000",
+            ),
+            concat!(
+                "6c04000100000000020000004100000001016f00020000002f610000000000000201730003000000",
+                "612e6200000000000301730001000000430000000000000007017300080000003a627573642e3432",
+                "0000000000000000",
+            ),
+            concat!(
+                "6c01000112000000030000004900000001016f00010000002f000000000000000301730001000000",
+                "580000000000000006017300040000003a312e370000000008016700017300000701730008000000",
+                "3a627573642e343200000000000000000d0000007878787878787878787878787800",
+            ),
+            concat!(
+                "6c04000108000000040000006100000001016f000e0000002f6f72672f7a6275732f546573740000",
+                "020173000d0000006f72672e7a6275732e5465737400000003017300030000004664730000000000",
+                "0801670002686800090175000200000007017300080000003a627573642e34320000000000000000",
+                "0000000001000000",
+            ),
+        ],
+        [
+            concat!(
+                "420100010000001c000000010000007901016f000000000e2f6f72672f7a6275732f546573740000",
+                "020173000000000d6f72672e7a6275732e54657374000000030173000000000450696e6700000000",
+                "060173000000000d6f72672e7a6275732e5465737400000008016700047973617500000000000000",
+                "07017300000000083a627573642e343200000000000000000100000000000003616263000000000c",
+                "000000010000000200000003",
+            ),
+            concat!(
+                "4204000100000000000000020000004101016f00000000022f610000000000000201730000000003",
+                "612e6200000000000301730000000001430000000000000007017300000000083a627573642e3432",
+                "0000000000000000",
+            ),
+            concat!(
+                "4201000100000012000000030000004901016f00000000012f000000000000000301730000000001",
+                "580000000000000006017300000000043a312e370000000008016700017300000701730000000008",
+                "3a627573642e343200000000000000000000000d7878787878787878787878787800",
+            ),
+            concat!(
+                "4204000100000008000000040000006101016f000000000e2f6f72672f7a6275732f546573740000",
+                "020173000000000d6f72672e7a6275732e5465737400000003017300000000034664730000000000",
+                "0801670002686800090175000000000207017300000000083a627573642e34320000000000000000",
+                "0000000000000001",
+            ),
+        ],
+    ];
 }

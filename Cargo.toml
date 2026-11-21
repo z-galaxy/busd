@@ -49,9 +49,11 @@ harness = false
 bench = false
 
 [dependencies]
+# `p2p` is for the GUID that the bus generates for its end of each client's connection, where the
+# bus is the server.
 zbus = { version = "6.4.0", features = [
     "default-rt",
-    "bus-impl",
+    "p2p",
     "handover",
 ], default-features = false }
 clap = { version = "4.5.4", features = [
