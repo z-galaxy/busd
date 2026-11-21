@@ -217,7 +217,7 @@ fn bus_hands_over_once_the_calls_under_way_are_answered() {
         let _next = handed_over.take_over(Carry::AsItIs).await;
         let ping = call_bus("GetId").build(&()).unwrap();
         caller.send(&ping).await.unwrap();
-        let replies = replies_until(&mut messages, &ping).await;
+        let replies = replies_until(&mut messages, &pass, &ping).await;
         assert_eq!(replies, [&pass, &ping].map(serial));
     });
 }
@@ -265,6 +265,12 @@ fn signal_that_follows_a_reply_is_part_of_the_call() {
             let msg = messages.next().await.unwrap().unwrap();
             let header = msg.header();
             match msg.message_type() {
+                // Not the reply to the call of `add_match`, which may still come out of the
+                // stream: see `replies_until`.
+                message::Type::MethodReturn
+                    if header
+                        .reply_serial()
+                        .is_some_and(|replied| replied < serial(&follow)) => {}
                 message::Type::MethodReturn => {
                     let replied = header.reply_serial();
                     got.push(format!("reply to {}", replied.unwrap()));
@@ -361,7 +367,14 @@ async fn one_reply_each_across_a_hand_over(carry: Carry) {
     while replies.len() < expected.len() || passed.len() <= MANY as usize {
         let msg = messages.next().await.unwrap().unwrap();
         match msg.message_type() {
-            message::Type::MethodReturn => replies.push(msg.header().reply_serial().unwrap()),
+            message::Type::MethodReturn => {
+                // Not the reply to the call of `add_match`, which may still come out of the
+                // stream: see `replies_until`.
+                let replied = msg.header().reply_serial().unwrap();
+                if replied >= serial(&pass) {
+                    replies.push(replied);
+                }
+            }
             message::Type::Signal => passed.push(msg.body().deserialize::<u32>().unwrap()),
             _ => (),
         }
@@ -401,7 +414,7 @@ fn reload_under_way_holds_a_hand_over_up() {
         let handed_over = HandedOver::new(bus).await;
 
         let _next = handed_over.take_over(Carry::AsItIs).await;
-        let replies = replies_until(&mut messages, &get_id).await;
+        let replies = replies_until(&mut messages, &reload, &get_id).await;
         assert_eq!(replies, [&reload, &get_id].map(serial));
     });
 }
@@ -738,8 +751,20 @@ async fn add_match(conn: &Connection, interface: &str) {
     .unwrap();
 }
 
-/// The serials of the calls that the replies from `messages` answer, up to the reply to `last`.
-async fn replies_until(messages: &mut MessageStream, last: &Message) -> Vec<NonZeroU32> {
+/// The serials of the calls that the replies from `messages` answer, from the reply to `first` up
+/// to the reply to `last`.
+///
+/// The replies to the calls made before `first` are left out. A stream made after a call returned
+/// can still yield the reply to that call, such as the reply to the `Hello` that the client sent as
+/// it connected. zbus hands a reply to its caller before it hands it to the streams. When the
+/// connection reads its socket on another thread, the caller can go on and make the stream in
+/// between. zbus numbers the messages of a process in the order that they are built, so such a
+/// reply answers a lower serial than `first` has.
+async fn replies_until(
+    messages: &mut MessageStream,
+    first: &Message,
+    last: &Message,
+) -> Vec<NonZeroU32> {
     let mut replies = Vec::new();
     loop {
         let msg = messages.next().await.unwrap().unwrap();
@@ -747,6 +772,9 @@ async fn replies_until(messages: &mut MessageStream, last: &Message) -> Vec<NonZ
             continue;
         }
         let replied = msg.header().reply_serial().unwrap();
+        if replied < serial(first) {
+            continue;
+        }
         replies.push(replied);
         if replied == serial(last) {
             return replies;
