@@ -52,7 +52,6 @@ bench = false
 zbus = { version = "6.4.0", features = [
     "default-rt",
     "bus-impl",
-    "service",
     "handover",
 ], default-features = false }
 clap = { version = "4.5.4", features = [
@@ -71,10 +70,12 @@ anyhow = "1.0.82"
 # Explicitly depend on serde to enable `rc` feature.
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false, features = ["alloc"] }
+# `mpmc` is for the queue of the calls to the bus itself, which it answers one at a time.
 zruntime = { version = "0.2.4", features = [
     "fs",
     "helper",
     "lock",
+    "mpmc",
     "signal",
     "unblock",
     "unix",
@@ -102,11 +103,13 @@ tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing", "zoter/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
 
 [dev-dependencies]
-# The tests drive the bus through proxies, which the binary itself does not need. The benchmarks
-# send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte by byte.
+# The tests drive the bus through proxies, and serve interfaces of their own on its clients, which
+# the binary itself does not need. The benchmarks send byte arrays with `serde_bytes`, which
+# (de)serializes them whole rather than byte by byte.
 zbus = { version = "6.4.0", features = [
     "proxy",
     "serde_bytes",
+    "service",
 ], default-features = false }
 ntest = "0.10.0"
 rand = "0.10.0"

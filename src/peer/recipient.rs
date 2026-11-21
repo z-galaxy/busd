@@ -14,9 +14,10 @@ use zruntime::{lock::Mutex, SharedRuntime};
 #[cfg(target_os = "linux")]
 use zruntime::{spawn, Shared, Task};
 
-use crate::{debug, warn};
+use crate::{debug, fdo::Calls, warn};
 
-/// Where the bus sends the messages for a peer, or a monitor.
+/// Where the bus sends the messages for a peer or a monitor, and the calls to the bus itself, which
+/// go to the queue of the task that answers them.
 ///
 /// It is cheap to clone, so that the bus can pick the recipients of messages while it holds its
 /// locks, and send the messages to them once it has let go of those. The clones share the state of
@@ -57,22 +58,23 @@ impl Recipient {
         Ok(Self(Kind::Client(Arc::new(link))))
     }
 
-    /// The bus itself, on `conn`.
+    /// The bus itself, which answers the calls that are queued in `calls`.
     ///
-    /// A message for the bus waits for room on its connection for as long as it takes, which
-    /// holds back a client that sends to the bus faster than the bus can keep up. That wait has
-    /// no time limit of its own, as the bus never gets disconnected, but it is bounded all the
-    /// same: the bus only ever waits on a client within the time limit of that client.
-    pub fn bus(conn: Connection) -> Self {
-        Self(Kind::Bus(conn))
+    /// A call to the bus waits for room in the queue for as long as it takes, which holds back a
+    /// client that calls the bus faster than the bus can answer. That wait has no time limit of its
+    /// own, as the bus never gets disconnected, but it is bounded all the same: the bus only ever
+    /// waits on a client within the time limit of that client. The bus takes no other messages.
+    pub(crate) fn bus(calls: Calls) -> Self {
+        Self(Kind::Bus(calls))
     }
 
     /// Stop sending to the client, without disconnecting it, as the bus handed the client over to
-    /// its next instance, which sends it whatever comes next.
+    /// its next instance, which sends it whatever comes next. The bus itself takes no more calls.
     #[cfg(target_os = "linux")]
     pub(crate) fn hand_over(&self) {
-        if let Kind::Client(client) = &self.0 {
-            client.disconnecting.store(true, Ordering::SeqCst);
+        match &self.0 {
+            Kind::Client(client) => client.disconnecting.store(true, Ordering::SeqCst),
+            Kind::Bus(calls) => calls.close(),
         }
     }
 
@@ -125,10 +127,8 @@ impl Recipient {
     pub async fn send(&self, msgs: &[Message]) -> Vec<Message> {
         match &self.0 {
             Kind::Client(client) => client.send(msgs).await,
-            Kind::Bus(conn) => {
-                if let Err(e) = conn.send_all(msgs).await {
-                    warn!("Error sending messages to the bus: {}", e);
-                }
+            Kind::Bus(calls) => {
+                calls.queue(msgs).await;
 
                 Vec::new()
             }
@@ -174,7 +174,7 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 enum Kind {
     Client(Arc<Link>),
-    Bus(Connection),
+    Bus(Calls),
 }
 
 /// The bus's link to a client: the client's connection, on which the bus sends messages.

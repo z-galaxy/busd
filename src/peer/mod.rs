@@ -1,7 +1,5 @@
 mod stream;
 pub use stream::*;
-#[cfg(target_os = "linux")]
-use zruntime::spawn;
 mod client;
 pub use client::*;
 mod monitor;
@@ -13,24 +11,19 @@ pub use pending_calls::*;
 
 use crate::trace;
 #[cfg(target_os = "linux")]
-use crate::warn;
-#[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(target_os = "linux")]
-use futures_util::future::join;
 use std::{sync::Arc, time::Duration};
 use zbus::{
     connection::{self, AuthMechanism},
     fdo::ConnectionCredentials,
-    names::{BusName, OwnedUniqueName},
+    names::BusName,
     Connection, MessageStream, OwnedGuid, OwnedMatchRule,
 };
 
 #[cfg(target_os = "linux")]
 use crate::user::Users;
 use crate::{
-    fdo,
     match_rules::MatchRules,
     name_registry::NameRegistry,
     policy::PeerPolicy,
@@ -47,8 +40,7 @@ pub struct Peer {
     pending_calls: Arc<PendingCalls>,
     /// The peer, as the caller of the calls that wait for replies.
     caller: Arc<Caller>,
-    /// The gids of the client, as its credentials tell; none for the bus itself, or where they
-    /// can't be told.
+    /// The gids of the client, as its credentials tell; none where they can't be told.
     groups: Box<[u32]>,
     /// What the policy of the bus has for the peer.
     policy: PeerPolicy,
@@ -96,7 +88,7 @@ impl Peer {
             id,
             unique_name,
             MatchRules::default(),
-            Some(charge),
+            charge,
         );
 
         // The bus gives the peer its policy as it adds the peer.
@@ -107,39 +99,6 @@ impl Peer {
             groups,
             PeerPolicy::default(),
             false,
-        ))
-    }
-
-    /// The bus itself, serving the FDO D-Bus API, of `user`.
-    ///
-    /// It fails if the credentials of the bus can't be looked up. zbus looks them up through
-    /// `msg_stream`'s connection, and waits for the sends on it: the calls on their way to the bus,
-    /// which may only go on once the bus answers the call that asks for its credentials. So the
-    /// bus looks them up before it serves anyone, while nothing is sent on the connection, and
-    /// zbus keeps them.
-    pub async fn new_us(msg_stream: MessageStream, user: Arc<User>) -> Result<(Self, Stream)> {
-        let unique_name = OwnedUniqueName::try_from(fdo::BUS_NAME).unwrap();
-        let conn = Connection::from(&msg_stream);
-        conn.peer_creds().await?;
-        let recipient = Recipient::bus(conn.clone());
-        let client = Client::new(
-            conn,
-            recipient,
-            BUS_ID,
-            unique_name,
-            MatchRules::default(),
-            None,
-        );
-
-        // Its pending calls stay empty, because the bus answers the calls to it itself and keeps no
-        // records of them.
-        Ok(Self::assemble(
-            client,
-            msg_stream,
-            user,
-            Box::default(),
-            PeerPolicy::unrestricted(),
-            true,
         ))
     }
 
@@ -163,7 +122,7 @@ impl Peer {
         self.caller.user()
     }
 
-    /// The gids of the client of the peer: none for the bus itself.
+    /// The gids of the client of the peer.
     pub fn groups(&self) -> &[u32] {
         &self.groups
     }
@@ -287,7 +246,7 @@ impl Peer {
         let user = users.user(uid);
         let recipient = Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?;
         let charge = Charge::taken_over(&user, &user);
-        let client = Client::new(conn, recipient, id, unique_name, match_rules, Some(charge));
+        let client = Client::new(conn, recipient, id, unique_name, match_rules, charge);
 
         // The bus gives the peer its policy as it adds the peer.
         Ok(Self::assemble(
@@ -304,37 +263,6 @@ impl Peer {
     #[cfg(target_os = "linux")]
     pub(crate) fn client_mut(&mut self) -> &mut Client {
         &mut self.client
-    }
-
-    /// Whether the peer is the bus itself.
-    pub(crate) fn is_bus(&self) -> bool {
-        self.client.id() == BUS_ID
-    }
-
-    /// Write what the previous instance of the bus left unwritten on the bus's own connection, if
-    /// anything, in a task of its own. This peer is one end of that connection, and `service` is
-    /// the other. What is left unwritten is the calls to the bus that this end took and didn't pass
-    /// on, and what the bus sent that `service` didn't pass on. The write stops when the bus pauses
-    /// the peer to hand over in turn ([`Client::pause`]), or when the bus lets go of the peer. Each
-    /// end writes what is left ahead of what it sends, but only once it sends, or once it is told
-    /// to here.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn flush_us(&mut self, service: &Connection) {
-        let conn = self.client.conn();
-        if conn.unwritten_len() == 0 && service.unwritten_len() == 0 {
-            return;
-        }
-        let (peer, service) = (conn.clone(), service.clone());
-        self.client.set_flushing(spawn(async move {
-            let (to_bus, from_bus) = join(peer.flush(), service.flush()).await;
-            for (flushed, what) in [(to_bus, "the calls to the bus"), (from_bus, "the messages")] {
-                if let Err(e) = flushed {
-                    warn!(
-                        "Failed to pass {what} of the bus on, which it was handed over with: {e}"
-                    );
-                }
-            }
-        }));
     }
 
     /// Build a peer from `client`, and the stream of the peer's messages, which come from
@@ -385,7 +313,8 @@ fn groups(creds: &ConnectionCredentials) -> Box<[u32]> {
         .map_or_else(Box::default, |gids| gids.as_slice().into())
 }
 
-/// The number of the bus, as a peer of its own.
+/// The number of the bus itself, which no client has: that of the recipient of the calls to the
+/// bus, and of the sender of its own messages.
 pub(crate) const BUS_ID: usize = 0;
 
 /// How many file descriptors a message may carry: as many as Linux passes in one write

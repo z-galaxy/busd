@@ -1,458 +1,393 @@
+//! The `org.freedesktop.DBus` interface.
+
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{info, warn};
 use zbus::{
-    fdo::{
-        ConnectionCredentials, Error, ReleaseNameReply, RequestNameFlags, RequestNameReply, Result,
-        StartServiceReply,
-    },
-    interface, message,
-    names::{BusName, InterfaceName, OwnedBusName, OwnedUniqueName, UniqueName, WellKnownName},
-    object_server::{ResponseDispatchNotifier, SignalEmitter},
-    Optional, OwnedGuid, OwnedMatchRule,
+    fdo::{ConnectionCredentials, Error, RequestNameFlags, Result, StartServiceReply},
+    message::{self, Header},
+    names::{BusName, MemberName, OwnedBusName, OwnedUniqueName, UniqueName, WellKnownName},
+    Message, OwnedMatchRule,
 };
 
-use super::{msg_sender, upgrade};
-use crate::{
-    name_registry::NameOwnerChanged,
-    peers::{Peers, WeakPeers},
-};
+use super::{args, failed, unknown_method, Answer, Driver, BUS_NAME, MONITORING, PATH, STATS};
+use crate::{info, name_registry::NameOwnerChanged, peers::Peers, warn};
 
-#[derive(Debug)]
-pub struct DBus {
-    peers: WeakPeers,
-    guid: OwnedGuid,
-}
+impl Driver {
+    /// Answer the call of `member` of the `org.freedesktop.DBus` interface, `call`, whose header
+    /// is `header`.
+    pub(super) async fn dbus(
+        &mut self,
+        peers: &Peers,
+        call: &Message,
+        header: &Header<'_>,
+        member: &MemberName<'_>,
+    ) -> Result<Answer> {
+        let body = call.body();
+        let sender = sender(header)?;
+        match member.as_str() {
+            "Hello" => hello(peers, header, sender).await,
+            "RequestName" => {
+                let (name, flags) = args(&body)?;
 
-impl DBus {
-    pub const PATH: &'static str = "/org/freedesktop/DBus";
-    pub const INTERFACE: &'static str = "org.freedesktop.DBus";
-
-    pub fn new(peers: &Peers, guid: OwnedGuid) -> Self {
-        Self {
-            peers: peers.downgrade(),
-            guid,
-        }
-    }
-
-    fn peers(&self) -> Result<Peers> {
-        upgrade(&self.peers)
-    }
-
-    /// Fails for the name of the bus itself, which no client may ask for or let go of, as with
-    /// dbus-broker and the reference implementation.
-    fn ensure_not_reserved(name: &WellKnownName<'_>) -> Result<()> {
-        if name == super::BUS_NAME {
-            return Err(Error::InvalidArgs(format!(
-                "{} is a reserved name",
-                super::BUS_NAME
-            )));
-        }
-
-        Ok(())
-    }
-}
-
-// The bus answers the calls one at a time, in the order that they come in, rather than in a task of
-// its own for each, as the reference implementation of D-Bus and dbus-broker do: the calls that a
-// client makes one after the other get their replies, and have the bus send their signals, in that
-// order. On Linux, a bus that hands over so answers the calls that it took, and leaves the others,
-// in that order, to its next instance: see `Peers::hand_over_us`.
-//
-// So a method must never wait for anything that waits for the bus to take the calls after the one
-// that it answers, or the bus waits for ever. The calls on their way to the bus wait for it to take
-// them, and hold the connection that they go over while they do, its lock included: nothing that
-// goes through that connection may be waited for, such as a lookup of the credentials of the bus
-// itself, which the bus makes before it serves anyone. `every_call_to_the_bus_among_calls` of the
-// tests calls each method among many other calls, to make sure.
-#[interface(
-    interface = "org.freedesktop.DBus",
-    introspection_docs = false,
-    spawn = false
-)]
-impl DBus {
-    /// This is already called & handled and we only need to handle it once.
-    async fn hello(
-        &self,
-        #[zbus(header)] hdr: message::Header<'_>,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> Result<ResponseDispatchNotifier<OwnedUniqueName>> {
-        let name = msg_sender(&hdr);
-        let peers = self.peers()?;
-        let unique_name = {
-            let mut routing = peers.routing_mut().await;
-            let peer = routing.peer_mut(name.as_str())?;
-            peer.hello()?;
-
-            peer.client().unique_name().clone()
-        };
-
-        // Notify name change once the response is sent because we want:
-        // 1. `Hello` to return ASAP and hence client connection to be esablished.
-        // 2. The `Hello` response to arrive before the `NameAcquired` signal.
-        // The signals are part of the call, so a hand-over of the bus waits for them.
-        let response = unique_name.clone();
-        let notify = async move {
-            let changed = NameOwnerChanged::appeared(unique_name);
-            if let Err(e) = peers.notify_name_changes(changed).await {
-                warn!("Failed to notify peers of name change: {}", e);
+                request_name(peers, header, sender, name, flags).await
             }
-        };
+            "ReleaseName" => release_name(peers, header, sender, args(&body)?).await,
+            "GetNameOwner" => {
+                let owner = name_owner(peers, args(&body)?).await?;
 
-        Ok(ResponseDispatchNotifier::followed_by(
-            response,
-            emitter.connection(),
-            notify,
-        ))
-    }
-
-    /// Ask the message bus to assign the given name to the method caller.
-    async fn request_name(
-        &self,
-        name: WellKnownName<'_>,
-        flags: RequestNameFlags,
-        #[zbus(header)] hdr: message::Header<'_>,
-    ) -> Result<RequestNameReply> {
-        Self::ensure_not_reserved(&name)?;
-        let unique_name = msg_sender(&hdr);
-        let peers = self.peers()?;
-        let (reply, name_owner_changed) = {
-            let mut routing = peers.routing_mut().await;
-            let peer = routing.peer(unique_name.as_str())?;
-            if !peer.policy().may_own(&name) {
-                warn!(
-                    "Refusing `{name}` to `{unique_name}`, as the policy does not let it own the \
-                     name"
-                );
-
-                return Err(Error::AccessDenied(
-                    "Request to own name refused by policy".to_string(),
-                ));
+                Answer::reply(header, &owner)
             }
+            "AddMatch" => {
+                let rule: OwnedMatchRule = args(&body)?;
+                peers.routing_mut().await.add_match_rule(sender, rule)?;
 
-            routing
-                .names_mut()
-                .request_name(name, unique_name.clone(), flags)
-        };
-        // The signals go out once the lock of the routing is let go of.
-        if let Some(changed) = name_owner_changed {
-            peers
-                .notify_name_changes(changed)
-                .await
-                .map_err(|e| Error::Failed(e.to_string()))?;
-        }
+                Answer::reply(header, &())
+            }
+            "RemoveMatch" => {
+                let rule: OwnedMatchRule = args(&body)?;
+                peers.routing_mut().await.remove_match_rule(sender, rule)?;
 
-        Ok(reply)
-    }
+                Answer::reply(header, &())
+            }
+            "GetAdtAuditSessionData" => {
+                let _: BusName<'_> = args(&body)?;
 
-    /// Ask the message bus to release the method caller's claim to the given name.
-    async fn release_name(
-        &self,
-        name: WellKnownName<'_>,
-        #[zbus(header)] hdr: message::Header<'_>,
-    ) -> Result<ReleaseNameReply> {
-        Self::ensure_not_reserved(&name)?;
-        let unique_name = msg_sender(&hdr);
-        let peers = self.peers()?;
-        let (reply, name_owner_changed) = peers
-            .routing_mut()
-            .await
-            .names_mut()
-            .release_name(name, unique_name.clone());
-        if let Some(changed) = name_owner_changed {
-            peers
-                .notify_name_changes(changed)
-                .await
-                .map_err(|e| Error::Failed(e.to_string()))?;
-        }
+                Err(Error::NotSupported("Solaris really?".to_string()))
+            }
+            "GetConnectionCredentials" => {
+                let creds = credentials(peers, args(&body)?).await?;
 
-        Ok(reply)
-    }
+                Answer::reply(header, &*creds)
+            }
+            "GetConnectionSELinuxSecurityContext" => {
+                let creds = credentials(peers, args(&body)?).await?;
+                let Some(label) = creds.linux_security_label() else {
+                    return Err(Error::SELinuxSecurityContextUnknown(
+                        "Unimplemented".to_string(),
+                    ));
+                };
 
-    /// Returns the unique connection name of the primary owner of the name given.
-    async fn get_name_owner(&self, name: BusName<'_>) -> Result<OwnedUniqueName> {
-        let peers = self.peers()?;
-        let routing = peers.routing().await;
-        match name {
-            BusName::WellKnown(name) => routing.names().lookup(&name).cloned().ok_or_else(|| {
-                Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
-            }),
-            BusName::Unique(name) => {
-                if routing.has_peer(&name) {
-                    Ok(name.into())
-                } else {
-                    Err(Error::NameHasNoOwner(
-                        "Name is not owned by anyone.".to_string(),
-                    ))
+                Answer::reply(header, label)
+            }
+            "GetConnectionUnixProcessID" => {
+                let name: BusName<'_> = args(&body)?;
+                let creds = credentials(peers, name.clone()).await?;
+                let Some(pid) = creds.process_id() else {
+                    return Err(Error::UnixProcessIdUnknown(format!(
+                        "Could not determine Unix process ID of `{name}`"
+                    )));
+                };
+
+                Answer::reply(header, &pid)
+            }
+            "GetConnectionUnixUser" => {
+                let name: BusName<'_> = args(&body)?;
+                let creds = credentials(peers, name.clone()).await?;
+                let Some(uid) = creds.unix_user_id() else {
+                    return Err(Error::Failed(format!(
+                        "Could not determine Unix user ID of `{name}`"
+                    )));
+                };
+
+                Answer::reply(header, &uid)
+            }
+            "GetId" => Answer::reply(header, &self.guid),
+            // The bus starts no services, so no name can be activated.
+            "ListActivatableNames" => Answer::reply(header, &Vec::<OwnedBusName>::new()),
+            "ListNames" => Answer::reply(header, &names(peers).await),
+            "ListQueuedOwners" => {
+                let owners = queued_owners(peers, args(&body)?).await?;
+
+                Answer::reply(header, &owners)
+            }
+            "NameHasOwner" => {
+                let has_owner = has_owner(peers, args(&body)?).await?;
+
+                Answer::reply(header, &has_owner)
+            }
+            "StartServiceByName" => {
+                let (name, _flags): (WellKnownName<'_>, u32) = args(&body)?;
+                if has_owner(peers, name.into()).await? {
+                    return Answer::reply(header, &StartServiceReply::AlreadyRunning);
                 }
+
+                Err(Error::Failed(
+                    "Service activation not yet supported".to_string(),
+                ))
             }
-        }
-    }
+            "UpdateActivationEnvironment" => {
+                let _: HashMap<&str, &str> = args(&body)?;
+                super::ensure_privileged(peers, sender).await?;
 
-    /// Adds a match rule to match messages going through the message bus
-    async fn add_match(
-        &self,
-        rule: OwnedMatchRule,
-        #[zbus(header)] hdr: message::Header<'_>,
-    ) -> Result<()> {
-        self.peers()?
-            .routing_mut()
-            .await
-            .add_match_rule(msg_sender(&hdr), rule)
-    }
-
-    /// Removes the first rule that matches.
-    async fn remove_match(
-        &self,
-        rule: OwnedMatchRule,
-        #[zbus(header)] hdr: message::Header<'_>,
-    ) -> Result<()> {
-        self.peers()?
-            .routing_mut()
-            .await
-            .remove_match_rule(msg_sender(&hdr), rule)
-    }
-
-    /// Returns auditing data used by Solaris ADT, in an unspecified binary format.
-    fn get_adt_audit_session_data(&self, _bus_name: BusName<'_>) -> Result<Vec<u8>> {
-        Err(Error::NotSupported("Solaris really?".to_string()))
-    }
-
-    /// Returns as many credentials as possible for the process connected to the server.
-    async fn get_connection_credentials(
-        &self,
-        bus_name: BusName<'_>,
-    ) -> Result<Arc<ConnectionCredentials>> {
-        let owner = self.get_name_owner(bus_name.clone()).await?;
-        // Not under the lock of the routing, as zbus looks the credentials up through the
-        // connection of the peer unless it knows them already, which waits for any send to the peer
-        // that is under way. It knows those of each client, which it looks up as the client
-        // connects, or as the bus takes the client over, and those of the bus itself, which the bus
-        // looks up before it serves anyone.
-        let conn = self
-            .peers()?
-            .routing()
-            .await
-            .peer(&owner)
-            .map(|peer| peer.client().conn().clone())
-            .map_err(|_| Error::Failed(format!("Peer `{bus_name}` not found")))?;
-
-        conn.peer_creds().await.cloned().map_err(|e| {
-            Error::Failed(format!(
-                "Failed to get peer credentials for `{bus_name}`: {e}"
-            ))
-        })
-    }
-
-    /// Returns the security context used by SELinux, in an unspecified format.
-    #[zbus(name = "GetConnectionSELinuxSecurityContext")]
-    async fn get_connection_selinux_security_context(
-        &self,
-        bus_name: BusName<'_>,
-    ) -> Result<Vec<u8>> {
-        self.get_connection_credentials(bus_name)
-            .await
-            .and_then(|c| {
-                c.linux_security_label().cloned().ok_or_else(|| {
-                    Error::SELinuxSecurityContextUnknown("Unimplemented".to_string())
-                })
-            })
-    }
-
-    /// Returns the Unix process ID of the process connected to the server.
-    #[zbus(name = "GetConnectionUnixProcessID")]
-    async fn get_connection_unix_process_id(&self, bus_name: BusName<'_>) -> Result<u32> {
-        self.get_connection_credentials(bus_name.clone())
-            .await
-            .and_then(|c| {
-                c.process_id().ok_or_else(|| {
-                    Error::UnixProcessIdUnknown(format!(
-                        "Could not determine Unix process ID of `{bus_name}`"
-                    ))
-                })
-            })
-    }
-
-    /// Returns the Unix user ID of the process connected to the server.
-    async fn get_connection_unix_user(&self, bus_name: BusName<'_>) -> Result<u32> {
-        self.get_connection_credentials(bus_name.clone())
-            .await
-            .and_then(|c| {
-                c.unix_user_id().ok_or_else(|| {
-                    Error::Failed(format!("Could not determine Unix user ID of `{bus_name}`"))
-                })
-            })
-    }
-
-    /// Gets the unique ID of the bus.
-    fn get_id(&self) -> &OwnedGuid {
-        &self.guid
-    }
-
-    /// Returns a list of all names that can be activated on the bus.
-    fn list_activatable_names(&self) -> &[OwnedBusName] {
-        // TODO: Return actual list when we support service activation.
-        &[]
-    }
-
-    /// Returns a list of all currently-owned names on the bus.
-    async fn list_names(&self) -> Result<Vec<OwnedBusName>> {
-        let peers = self.peers()?;
-        let routing = peers.routing().await;
-        let mut names: Vec<_> = routing
-            .peer_names()
-            .cloned()
-            .map(|n| BusName::Unique(n.into()).into())
-            .collect();
-
-        names.extend(
-            routing
-                .names()
-                .all_names()
-                .keys()
-                .map(|n| BusName::WellKnown(n.into()).into()),
-        );
-
-        Ok(names)
-    }
-
-    /// List the connections currently queued for a bus name.
-    async fn list_queued_owners(&self, name: WellKnownName<'_>) -> Result<Vec<OwnedUniqueName>> {
-        self.peers()?
-            .routing()
-            .await
-            .names()
-            .waiting_list(name)
-            .ok_or_else(|| {
-                Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
-            })
-            .map(|owners| owners.map(|o| o.unique_name()).cloned().collect())
-    }
-
-    /// Checks if the specified name exists (currently has an owner).
-    async fn name_has_owner(&self, name: BusName<'_>) -> Result<bool> {
-        match self.get_name_owner(name).await {
-            Ok(_) => Ok(true),
-            Err(Error::NameHasNoOwner(_)) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Tries to launch the executable associated with a name (service activation).
-    async fn start_service_by_name(
-        &self,
-        name: WellKnownName<'_>,
-        _flags: u32,
-    ) -> Result<StartServiceReply> {
-        if self.name_has_owner(name.into()).await? {
-            return Ok(StartServiceReply::AlreadyRunning);
-        }
-        // TODO: Implement further when we support service activation.
-        Err(Error::Failed(
-            "Service activation not yet supported".to_string(),
-        ))
-    }
-
-    /// This method adds to or modifies that environment when activating services.
-    async fn update_activation_environment(
-        &self,
-        _environment: HashMap<&str, &str>,
-        #[zbus(header)] hdr: message::Header<'_>,
-    ) -> Result<()> {
-        let peers = self.peers()?;
-        super::ensure_privileged(&peers, &hdr).await?;
-        // TODO: Implement when we support service activation.
-        Err(Error::Failed(
-            "Service activation not yet supported".to_string(),
-        ))
-    }
-
-    /// Reload server configuration.
-    ///
-    /// The bus reads its policy again, and goes by it. If that fails, the bus goes on by the
-    /// policy that it has, and the call fails, as with dbus-broker: the reason is for the log
-    /// alone.
-    ///
-    /// The policy is read off the thread of the bus, which forwards the messages of its peers
-    /// meanwhile. The calls to the bus that come in before the reload is done wait for it, as
-    /// they wait for any call before them.
-    async fn reload_config(&self) -> Result<()> {
-        match self.peers()?.reload().await {
-            Some(Ok(())) => {
-                info!("Reloaded the configuration.");
-
-                Ok(())
+                Err(Error::Failed(
+                    "Service activation not yet supported".to_string(),
+                ))
             }
-            Some(Err(e)) => {
-                warn!("Failed to reload the configuration, which stays as it is: {e:#}");
+            "ReloadConfig" => {
+                reload_config(peers).await?;
 
-                Err(Error::Failed("Config invalid. Reload ignored.".to_string()))
+                Answer::reply(header, &())
             }
-            None => Err(Error::Failed(
-                "No server configuration to reload.".to_string(),
-            )),
+            "Dune" => Answer::reply(header, &DUNE),
+            _ => Err(unknown_method(member)),
         }
     }
-
-    /// Easter egg method.
-    fn dune(&self) -> &str {
-        "I must not fear. Fear is the mind-killer. Fear is the little-death that brings total \
-        obliteration. I will face my fear. I will permit it to pass over me and through me. And \
-        when it has gone past I will turn the inner eye to see its path. Where the fear has gone \
-        there will be nothing. Only **I** will remain!"
-    }
-
-    //
-    // Propertries
-    //
-
-    /// This property lists abstract “features” provided by the message bus, and can be used by
-    /// clients to detect the capabilities of the message bus with which they are communicating.
-    #[zbus(property)]
-    fn features(&self) -> &[&str] {
-        &[]
-    }
-
-    /// This property lists interfaces provided by the `/org/freedesktop/DBus` object, and can be
-    /// used by clients to detect the capabilities of the message bus with which they are
-    /// communicating. Unlike the standard Introspectable interface, querying this property does not
-    /// require parsing XML. This property was added in version 1.11.x of the reference
-    /// implementation of the message bus.
-    ///
-    /// The standard `org.freedesktop.DBus` and `org.freedesktop.DBus.Properties` interfaces are not
-    /// included in the value of this property, because their presence can be inferred from the fact
-    /// that a method call on `org.freedesktop.DBus.Properties` asking for properties of
-    /// `org.freedesktop.DBus` was successful. The standard `org.freedesktop.DBus.Peer` and
-    /// `org.freedesktop.DBus.Introspectable` interfaces are not included in the value of this
-    /// property either, because they do not indicate features of the message bus implementation.
-    #[zbus(property)]
-    fn interfaces(&self) -> &[InterfaceName<'_>] {
-        &INTERFACES
-    }
-
-    /// This signal indicates that the owner of a name has changed.
-    ///
-    /// It's also the signal to use to detect the appearance of new names on the bus.
-    #[zbus(signal)]
-    pub async fn name_owner_changed(
-        emitter: &SignalEmitter<'_>,
-        name: BusName<'_>,
-        old_owner: Optional<UniqueName<'_>>,
-        new_owner: Optional<UniqueName<'_>>,
-    ) -> zbus::Result<()>;
-
-    /// This signal is sent to a specific application when it loses ownership of a name.
-    #[zbus(signal)]
-    pub async fn name_lost(emitter: &SignalEmitter<'_>, name: BusName<'_>) -> zbus::Result<()>;
-
-    /// This signal is sent to a specific application when it gains ownership of a name.
-    #[zbus(signal)]
-    pub async fn name_acquired(emitter: &SignalEmitter<'_>, name: BusName<'_>) -> zbus::Result<()>;
 }
 
-/// The interfaces of the `/org/freedesktop/DBus` object that the `Interfaces` property lists, which
-/// leave out the interfaces that every bus has, as the specification says.
-static INTERFACES: [InterfaceName<'static>; 2] = [
-    InterfaceName::from_static_str_unchecked(super::Monitoring::INTERFACE),
-    InterfaceName::from_static_str_unchecked(super::Stats::INTERFACE),
-];
+/// The signals of the changes of the owners of names, `changes`, in order: for each,
+/// `NameOwnerChanged` to all, then `NameLost` to the old owner, if any, and `NameAcquired` to the
+/// new owner, if any.
+pub(crate) fn name_change_signals<'c, C>(changes: C) -> zbus::Result<Vec<Message>>
+where
+    C: IntoIterator<Item = &'c NameOwnerChanged>,
+{
+    let mut signals = Vec::new();
+    for changed in changes {
+        let name = BusName::from(changed.name());
+        let old_owner = changed.old_owner().map(UniqueName::from);
+        let new_owner = changed.new_owner().map(UniqueName::from);
+        let owner = |owner: &Option<UniqueName<'_>>| {
+            owner.as_ref().map_or_else(String::new, ToString::to_string)
+        };
+        signals.push(signal("NameOwnerChanged", None).build(&(
+            &name,
+            owner(&old_owner),
+            owner(&new_owner),
+        ))?);
+        if let Some(old_owner) = &old_owner {
+            signals.push(signal("NameLost", Some(old_owner)).build(&name)?);
+        }
+        if let Some(new_owner) = &new_owner {
+            signals.push(signal("NameAcquired", Some(new_owner)).build(&name)?);
+        }
+    }
+
+    Ok(signals)
+}
+
+/// The interfaces of the object of the bus that its `Interfaces` property lists, which leave out
+/// the interfaces that every bus has, as the specification says.
+pub(super) const INTERFACES: [&str; 2] = [MONITORING, STATS];
+
+/// The sender of the call of `header`, which the bus sets on each message of its clients.
+fn sender<'h>(header: &'h Header<'_>) -> Result<&'h UniqueName<'h>> {
+    header
+        .sender()
+        .ok_or_else(|| Error::Failed("The call has no sender".to_string()))
+}
+
+/// Answer `Hello` of `sender`, whose header is `header`: it can be called once.
+///
+/// The reply comes before the signals of the unique name that the peer gets, so that the peer has
+/// its name by the time that it gets them, as with dbus-broker.
+async fn hello(peers: &Peers, header: &Header<'_>, sender: &UniqueName<'_>) -> Result<Answer> {
+    let unique_name = {
+        let mut routing = peers.routing_mut().await;
+        let peer = routing.peer_mut(sender.as_str())?;
+        peer.hello()?;
+
+        peer.client().unique_name().clone()
+    };
+    let reply = super::reply(header, &unique_name)?;
+    let after = name_change_signals([&NameOwnerChanged::appeared(unique_name)]).map_err(failed)?;
+
+    Ok(Answer {
+        before: Vec::new(),
+        reply,
+        after,
+    })
+}
+
+/// Answer `RequestName` of `sender`, whose header is `header`, for `name`, with `flags`.
+///
+/// The signals of the change of the owner of the name come before the reply.
+async fn request_name(
+    peers: &Peers,
+    header: &Header<'_>,
+    sender: &UniqueName<'_>,
+    name: WellKnownName<'_>,
+    flags: RequestNameFlags,
+) -> Result<Answer> {
+    ensure_not_reserved(&name)?;
+    let (reply, changed) = {
+        let mut routing = peers.routing_mut().await;
+        let peer = routing.peer(sender.as_str())?;
+        if !peer.policy().may_own(&name) {
+            warn!("Refusing `{name}` to `{sender}`, as the policy does not let it own the name");
+
+            return Err(Error::AccessDenied(
+                "Request to own name refused by policy".to_string(),
+            ));
+        }
+
+        routing
+            .names_mut()
+            .request_name(name, sender.clone(), flags)
+    };
+
+    Ok(Answer {
+        before: name_change_signals(&changed).map_err(failed)?,
+        reply: super::reply(header, &reply)?,
+        after: Vec::new(),
+    })
+}
+
+/// Answer `ReleaseName` of `sender`, whose header is `header`, for `name`.
+///
+/// The signals of the change of the owner of the name come before the reply.
+async fn release_name(
+    peers: &Peers,
+    header: &Header<'_>,
+    sender: &UniqueName<'_>,
+    name: WellKnownName<'_>,
+) -> Result<Answer> {
+    ensure_not_reserved(&name)?;
+    let (reply, changed) = peers
+        .routing_mut()
+        .await
+        .names_mut()
+        .release_name(name, sender.clone());
+
+    Ok(Answer {
+        before: name_change_signals(&changed).map_err(failed)?,
+        reply: super::reply(header, &reply)?,
+        after: Vec::new(),
+    })
+}
+
+/// Fails for the name of the bus itself, which no client may ask for or let go of, as with
+/// dbus-broker and the reference implementation.
+fn ensure_not_reserved(name: &WellKnownName<'_>) -> Result<()> {
+    if name == BUS_NAME {
+        return Err(Error::InvalidArgs(format!("{BUS_NAME} is a reserved name")));
+    }
+
+    Ok(())
+}
+
+/// The unique name of the owner of `name`: its primary owner, if it is a well-known name, or the
+/// peer of that name, the bus itself among them, if it is a unique name.
+async fn name_owner(peers: &Peers, name: BusName<'_>) -> Result<OwnedUniqueName> {
+    let routing = peers.routing().await;
+    match name {
+        BusName::WellKnown(name) => routing.names().lookup(&name).cloned().ok_or_else(|| {
+            Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
+        }),
+        BusName::Unique(name) if name == BUS_NAME || routing.has_peer(&name) => Ok(name.into()),
+        BusName::Unique(_) => Err(Error::NameHasNoOwner(
+            "Name is not owned by anyone.".to_string(),
+        )),
+    }
+}
+
+/// Whether `name` has an owner.
+async fn has_owner(peers: &Peers, name: BusName<'_>) -> Result<bool> {
+    match name_owner(peers, name).await {
+        Ok(_) => Ok(true),
+        Err(Error::NameHasNoOwner(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// As many credentials as the bus has of the owner of `name`: of the process of the peer, or of
+/// the process of the bus itself.
+async fn credentials(peers: &Peers, name: BusName<'_>) -> Result<Arc<ConnectionCredentials>> {
+    let owner = name_owner(peers, name.clone()).await?;
+    if owner == BUS_NAME {
+        return Ok(Arc::new(own_credentials()));
+    }
+    // Not under the lock of the routing, as zbus looks the credentials up through the connection
+    // of the peer unless it knows them already, which waits for any send to the peer that is under
+    // way. It knows those of each client, which it looks up as the client connects, or as the bus
+    // takes the client over.
+    let conn = peers
+        .routing()
+        .await
+        .peer(&owner)
+        .map(|peer| peer.client().conn().clone())
+        .map_err(|_| Error::Failed(format!("Peer `{name}` not found")))?;
+
+    match conn.peer_creds().await {
+        Ok(creds) => Ok(creds.clone()),
+        Err(e) => Err(Error::Failed(format!(
+            "Failed to get peer credentials for `{name}`: {e}"
+        ))),
+    }
+}
+
+/// The credentials of the process of the bus: its pid, and its effective user and group.
+fn own_credentials() -> ConnectionCredentials {
+    ConnectionCredentials::default()
+        .set_process_id(std::process::id())
+        .set_unix_user_id(rustix::process::geteuid().as_raw())
+        .add_unix_group_id(rustix::process::getegid().as_raw())
+}
+
+/// The names that have an owner: the unique names of the bus and of its peers, and the well-known
+/// names that are owned.
+async fn names(peers: &Peers) -> Vec<OwnedBusName> {
+    let routing = peers.routing().await;
+    let bus = BusName::Unique(UniqueName::from_static_str_unchecked(BUS_NAME));
+    let unique_names = routing.peer_names().map(BusName::from);
+    let well_known_names = routing.names().all_names().keys().map(BusName::from);
+
+    [bus]
+        .into_iter()
+        .chain(unique_names)
+        .chain(well_known_names)
+        .map(OwnedBusName::from)
+        .collect()
+}
+
+/// The peers that queue for `name`, in order.
+async fn queued_owners(peers: &Peers, name: WellKnownName<'_>) -> Result<Vec<OwnedUniqueName>> {
+    peers
+        .routing()
+        .await
+        .names()
+        .waiting_list(name)
+        .ok_or_else(|| Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string()))
+        .map(|owners| owners.map(|owner| owner.unique_name()).cloned().collect())
+}
+
+/// Read the configuration of the bus again, and go by its policy.
+///
+/// If that fails, the bus goes on by the policy that it has, and the call fails, as with
+/// dbus-broker: the reason is for the log alone. The policy is read off the thread of the bus,
+/// which forwards the messages of its peers meanwhile, while the calls to the bus that come in
+/// before the reload is done wait for it, as they wait for any call before them.
+async fn reload_config(peers: &Peers) -> Result<()> {
+    match peers.reload().await {
+        Some(Ok(())) => {
+            info!("Reloaded the configuration.");
+
+            Ok(())
+        }
+        Some(Err(e)) => {
+            warn!("Failed to reload the configuration, which stays as it is: {e:#}");
+
+            Err(Error::Failed("Config invalid. Reload ignored.".to_string()))
+        }
+        None => Err(Error::Failed(
+            "No server configuration to reload.".to_string(),
+        )),
+    }
+}
+
+/// A signal of the bus, from its object, as `member` of its interface, to `destination` if any,
+/// and to the peers that subscribed to it otherwise.
+fn signal<'s>(member: &'s str, destination: Option<&'s str>) -> message::Builder<'s> {
+    let builder = Message::signal(PATH, BUS_NAME, member).sender(BUS_NAME);
+
+    match destination {
+        Some(destination) => builder.destination(destination),
+        None => builder,
+    }
+}
+
+/// The answer of the easter egg method, `Dune`.
+const DUNE: &str =
+    "I must not fear. Fear is the mind-killer. Fear is the little-death that brings total \
+     obliteration. I will face my fear. I will permit it to pass over me and through me. And when \
+     it has gone past I will turn the inner eye to see its path. Where the fear has gone there \
+     will be nothing. Only **I** will remain!";

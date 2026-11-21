@@ -10,8 +10,7 @@ use crate::{match_rules::MatchRules, user::Charge};
 use super::Recipient;
 
 /// A client of the bus: a peer, or the monitor that a peer becomes. It holds the client's
-/// connection and what the bus needs to serve the client and to hand it over. The bus itself, as a
-/// peer of its own, also has one.
+/// connection and what the bus needs to serve the client and to hand it over.
 #[derive(Debug)]
 pub struct Client {
     conn: Connection,
@@ -20,8 +19,8 @@ pub struct Client {
     unique_name: OwnedUniqueName,
     match_rules: MatchRules,
     /// The client as an object that the bus keeps for its user, as in dbus-broker. This holds for
-    /// a peer and for the monitor that the peer becomes. `None` for the bus itself.
-    _charge: Option<Charge>,
+    /// a peer and for the monitor that the peer becomes.
+    _charge: Charge,
     /// Notified when the client leaves, when it becomes a monitor, and when the bus pauses to hand
     /// over, so that the task that serves the client checks why.
     canceled: Event,
@@ -47,8 +46,8 @@ impl Client {
     }
 
     /// The client's number. No other client that the bus ever has shares it, and it stays the
-    /// same when a peer becomes a monitor. It is 0 for the bus itself, and 1 or more for the other
-    /// clients, whose unique names contain it.
+    /// same when a peer becomes a monitor. It is 1 or more, as 0 is the number of the bus itself,
+    /// and the unique name of the client contains it.
     pub fn id(&self) -> usize {
         self.id
     }
@@ -72,7 +71,7 @@ impl Client {
     /// the hand-over of its connection waits for the client to take what the bus sends it, because
     /// whatever it doesn't take goes along with the hand-over. Pausing also stops the write of what
     /// the previous instance of the bus left unwritten, if that write is still under way
-    /// ([`Client::flush`]). The bus itself pauses in the same way as its clients.
+    /// ([`Client::flush`]).
     #[cfg(target_os = "linux")]
     pub(crate) fn pause(&mut self) {
         let prepared = self.conn.prepare_hand_over();
@@ -111,7 +110,7 @@ impl Client {
         id: usize,
         unique_name: OwnedUniqueName,
         match_rules: MatchRules,
-        charge: Option<Charge>,
+        charge: Charge,
     ) -> Self {
         Self {
             conn,
@@ -137,13 +136,6 @@ impl Client {
     /// or pauses, so that the task that serves the client checks why.
     pub(super) fn notify_canceled(&self) {
         self.canceled.notify(usize::MAX);
-    }
-
-    /// Make `flushing` the task that writes to the client what is left to write, as
-    /// [`Client::flush`] does.
-    #[cfg(target_os = "linux")]
-    pub(super) fn set_flushing(&mut self, flushing: Task<(), Shared>) {
-        self.flushing = Some(flushing);
     }
 }
 
