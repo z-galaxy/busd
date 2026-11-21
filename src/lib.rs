@@ -5,6 +5,7 @@
 
 pub mod bus;
 pub mod config;
+pub mod connection;
 pub mod fdo;
 #[doc(hidden)]
 pub mod log;

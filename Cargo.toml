@@ -85,9 +85,15 @@ zruntime = { version = "0.2.4", features = [
 fastrand = "2.2.0"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
-# `net` is for the sockets of the bus, and `process` for its limit of open file descriptors. `std`
-# makes rustix share the types of std with its callers (`OwnedFd`, `io::Error`).
-rustix = { version = "1.1.2", default-features = false, features = ["net", "process", "std"] }
+# `net` is for the sockets of the bus, `event` for telling whether a client closed its end of the
+# socket, and `process` for the bus's limit of open file descriptors. `std` makes rustix share the
+# types of std with its callers (`OwnedFd`, `io::Error`).
+rustix = { version = "1.1.2", default-features = false, features = [
+    "event",
+    "net",
+    "process",
+    "std",
+] }
 foldhash = "0.2.0"
 # Draws the diagrams of the docs, which are in mermaid, in the HTML that `cargo doc` builds.
 simple-mermaid = "0.2.0"
