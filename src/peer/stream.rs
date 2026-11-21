@@ -19,6 +19,7 @@ use crate::peer::{Peer, MAX_MESSAGE_FDS};
 ///
 /// This stream ensures the following for each message produced:
 ///
+/// * Its body holds what its signature says.
 /// * It carries no more file descriptors than the bus can pass on, [`MAX_MESSAGE_FDS`].
 /// * It has neither the interface nor the path that the specification reserves for local use.
 /// * The destination field is present and readable for non-signals.
@@ -61,6 +62,9 @@ impl FutureStream for Stream {
 /// A message of a peer that the bus doesn't pass on.
 #[derive(Debug)]
 pub enum Invalid {
+    /// Its body doesn't hold what its signature says: the bus disconnects the peer, as dbus-broker
+    /// does, as it passes bodies on without reading them.
+    Body(zbus::Error),
     /// It carries more file descriptors than the bus can pass on, [`MAX_MESSAGE_FDS`]: the bus
     /// disconnects the peer.
     TooManyFds,
@@ -76,6 +80,10 @@ impl fmt::Display for Invalid {
     /// What the peer sent, to go on from "Disconnecting the peer, as it sent".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Body(e) => write!(
+                f,
+                "a message whose body doesn't hold what its signature says: {e}"
+            ),
             Self::TooManyFds => write!(
                 f,
                 "a message with more than {MAX_MESSAGE_FDS} file descriptors"
@@ -93,6 +101,11 @@ impl fmt::Display for Invalid {
 /// `msg`, which the peer `unique_name` sent, as [`Stream`] yields it: with its sender field set if
 /// it has none, unless the bus doesn't pass it on.
 pub(crate) fn checked(msg: Message, unique_name: &OwnedUniqueName) -> Result<Message, Invalid> {
+    // The bus passes the bodies of messages on without deserializing them, so it checks each one
+    // here, and disconnects a peer that sends one that doesn't hold what its signature says, as
+    // dbus-broker does.
+    msg.body().validate().map_err(Invalid::Body)?;
+
     // Passing such a message on would fail, and get its recipients disconnected.
     if msg.data().fds().len() > MAX_MESSAGE_FDS {
         return Err(Invalid::TooManyFds);
@@ -140,3 +153,42 @@ const LOCAL_INTERFACE: InterfaceName<'static> =
 /// The path that the specification reserves for the signal that a library raises locally.
 const LOCAL_PATH: ObjectPath<'static> =
     ObjectPath::from_static_str_unchecked("/org/freedesktop/DBus/Local");
+
+#[cfg(test)]
+mod tests {
+    use zbus::wire::Endian;
+
+    use super::*;
+
+    /// A message whose body doesn't hold what its signature says, a boolean of 2, is a violation,
+    /// even one that the bus would otherwise only drop, and one whose body does, a boolean of 1,
+    /// passes, with the sender field of its peer.
+    #[test]
+    fn bodies_are_checked() {
+        let peer = OwnedUniqueName::try_from(":busd.1").unwrap();
+        let with_body = |builder: message::Builder<'_>, body: &[u8]| {
+            let builder = builder.endian(Endian::Little);
+            // SAFETY: The body is 4 bytes, as a boolean takes, without file descriptors: at worst
+            // it holds another number than 0 or 1, which `checked` is to refuse before anything
+            // reads it.
+            unsafe { builder.build_raw_body(body, "b", vec![]) }.unwrap()
+        };
+        let signal = || Message::signal("/org/busd/Test", "org.busd.Test", "Bool");
+
+        // One without a sender field, one with that of the peer, and two that the bus would
+        // otherwise only drop, serving the peer on: a call without a destination, and a signal
+        // with the sender field of another peer.
+        for builder in [
+            signal(),
+            signal().sender(":busd.1"),
+            Message::method_call("/org/busd/Test", "Bool"),
+            signal().sender(":busd.2"),
+        ] {
+            let refused = checked(with_body(builder, &[2, 0, 0, 0]), &peer);
+            assert!(matches!(refused, Err(Invalid::Body(_))), "{refused:?}");
+        }
+        let passed = checked(with_body(signal(), &[1, 0, 0, 0]), &peer).unwrap();
+        assert_eq!(passed.header().sender(), Some(&peer.as_ref()));
+        assert!(passed.body().deserialize::<bool>().unwrap());
+    }
+}

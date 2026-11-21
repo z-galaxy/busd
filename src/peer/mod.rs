@@ -63,10 +63,6 @@ impl Peer {
         // (notably `Hello`) are never dropped in the race window between `build()` and stream
         // creation. See https://github.com/z-galaxy/zbus/pull/1760.
         //
-        // zbus checks the body of each message of the client as it receives it, as the bus passes
-        // the bodies of messages on without deserializing them, and the connection ends on one
-        // that doesn't hold what its signature says, as with dbus-broker.
-        //
         // A client authenticates with the EXTERNAL mechanism, the only one that dbus-broker takes
         // too: as the uid that its socket tells. zbus keeps the credentials that it looks up for
         // that, so it has them without waiting for the sends to the client, when asked for them.
@@ -74,7 +70,6 @@ impl Peer {
             .server(guid)
             .p2p()
             .auth_mechanism(AuthMechanism::External)
-            .validate_bodies()
             .build_message_stream()
             .await?;
         let conn = Connection::from(&msg_stream);
@@ -231,7 +226,6 @@ impl Peer {
         // the client and that the bus didn't take, and the part of the one that the client was in
         // the middle of sending, if any, before what the socket holds.
         let msg_stream = connection::Builder::take_over(handover)
-            .validate_bodies()
             .build_message_stream()
             .await?;
         let conn = Connection::from(&msg_stream);
