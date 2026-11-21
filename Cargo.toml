@@ -101,8 +101,15 @@ default-features = false
 default = ["tracing-subscriber"]
 tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing", "zoter/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
+# The helpers that busd's tests share build zbus clients.
+testing = ["zbus/default-rt"]
 
 [dev-dependencies]
+# The tests of `tests/` share helpers that the library has only with the `testing` feature. This
+# dependency turns on that feature alone, so that the tests build without the default features
+# too, with `--no-default-features`. Cargo leaves it out of the packaged crate, whose tests take
+# `--features testing` instead.
+busd = { path = ".", default-features = false, features = ["testing"] }
 # The tests drive the bus through proxies, and serve their own interfaces on its clients, which
 # the binary itself does not need. The benchmarks send byte arrays with `serde_bytes`, which
 # (de)serializes them whole rather than byte by byte.

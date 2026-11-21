@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::collections::HashMap;
 
 use anyhow::{ensure, Context};

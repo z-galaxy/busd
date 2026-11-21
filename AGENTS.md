@@ -40,6 +40,9 @@ cargo run -- --print-address
 
 # Test (integration tests live in tests/, e.g. config parsing)
 cargo test
+# The same from the packaged crate, which lacks the dev-dependency of busd on itself: the tests
+# that share the helpers of `src/testing.rs` build only with the `testing` feature
+cargo test --features testing
 
 # Format (nightly rustfmt) and lint
 cargo +nightly fmt --all
@@ -92,7 +95,7 @@ argument parsing via clap). Key modules:
 - **`tracing_subscriber.rs`** — logging setup (behind the default `tracing-subscriber`
   feature).
 - **`testing.rs`** — the helpers that the tests under `tests/` share: a bus for a test to run
-  against, and its clients.
+  against, and its clients (behind the `testing` feature, which the tests turn on).
 
 The library is internal to busd: it's only there for the binary, the tests and the
 benchmarks to share the code, and is only published along with the binary. Its `pub` items

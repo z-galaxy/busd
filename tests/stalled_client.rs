@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::{
     fs::File,
     future::Future,

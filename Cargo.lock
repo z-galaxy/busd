@@ -72,6 +72,7 @@ name = "busd"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "busd",
  "clap",
  "codspeed-criterion-compat",
  "fastrand",

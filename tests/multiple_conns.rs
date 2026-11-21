@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use busd::testing::{init_tracing, with_bus};
 use futures_util::future::join_all;
 use ntest::timeout;

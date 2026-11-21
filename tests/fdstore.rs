@@ -5,7 +5,7 @@
 //! the stored FDs, those that busd stores in the manager, and passes them to the next instance of
 //! busd, with the listening socket, among the passed FDs, as `$LISTEN_FDS` does. The FDs of a
 //! hand-over go by the names that the docs of `src/bus/systemd.rs` give them.
-#![cfg(target_os = "linux")]
+#![cfg(all(feature = "testing", target_os = "linux"))]
 
 use std::{
     env::temp_dir,

@@ -1,6 +1,6 @@
 //! A bus that hands over to its next instance, which serves its clients on, on the same
 //! connections, as if nothing happened.
-#![cfg(target_os = "linux")]
+#![cfg(all(feature = "testing", target_os = "linux"))]
 
 use std::{
     collections::HashSet,

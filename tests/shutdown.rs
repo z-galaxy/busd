@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::time::Duration;
 
 use busd::{
