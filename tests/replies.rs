@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::{
     future::Future,
     num::{NonZeroU32, NonZeroUsize},

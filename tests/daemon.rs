@@ -1,4 +1,5 @@
 //! The busd binary, run the way that a service manager or a script runs it.
+#![cfg(feature = "testing")]
 
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixDatagram;

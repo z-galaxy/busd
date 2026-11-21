@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use anyhow::ensure;
 use busd::testing::{connect, init_tracing, with_bus};
 use futures_util::TryStreamExt;

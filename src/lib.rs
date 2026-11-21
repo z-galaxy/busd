@@ -13,6 +13,7 @@ pub mod name_registry;
 pub mod peer;
 pub mod peers;
 pub mod policy;
+#[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
 pub mod testing;
 pub mod tracing_subscriber;

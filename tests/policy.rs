@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::{
     collections::VecDeque,
     fmt::Debug,

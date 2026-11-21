@@ -1,5 +1,5 @@
 //! A bus on a socket that listens already, as systemd's socket activation passes one.
-#![cfg(target_os = "linux")]
+#![cfg(all(feature = "testing", target_os = "linux"))]
 
 use std::{
     fs,
