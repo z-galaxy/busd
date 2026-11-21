@@ -124,14 +124,25 @@ fn restart_with_calls_to_the_bus_on_their_way() {
     let (last, on_their_way) = calls.split_last().unwrap();
     // The client takes the replies as they come, so that the bus never waits for it.
     let replies = calls.len();
+    let first_call = calls[0].primary_header().serial_num();
     let answering = SharedRuntime::current()
         .unwrap()
         .spawn("replies", async move {
             let mut answered = Vec::new();
             while answered.len() < replies {
                 let msg = messages.next().await.unwrap().unwrap();
-                if msg.message_type() == message::Type::MethodReturn {
-                    answered.push(msg.header().reply_serial().unwrap());
+                if msg.message_type() != message::Type::MethodReturn {
+                    continue;
+                }
+                // Not the reply to `Hello`, as the client connected, which may still come out of
+                // the stream: zbus hands a reply to its caller before it hands it to the streams,
+                // so the client can go on, and make the stream, in between, where its connection
+                // reads its socket on another thread. zbus numbers the messages of a process in
+                // the order that they are built, so that reply answers a lower serial than the
+                // calls of the test.
+                let replied = msg.header().reply_serial().unwrap();
+                if replied >= first_call {
+                    answered.push(replied);
                 }
             }
 

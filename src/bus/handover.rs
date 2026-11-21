@@ -510,6 +510,18 @@ mod tests {
             loop {
                 let msg = messages.next().await.unwrap().unwrap();
                 let header = msg.header();
+                // Not the reply to `Hello`, as the client connected, which may still come out of
+                // the stream: zbus hands a reply to its caller before it hands it to the streams,
+                // so the client can go on, and make the stream, in between, where its connection
+                // reads its socket on another thread. zbus numbers the messages of a process in
+                // the order that they are built, so that reply answers a lower serial than the
+                // calls of the test.
+                if header
+                    .reply_serial()
+                    .is_some_and(|replied| replied < serial(&failing))
+                {
+                    continue;
+                }
                 assert_eq!(
                     header.sender().map(|sender| sender.as_str()),
                     Some(fdo::BUS_NAME),

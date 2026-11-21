@@ -310,7 +310,9 @@ fn reload_holds_later_calls_back() {
                 conn.send(call).await?;
             }
             let runtime = SharedRuntime::current()?;
-            let early = runtime.timeout(QUIET, next_reply(&mut messages)).await;
+            let early = runtime
+                .timeout(QUIET, next_reply(&mut messages, &calls[0]))
+                .await;
             ensure!(
                 early.is_err(),
                 "the bus answered during the reload: {early:?}"
@@ -318,7 +320,7 @@ fn reload_holds_later_calls_back() {
 
             blocked.started().await.let_go().await;
             for call in &calls {
-                let reply = next_reply(&mut messages).await?;
+                let reply = next_reply(&mut messages, &calls[0]).await?;
                 ensure!(
                     reply.header().reply_serial() == Some(call.primary_header().serial_num()),
                     "the bus sent {reply:?} instead of the reply to {call:?}"
@@ -352,6 +354,7 @@ fn calls_that_expect_no_reply_get_none() {
         }
         let last = call_of(BUS_NAME, "GetId");
         conn.send(&last).await?;
+        let first = calls[0].primary_header().serial_num();
         let mut acquired = false;
         loop {
             let msg = messages.next().await.context("the stream ended")??;
@@ -362,6 +365,11 @@ fn calls_that_expect_no_reply_get_none() {
                     .is_some_and(|member| member == "NameAcquired")
                     && msg.body().deserialize::<&str>()? == "org.busd.Quiet";
 
+                continue;
+            }
+            // Not the reply to `Hello`, as the client connected, which may still come out of the
+            // stream: see `next_reply`.
+            if header.reply_serial().is_some_and(|replied| replied < first) {
                 continue;
             }
             ensure!(
@@ -547,11 +555,23 @@ async fn answer(conn: &Connection, call: &Message) -> Message {
     }
 }
 
-/// The next reply or error that comes out of `messages`, past the signals.
-async fn next_reply(messages: &mut MessageStream) -> anyhow::Result<Message> {
+/// The next reply or error that comes out of `messages`, past the signals, and past the replies to
+/// the calls made before `first`.
+///
+/// One of those may still come out of a stream made after the call returned, such as the reply to
+/// `Hello` as the client connected: zbus hands a reply to its caller before it hands it to the
+/// streams, so the caller can go on, and make the stream, in between, where its connection reads
+/// its socket on another thread. zbus numbers the messages of a process in the order that they are
+/// built, so such a reply answers a serial lower than that of `first`.
+async fn next_reply(messages: &mut MessageStream, first: &Message) -> anyhow::Result<Message> {
+    let first = first.primary_header().serial_num();
     loop {
         let msg = messages.next().await.context("the stream ended")??;
-        if msg.message_type() != message::Type::Signal {
+        let earlier = msg
+            .header()
+            .reply_serial()
+            .is_some_and(|replied| replied < first);
+        if msg.message_type() != message::Type::Signal && !earlier {
             return Ok(msg);
         }
     }

@@ -323,9 +323,8 @@ async fn send_to_a_name_(bus: TestBus) -> anyhow::Result<()> {
             .with_context(|| format!("a call to `{destination}`"))?;
     }
     let mut replies = MessageStream::from(&caller);
-    caller
-        .send(&no_reply(SERVICE, PATH, "org.busd.Denied", "Quiet")?)
-        .await?;
+    let quiet = no_reply(SERVICE, PATH, "org.busd.Denied", "Quiet")?;
+    caller.send(&quiet).await?;
     caller
         .send(&no_reply(SERVICE, PATH, INTERFACE, "Allowed")?)
         .await?;
@@ -334,7 +333,16 @@ async fn send_to_a_name_(bus: TestBus) -> anyhow::Result<()> {
     dbus_proxy(&caller).await?.get_id().await?;
     let msg = loop {
         let msg = replies.try_next().await?.unwrap();
-        if msg.message_type() != message::Type::Signal {
+        // Not the error to the last call before the stream, which may still come out of it: zbus
+        // hands a reply to its caller before it hands it to the streams, so the caller can go on,
+        // and make the stream, in between, where its connection reads its socket on another
+        // thread. zbus numbers the messages of a process in the order that they are built, so that
+        // error answers a lower serial than the call that expects no reply.
+        let earlier = msg
+            .header()
+            .reply_serial()
+            .is_some_and(|replied| replied < quiet.primary_header().serial_num());
+        if msg.message_type() != message::Type::Signal && !earlier {
             break msg;
         }
     };
