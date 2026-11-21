@@ -84,7 +84,9 @@ impl Peers {
         let (calls, queue) = fdo::queue(chores.clone());
         // The bus is of the user of its process, as with dbus-broker.
         let itself = Itself {
-            recipient: Recipient::bus(calls),
+            recipient: Recipient::bus(calls.clone()),
+            #[cfg(target_os = "linux")]
+            calls,
             served: Served::bus(users.user(uid)),
             policy: PeerPolicy::unrestricted(),
         };
@@ -373,6 +375,10 @@ struct Inner {
 struct Itself {
     /// Where the calls to the bus go: the queue of the task that answers them.
     recipient: Recipient,
+    /// The queue of the task that answers the calls to the bus, for the calls that an instance of
+    /// busd 0.8 didn't take, which the bus answers before any other call.
+    #[cfg(target_os = "linux")]
+    calls: fdo::Calls,
     /// The bus, as the sender of its replies, errors and signals.
     served: Served,
     /// What the policy has for the bus: it may send and receive everything.

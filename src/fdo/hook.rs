@@ -44,7 +44,7 @@ impl Gate {
     }
 
     /// Wait at the gate until it is open, and tell that it was reached.
-    async fn pass(&self) {
+    pub(crate) async fn pass(&self) {
         self.reached.store(true, Ordering::SeqCst);
         self.changed.notify(usize::MAX);
         self.wait_for(&self.open).await;

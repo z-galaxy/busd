@@ -43,6 +43,12 @@ use crate::{
 
 mod dbus;
 pub(crate) use dbus::name_change_signals;
+#[cfg(target_os = "linux")]
+mod handover;
+#[cfg(target_os = "linux")]
+pub(crate) use handover::OnItsWay;
+#[cfg(target_os = "linux")]
+use handover::TakenOver;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod hook;
 mod introspectable;
@@ -78,7 +84,7 @@ pub const QUEUED: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 /// A queue of the calls to the bus, whose calls are chores among `chores`: the end that the tasks
 /// that serve the clients put the calls in, and the end that the bus takes them out of.
-pub(crate) fn queue(chores: Chores) -> (Calls, mpmc::Receiver<Call>) {
+pub(crate) fn queue(chores: Chores) -> (Calls, mpmc::Receiver<Job>) {
     let (sender, receiver) = mpmc::bounded(QUEUED);
 
     (
@@ -92,7 +98,7 @@ pub(crate) fn queue(chores: Chores) -> (Calls, mpmc::Receiver<Call>) {
 
 /// Answer the calls to the bus of `peers`, whose GUID is `guid`, that come out of `queue`, in a
 /// task of its own, until the queue is closed or the peers go.
-pub(crate) fn answer_calls(peers: &Peers, guid: OwnedGuid, queue: mpmc::Receiver<Call>) {
+pub(crate) fn answer_calls(peers: &Peers, guid: OwnedGuid, queue: mpmc::Receiver<Job>) {
     let driver = Driver {
         peers: peers.downgrade(),
         guid,
@@ -107,7 +113,7 @@ pub(crate) fn answer_calls(peers: &Peers, guid: OwnedGuid, queue: mpmc::Receiver
 /// in.
 #[derive(Clone, Debug)]
 pub(crate) struct Calls {
-    queue: mpmc::Sender<Call>,
+    queue: mpmc::Sender<Job>,
     chores: Chores,
 }
 
@@ -126,10 +132,31 @@ impl Calls {
                 msg: msg.clone(),
                 _chore: self.chores.start(),
             };
-            if self.queue.send(call).await.is_err() {
+            if self.queue.send(Job::Call(call)).await.is_err() {
                 debug!("Dropping {msg:?}, as the bus takes no more calls");
             }
         }
+    }
+
+    /// Have the bus answer `calls`, the calls to it that an instance of busd 0.8 didn't take, as
+    /// [`OnItsWay`] says, before any other call, but not before the returned gate is given a
+    /// message, or dropped: call this before anyone calls the bus, and let the bus go on once it
+    /// passed on what that instance sent.
+    ///
+    /// Answering them is a chore of the bus, until the bus is done with it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_over(&self, calls: Vec<Message>) -> mpmc::Sender<()> {
+        let (gate, held) = mpmc::bounded(NonZeroUsize::MIN);
+        let taken_over = TakenOver { calls, held };
+        let job = Job::TakeOver(Box::new(taken_over), self.chores.start());
+        if self.queue.try_send(job).is_err() {
+            warn!(
+                "Dropping the calls to the bus that it was handed over with, as the bus took calls \
+                 ahead of them"
+            );
+        }
+
+        gate
     }
 
     /// Take no more calls: the bus answers those that are in the queue already, and stops.
@@ -137,6 +164,17 @@ impl Calls {
     pub(crate) fn close(&self) {
         self.queue.close();
     }
+}
+
+/// What the bus does, in the order of its queue, each a chore of the bus until it is done.
+#[derive(Debug)]
+pub(crate) enum Job {
+    /// Answer a call.
+    Call(Call),
+    /// Answer the calls to the bus that an instance of busd 0.8 didn't take: see
+    /// [`Calls::take_over`]. It is boxed, as the calls that fill the queue are much smaller.
+    #[cfg(target_os = "linux")]
+    TakeOver(Box<TakenOver>, Chore),
 }
 
 /// A call to the bus, in its queue, which is a chore of the bus until the bus has answered it.
@@ -161,21 +199,25 @@ struct Driver {
 }
 
 impl Driver {
-    /// Answer the calls that come out of `queue`, until it is closed and empty, or the peers go.
-    async fn run(mut self, queue: mpmc::Receiver<Call>) {
-        while let Ok(call) = queue.recv().await {
+    /// Do the jobs that come out of `queue`, until it is closed and empty, or the peers go.
+    async fn run(mut self, queue: mpmc::Receiver<Job>) {
+        while let Ok(job) = queue.recv().await {
             let Some(peers) = self.peers.upgrade() else {
                 return;
             };
-            self.answer(&peers, call).await;
+            // Each job is a chore until it is done.
+            match job {
+                Job::Call(Call { msg, _chore }) => self.answer(&peers, &msg).await,
+                #[cfg(target_os = "linux")]
+                Job::TakeOver(taken_over, _chore) => self.take_over(&peers, *taken_over).await,
+            }
         }
     }
 
     /// Answer `call`, and send what the call has the bus send, its reply and signals, in the order
-    /// that the call has them: the call is a chore until then.
-    async fn answer(&mut self, peers: &Peers, call: Call) {
-        let Call { msg, _chore } = call;
-        let Some(msgs) = self.messages(peers, &msg).await else {
+    /// that the call has them.
+    async fn answer(&mut self, peers: &Peers, call: &Message) {
+        let Some(msgs) = self.messages(peers, call).await else {
             return;
         };
 

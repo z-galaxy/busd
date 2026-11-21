@@ -23,6 +23,7 @@ use zruntime::{spawn, SharedRuntime};
 use super::{Peers, Routing, Served};
 use crate::{
     debug,
+    fdo::OnItsWay,
     match_rules::MatchRules,
     name_registry::{NameOwner, NameRegistry},
     peer::{unique_name, Caller, Client, HandedOver, Monitor, Peer, Recipient, Stream},
@@ -248,17 +249,28 @@ impl Peers {
     /// client first, as the client takes it: a client that doesn't take it within `send_timeout`
     /// gets disconnected, as when a send to it times out. What is left of it once the bus pauses,
     /// to hand over in turn, goes on with that hand-over.
+    ///
+    /// With `on_its_way`, what was on its way on the connection on which an instance of busd 0.8
+    /// served the D-Bus API, the bus passes on what that instance sent, once the peers, monitors
+    /// and names are back, before anything else that it sends, the clean-up after the peers that
+    /// went included, and then answers the calls to it that that instance didn't take, before any
+    /// other call.
     pub(crate) async fn restore(
         &self,
         snapshot: Snapshot,
         mut clients: HashMap<usize, ClientHandover>,
         send_timeout: Duration,
+        on_its_way: Option<OnItsWay>,
     ) -> Result<()> {
         let Snapshot {
             peers,
             monitors,
             names,
         } = snapshot;
+        let (sent, calls) = match on_its_way {
+            Some(OnItsWay { sent, calls }) => (sent, Some(calls)),
+            None => (Vec::new(), None),
+        };
         // The connections start reading as they are created, but the bus only forwards what comes
         // in once all of its peers, monitors and names are back.
         let mut restored = Vec::new();
@@ -310,8 +322,12 @@ impl Peers {
                 }
             }
         }
-        {
+        let gate = {
             let mut routing = self.routing_mut().await;
+            // The bus queues these calls first, once it has the lock, and so once all that follows
+            // is in place, while the peers, which wait for the lock to forward what they send, have
+            // called it for nothing yet. It answers them once the gate lets it, below.
+            let gate = calls.map(|calls| self.inner.itself.calls.take_over(calls));
             for NameState { name, owners } in names {
                 let mut owners = owners
                     .into_iter()
@@ -356,8 +372,12 @@ impl Peers {
                 monitor.client_mut().flush();
                 self.insert_monitor(&mut routing, monitor, stream);
             }
-        }
-        // The bus serves its clients from here on, so it goes on whatever comes.
+
+            gate
+        };
+        // The bus serves its clients from here on, so it goes on whatever comes. What the previous
+        // instance sent and didn't pass on goes first, as it would have.
+        self.send_from_bus(&sent).await;
         for (unique_name, records, names_changes) in gone {
             let waiting = records
                 .into_iter()
@@ -367,6 +387,12 @@ impl Peers {
             if let Err(e) = cleaned_up.await {
                 warn!("Failed to clean up after `{unique_name}`: {e}");
             }
+        }
+        if let Some(gate) = gate {
+            // The bus goes on with the calls that the previous instance didn't take, whose answers
+            // come after what it sent here. This fails only if the bus dropped those calls, or
+            // stopped.
+            let _ = gate.try_send(());
         }
         if !clients.is_empty() {
             warn!(

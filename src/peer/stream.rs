@@ -90,8 +90,9 @@ impl fmt::Display for Invalid {
     }
 }
 
-/// `msg`, which the peer `unique_name` sent, with its sender field set if it has none.
-fn checked(msg: Message, unique_name: &OwnedUniqueName) -> Result<Message, Invalid> {
+/// `msg`, which the peer `unique_name` sent, as [`Stream`] yields it: with its sender field set if
+/// it has none, unless the bus doesn't pass it on.
+pub(crate) fn checked(msg: Message, unique_name: &OwnedUniqueName) -> Result<Message, Invalid> {
     // Passing such a message on would fail, and get its recipients disconnected.
     if msg.data().fds().len() > MAX_MESSAGE_FDS {
         return Err(Invalid::TooManyFds);

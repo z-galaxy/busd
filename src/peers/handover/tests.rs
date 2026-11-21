@@ -689,7 +689,7 @@ async fn take_over(handed_over: HandedOver, carry: Carry) -> Peers {
         .collect();
     let peers = Peers::new(guid);
     peers
-        .restore(snapshot, clients, SEND_TIMEOUT)
+        .restore(snapshot, clients, SEND_TIMEOUT, None)
         .await
         .unwrap();
 

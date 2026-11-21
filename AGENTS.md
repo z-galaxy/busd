@@ -82,8 +82,9 @@ argument parsing via clap). Key modules:
   replies and signals as it forwards the messages of a peer. It serves `org.freedesktop.DBus`
   (`dbus.rs`), monitoring (`monitoring.rs`) and statistics (`stats.rs`) on
   `/org/freedesktop/DBus`, and the standard `Introspectable` (`introspectable.rs`, with the XML),
-  `Properties` (`properties.rs`) and `Peer` (`peer.rs`) interfaces. `hook.rs` holds the answers of
-  the bus at gates, for the hand-over tests.
+  `Properties` (`properties.rs`) and `Peer` (`peer.rs`) interfaces. `handover.rs` takes what was
+  on its way to and from the connection on which busd 0.8 served the D-Bus API, which that version
+  handed over too, and `hook.rs` holds the answers of the bus at gates, for the hand-over tests.
 - **`config/`** — bus configuration file parsing: `xml.rs` (the `.conf` format),
   `policy.rs` and `rule.rs` (the access-control policy, as parsed).
 - **`policy/`** — the access-control policy that the bus enforces, built from the parsed one:

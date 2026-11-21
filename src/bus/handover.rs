@@ -11,12 +11,14 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use zbus::{
+    connection::socket::ChannelHandover,
     wire::{serialized, to_bytes, LE},
     OwnedGuid, Type,
 };
 
 use super::{Bus, Listener};
 use crate::{
+    fdo::OnItsWay,
     info,
     peers::{
         handover::{ClientHandover, MonitorState, NameState, PeerState, Snapshot},
@@ -85,6 +87,7 @@ impl Bus {
             state,
             listener,
             clients,
+            own: None,
         })
     }
 
@@ -106,7 +109,12 @@ impl Bus {
     /// beyond a maximum that is lower than the previous one.
     ///
     /// The calls to the bus that the previous instance didn't take are among what that instance
-    /// didn't take of its clients, which the bus takes as it serves them, as it takes any call.
+    /// didn't take of its clients, which the bus takes as it serves them, as it takes any call. A
+    /// previous instance of busd 0.8 handed over the connection on which it served the D-Bus API
+    /// too, with what was on its way between it and its clients, which the bus takes off that
+    /// connection first: once the clients, their names and their match rules are back, it passes
+    /// on what that instance sent and didn't pass on, before anything else that it sends, and then
+    /// answers the calls to it that that instance didn't take, before any other call.
     pub async fn take_over(
         handover: Handover,
         listener: Option<OwnedFd>,
@@ -123,6 +131,10 @@ impl Bus {
         let guid = state.guid;
         let address = listener.address(&guid)?;
         let last_id = usize::try_from(state.last_id)?;
+        let on_its_way = match handover.own {
+            Some(channel) => Some(OnItsWay::take_over(channel).await?),
+            None => None,
+        };
         let peers = Peers::new(guid.clone());
         // Before the bus has the clients of the hand-over, which it serves as soon as it has them.
         peers.set_policy(policy).await;
@@ -136,7 +148,9 @@ impl Bus {
             monitors: state.monitors,
             names: state.names,
         };
-        peers.restore(snapshot, clients, send_timeout).await?;
+        peers
+            .restore(snapshot, clients, send_timeout, on_its_way)
+            .await?;
         let mut bus = Self::with_peers(listener, address, guid, peers);
         bus.next_id = last_id;
         bus.set_send_timeout(send_timeout);
@@ -161,6 +175,10 @@ pub struct Handover {
     pub(crate) listener: Option<OwnedFd>,
     /// The clients, peers and monitors.
     pub(crate) clients: Vec<ClientHandover>,
+    /// The connection on which the previous instance served the D-Bus API, both of its ends, in a
+    /// hand-over of busd 0.8, which handed it over with what was on its way between the bus and
+    /// its clients. `None` in any other.
+    pub(crate) own: Option<ChannelHandover>,
 }
 
 impl Handover {
@@ -211,47 +229,65 @@ impl State {
         Ok(data.bytes().to_vec())
     }
 
-    /// The state that `bytes` hold, as [`State::encode`] encoded it.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+    /// The state that `bytes` hold, as [`State::encode`] encoded it, and whether its bus handed
+    /// over the connection on which it served the D-Bus API as well, as a bus of
+    /// [`VERSION_WITH_OWN`] did.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<(Self, bool)> {
         let data = serialized::Data::new(bytes, serialized::Context::new(LE, 0));
         let (version, _) = data
             .deserialize::<u32>()
             .context("The state that was handed over has no version")?;
-        if version != VERSION && version != VERSION_1 {
-            bail!("The state that was handed over is of version {version}, not {VERSION}.");
-        }
+        let with_own = match version {
+            VERSION | VERSION_1 => false,
+            VERSION_WITH_OWN => true,
+            _ => bail!("The state that was handed over is of version {version}, not {VERSION}."),
+        };
         let ((_, state), _) = data
             .deserialize::<(u32, Self)>()
             .context("Failed to decode the state that was handed over")?;
 
-        Ok(state)
+        Ok((state, with_own))
     }
 }
 
-/// The version of the state. A bus takes over from a bus of the same version, or of [`VERSION_1`],
-/// and from no other.
+/// The version of the state. A bus takes over from a bus of the same version, or of one of the
+/// versions before it, [`VERSION_WITH_OWN`] and [`VERSION_1`], all of which encode the state in the
+/// same way, and from no other.
 ///
 /// A bus of this version answers the calls to it that it took before it hands over, so nothing is
-/// on its way to or from it then. A bus of version 2, between the two, handed over the connection
-/// on which it served the D-Bus API, along with its state, with what was on its way there, which a
-/// bus of this version doesn't take over.
+/// on its way to or from it then.
 ///
 /// busd 0.8 and the versions before it take nothing over from a state of this version, so going
 /// back to one of them disconnects the clients.
 const VERSION: u32 = 3;
-/// The first version of the state, which is encoded in the same way as this one, and means the
-/// same: its bus made sure that nothing was on its way to or from it as it handed over.
+/// The version of the state of busd 0.8, which handed over the connection on which it served the
+/// D-Bus API as well, with what was on its way there.
+const VERSION_WITH_OWN: u32 = 2;
+/// The first version of the state, which means the same as this one: its bus made sure that nothing
+/// was on its way to or from it as it handed over.
 const VERSION_1: u32 = 1;
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
+
+    use futures_util::{future::join, StreamExt};
+    use ntest::timeout;
     use zbus::{
+        connection::{self, socket::Channel},
+        message,
         names::{OwnedUniqueName, OwnedWellKnownName},
-        OwnedMatchRule,
+        Connection, Guid, Message, MessageStream, OwnedMatchRule,
     };
+    use zoter::{Restore, Save};
 
     use super::*;
-    use crate::match_rules::MatchRules;
+    use crate::{
+        fdo::{self, hook::Gate},
+        match_rules::MatchRules,
+        peer::{unique_name, SEND_TIMEOUT},
+        testing::{connect_as, unix_address},
+    };
 
     #[test]
     fn state() {
@@ -279,8 +315,9 @@ mod tests {
         };
 
         let encoded = state.encode().unwrap();
-        let decoded = State::decode(&encoded).unwrap();
+        let (decoded, with_own) = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
+        assert!(!with_own);
 
         let mut other = encoded.clone();
         let version = VERSION + 1;
@@ -302,8 +339,9 @@ mod tests {
         let hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(hex, ENCODED);
 
-        let decoded = State::decode(&encoded).unwrap();
+        let (decoded, with_own) = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
+        assert!(!with_own);
     }
 
     /// A bus takes over from a state of the first version, which is encoded as one of this version
@@ -320,20 +358,22 @@ mod tests {
         let mut encoded = state.encode().unwrap();
         encoded[..4].copy_from_slice(&VERSION_1.to_le_bytes());
 
-        let decoded = State::decode(&encoded).unwrap();
+        let (decoded, with_own) = State::decode(&encoded).unwrap();
 
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
+        assert!(!with_own);
     }
 
-    /// A bus doesn't take over from a state of version 2, which came with the connection on which
-    /// its bus served the D-Bus API, as busd 0.8 encoded the state of [`pinned_state`].
+    /// A bus takes over from the state of busd 0.8, of version 2, which came with the connection on
+    /// which its bus served the D-Bus API: as busd 0.8 encoded the state of [`pinned_state`].
     #[test]
-    fn state_of_version_2_is_refused() {
+    fn state_of_version_2_comes_with_the_connection_of_the_bus() {
         let encoded = bytes_of(ENCODED_BY_VERSION_2);
 
-        let error = State::decode(&encoded).unwrap_err();
+        let (decoded, with_own) = State::decode(&encoded).unwrap();
 
-        assert!(error.to_string().contains("version 2"), "{error}");
+        assert_eq!(format!("{decoded:?}"), format!("{:?}", pinned_state()));
+        assert!(with_own);
     }
 
     /// A bus doesn't take over from a state that it can't decode, rather than panic: garbage, the
@@ -360,6 +400,255 @@ mod tests {
             spoil(&mut spoiled);
             assert!(State::decode(&spoiled).is_err(), "{spoiled:?}");
         }
+    }
+
+    /// A bus takes over from busd 0.8, whose hand-over is of version 2, and comes with the
+    /// connection on which that bus served the D-Bus API, both of its ends, with more on its way
+    /// between them than the channel between them holds, so that each end keeps some unwritten.
+    ///
+    /// The next instance passes on what the bus sent and didn't pass on, in order, with the bus for
+    /// the sender of each message, the error that lacked one included, as the object server of
+    /// busd 0.8 sent its errors, but for what the bus doesn't send. Only then does it clean up
+    /// after the peer of the state that went meanwhile, whose name that bus signalled the change
+    /// of, and then answers the calls to the bus that that bus didn't take, in order, before the
+    /// calls that come after.
+    #[test]
+    #[timeout(30000)]
+    fn bus_takes_over_from_busd_0_8() {
+        // More than the two ends of the connection hold between them.
+        const MANY: u32 = 150;
+        // The number of the peer that went while busd 0.8 handed over.
+        const GONE: usize = 2;
+        // The name that the client released, as that bus handed over, which the peer that went got.
+        const NAME: &str = "org.busd.Test.Name";
+
+        zruntime::block_on(async {
+            let bus = Bus::for_address(Some(&unix_address())).await.unwrap();
+            let uid = rustix::process::getuid().as_raw();
+            let client = connect_as(bus.peers(), bus.guid(), 1, uid).await.unwrap();
+            let name = client.unique_name().unwrap().to_string();
+            let gone = unique_name(GONE).to_string();
+            let mut messages = MessageStream::from(&client);
+            let mut handover = bus.hand_over().await.unwrap();
+            // The state as busd 0.8 encoded it, with the version of its own, in which the client
+            // watches the names change owners, and the peer that went owns the name.
+            let mut state = handover.state.encode().unwrap();
+            state[..4].copy_from_slice(&VERSION_WITH_OWN.to_le_bytes());
+            let (mut state, with_own) = State::decode(&state).unwrap();
+            assert!(with_own);
+            let rule = "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged'";
+            state.peers[0]
+                .match_rules
+                .add(OwnedMatchRule::try_from(rule).unwrap());
+            state.peers.push(PeerState {
+                id: GONE as u64,
+                greeted: true,
+                match_rules: MatchRules::default(),
+                pending_calls: Vec::new(),
+            });
+            state.names.push(NameState {
+                name: OwnedWellKnownName::try_from(NAME).unwrap(),
+                owners: vec![(unique_name(GONE), false, false)],
+            });
+            state.last_id = GONE as u64;
+            handover.state = state;
+            let get_id = |sender: Option<&str>| {
+                let call = Message::method_call(fdo::PATH, "GetId")
+                    .interface(fdo::BUS_NAME)
+                    .destination(fdo::BUS_NAME);
+                match sender {
+                    Some(sender) => call.sender(sender),
+                    None => call,
+                }
+                .build(&())
+                .unwrap()
+            };
+            // The client asks for the owner of a name that nobody owns, and for the ID of the bus.
+            let failing = Message::method_call(fdo::PATH, "GetNameOwner")
+                .interface(fdo::BUS_NAME)
+                .destination(fdo::BUS_NAME)
+                .sender(name.as_str())
+                .build(&NAME)
+                .unwrap();
+            let calls: Vec<_> = (0..MANY).map(|_| get_id(Some(&name))).collect();
+            let signal = |sender: &str, n: u32| {
+                Message::signal("/org/busd/Test", "org.busd.Test", "Sent")
+                    .sender(sender)
+                    .destination(name.as_str())
+                    .build(&n)
+                    .unwrap()
+            };
+            let sent: Vec<_> = (0..MANY)
+                .map(|n| signal(fdo::BUS_NAME, n))
+                .chain([
+                    Message::signal(fdo::PATH, fdo::BUS_NAME, "NameOwnerChanged")
+                        .sender(fdo::BUS_NAME)
+                        .build(&(NAME, &name, &gone))
+                        .unwrap(),
+                    // What the bus doesn't send: a message of another sender, and a call.
+                    signal(":busd.9", MANY),
+                    Message::method_call("/org/busd/Test", "Call")
+                        .sender(fdo::BUS_NAME)
+                        .destination(name.as_str())
+                        .build(&())
+                        .unwrap(),
+                ])
+                .collect();
+            let own = connection_of_busd_0_8(&failing, &calls, &sent).await;
+            handover.own = Some(stored(&own));
+
+            let _next = Bus::take_over(handover, None, SEND_TIMEOUT, Arc::default())
+                .await
+                .unwrap();
+            let ping = get_id(None);
+            client.send(&ping).await.unwrap();
+            let serial = |msg: &Message| msg.primary_header().serial_num();
+            let owner_change = |name: &str, old: &str, new: &str| {
+                format!("`{name}` changed owners, from `{old}` to `{new}`")
+            };
+            let mut got = Vec::new();
+            loop {
+                let msg = messages.next().await.unwrap().unwrap();
+                let header = msg.header();
+                assert_eq!(
+                    header.sender().map(|sender| sender.as_str()),
+                    Some(fdo::BUS_NAME),
+                    "{msg:?}"
+                );
+                let member = header.member().map(|member| member.as_str());
+                match (msg.message_type(), member) {
+                    (message::Type::Signal, Some("Sent")) => {
+                        got.push(format!(
+                            "signal {}",
+                            msg.body().deserialize::<u32>().unwrap()
+                        ));
+                    }
+                    (message::Type::Signal, Some("NameOwnerChanged")) => {
+                        let (name, old, new): (String, String, String) =
+                            msg.body().deserialize().unwrap();
+                        got.push(owner_change(&name, &old, &new));
+                    }
+                    (message::Type::MethodCall, member) => got.push(format!("call {member:?}")),
+                    (message::Type::Error, _) => {
+                        let name = header.error_name().unwrap();
+                        got.push(format!("{name} for {}", header.reply_serial().unwrap()));
+                    }
+                    (message::Type::MethodReturn, _) => {
+                        let replied = header.reply_serial().unwrap();
+                        got.push(format!("reply to {replied}"));
+                        if replied == serial(&ping) {
+                            break;
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            // What that bus sent first, its error and the reply of its object server to the first
+            // call included, then the clean-up after the peer that went: its name has no owner any
+            // more, and its unique name goes. Then the replies of the next instance to the calls
+            // that that bus didn't take, and to the call after them.
+            let expected: Vec<_> = iter::once(format!(
+                "org.freedesktop.DBus.Error.NameHasNoOwner for {}",
+                serial(&failing)
+            ))
+            .chain((0..MANY).map(|n| format!("signal {n}")))
+            .chain([
+                owner_change(NAME, &name, &gone),
+                format!("reply to {}", serial(&calls[0])),
+                owner_change(NAME, &gone, ""),
+                owner_change(&gone, &gone, ""),
+            ])
+            .chain(
+                calls[1..]
+                    .iter()
+                    .chain([&ping])
+                    .map(|call| format!("reply to {}", serial(call))),
+            )
+            .collect();
+            assert_eq!(got, expected);
+        });
+    }
+
+    /// The connection on which busd 0.8 served the D-Bus API, both of its ends off their channel,
+    /// as that bus handed it over: the object server of the end that answered the calls to the bus
+    /// answered `failing` with an error, took the first of `calls` and left the others, and
+    /// answered the first once the hand-over started, after `sent`, which the bus sent and nobody
+    /// passed on. The ends don't wait for each other to read, so each keeps what the channel and
+    /// the other end don't take unwritten.
+    async fn connection_of_busd_0_8(
+        failing: &Message,
+        calls: &[Message],
+        sent: &[Message],
+    ) -> ChannelHandover {
+        let (service, peer) = Channel::pair();
+        let guid: OwnedGuid = Guid::generate().into();
+        let gate = Arc::new(Gate::default());
+        let service = connection::Builder::authenticated_socket(service, guid.clone())
+            .p2p()
+            .serve_at(fdo::PATH, OldBus(gate.clone()))
+            .build()
+            .await
+            .unwrap();
+        let mut peer = connection::Builder::authenticated_socket(peer, guid)
+            .p2p()
+            .build_message_stream()
+            .await
+            .unwrap();
+        let peer_conn = Connection::from(&peer);
+
+        // The object server answers the failing call at once, and takes the first of the others,
+        // which waits at the gate.
+        peer_conn.send(failing).await.unwrap();
+        peer_conn.send(&calls[0]).await.unwrap();
+        gate.reached().await;
+        assert!(service.prepare_hand_over() && peer_conn.prepare_hand_over());
+        peer_conn.send_all(&calls[1..]).await.unwrap();
+        service.send_all(sent).await.unwrap();
+        // The hand-over waits for the call under way, whose reply goes after what the bus sent.
+        let opening = async { gate.open() };
+        let (service, ()) = join(service.hand_over(), opening).await;
+        let service = service.unwrap();
+        let peer = peer.hand_over().await.unwrap();
+        for (end, handover) in [("service", &service), ("peer", &peer)] {
+            assert_ne!(handover.unread_len(), 0, "the {end} end read all");
+            assert_ne!(handover.unwritten_len(), 0, "the {end} end wrote all");
+        }
+
+        ChannelHandover::new(service, peer).unwrap()
+    }
+
+    /// The `org.freedesktop.DBus` interface of busd 0.8, as far as the test of a take-over from it
+    /// needs: `GetNameOwner`, which fails, as for a name that nobody owns, and `GetId`, which waits
+    /// at the gate before it answers, as the bus answers one call at a time.
+    struct OldBus(Arc<Gate>);
+
+    #[zbus::interface(name = "org.freedesktop.DBus", spawn = false)]
+    impl OldBus {
+        async fn get_name_owner(&self, name: &str) -> zbus::fdo::Result<String> {
+            Err(zbus::fdo::Error::NameHasNoOwner(format!(
+                "Could not get owner of name '{name}': no such name"
+            )))
+        }
+
+        async fn get_id(&self) -> String {
+            self.0.pass().await;
+
+            "0123456789abcdef0123456789abcdef".to_string()
+        }
+    }
+
+    /// `channel`, the two ends of a connection off their channel, as zoter gives them back to a
+    /// next instance in another process: restored from their record and their file descriptors.
+    fn stored(channel: &ChannelHandover) -> ChannelHandover {
+        let fds = channel
+            .fds()
+            .into_iter()
+            .map(|fd| fd.try_clone_to_owned().unwrap())
+            .collect();
+        let mut record = vec![0; channel.saved_len().unwrap()];
+        channel.save(&mut record).unwrap();
+
+        ChannelHandover::restore(&record, fds).unwrap()
     }
 
     /// The state that `encoding_of_the_state_is_pinned` encodes.
