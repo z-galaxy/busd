@@ -276,23 +276,13 @@ impl Peers {
         if owner == BUS_NAME {
             return Ok(Arc::new(own_credentials()));
         }
-        // Not under the lock of the routing, as zbus looks the credentials up through the
-        // connection of the peer unless it knows them already, which waits for any send to the peer
-        // that is under way. It knows those of each client, which it looks up as the client
-        // connects, or as the bus takes the client over.
-        let conn = self
-            .routing()
+        // Each peer has the credentials that the bus looked up when its client connected, or when
+        // the bus took the client over.
+        self.routing()
             .await
             .peer(&owner)
-            .map(|peer| peer.client().conn().clone())
-            .map_err(|_| Error::Failed(format!("Peer `{name}` not found")))?;
-
-        match conn.peer_creds().await {
-            Ok(creds) => Ok(creds.clone()),
-            Err(e) => Err(Error::Failed(format!(
-                "Failed to get peer credentials for `{name}`: {e}"
-            ))),
-        }
+            .map(|peer| peer.credentials().clone())
+            .map_err(|_| Error::Failed(format!("Peer `{name}` not found")))
     }
 
     /// The unique name of the owner of `name`.

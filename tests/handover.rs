@@ -4,13 +4,14 @@
 
 use std::{
     collections::HashSet,
+    fs,
     io::{self, IoSlice, Read, Write},
     mem::MaybeUninit,
     net::Shutdown,
     num::{NonZeroU32, NonZeroUsize},
     ops::Range,
     os::{
-        fd::{AsFd, BorrowedFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
         unix::net::{UnixListener, UnixStream},
     },
     pin::pin,
@@ -92,6 +93,7 @@ fn smoke() {
 }
 
 /// The next instance tells the credentials of a client that it took over, as the previous one did.
+/// They are the credentials that the client's socket reports.
 #[test]
 #[timeout(30000)]
 fn credentials_of_a_client_that_was_handed_over() {
@@ -100,23 +102,28 @@ fn credentials_of_a_client_that_was_handed_over() {
     zruntime::block_on(async {
         let (bus, address) = start().await;
         let client = connect(&address).await;
+        let name = BusName::from(client.unique_name().unwrap().clone());
+        check_credentials(&DBusProxy::new(&client).await.unwrap(), name.clone()).await;
         let bus = bus.restart().await;
 
         let asker = connect(&address).await;
         let dbus = DBusProxy::new(&asker).await.unwrap();
-        let name = BusName::from(client.unique_name().unwrap().clone());
         let uid = dbus.get_connection_unix_user(name.clone()).await.unwrap();
         assert_eq!(uid, rustix::process::getuid().as_raw());
-        let pid = dbus.get_connection_unix_process_id(name).await.unwrap();
+        let pid = dbus
+            .get_connection_unix_process_id(name.clone())
+            .await
+            .unwrap();
         assert_eq!(pid, std::process::id());
+        check_credentials(&dbus, name).await;
 
         bus.finish().await;
     });
 }
 
-/// The next instance looks the credentials of a client that it took over up before it sends the
-/// client anything, so that it tells them at once, even while a send to the client waits for the
-/// client to read.
+/// The next instance tells at once the credentials of a client that it took over, even while a send
+/// to the client waits for the client to read. It keeps the credentials that the client's socket
+/// reported when the instance took the client over.
 #[test]
 #[timeout(30000)]
 fn credentials_of_a_stalled_client_that_was_handed_over() {
@@ -1765,6 +1772,43 @@ async fn request_name(conn: &Connection, name: &str) {
 /// Check that the bus answers `conn`.
 async fn get_id(conn: &Connection) {
     DBusProxy::new(conn).await.unwrap().get_id().await.unwrap();
+}
+
+/// Check that the bus tells, through `dbus`, the credentials of the client of `name` that its
+/// socket reports.
+///
+/// They are the credentials of the test's process, which connects every client of the tests. They
+/// include the process's groups, and a file descriptor of the process where the kernel has one to
+/// give.
+async fn check_credentials(dbus: &DBusProxy<'_>, name: BusName<'_>) {
+    let credentials = dbus.get_connection_credentials(name).await.unwrap();
+    assert_eq!(
+        credentials.unix_user_id(),
+        Some(rustix::process::geteuid().as_raw())
+    );
+    assert_eq!(credentials.process_id(), Some(std::process::id()));
+    let mut groups: Vec<u32> = rustix::process::getgroups()
+        .unwrap()
+        .into_iter()
+        .chain([rustix::process::getegid()])
+        .map(|gid| gid.as_raw())
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    assert_eq!(credentials.unix_group_ids(), Some(&groups));
+    // From Linux 6.5 on, the kernel gives an FD of the process at the other end of a socket, as it
+    // does for the test's own socket pair.
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let own = fdo::ConnectionCredentials::from_socket(&socket).unwrap();
+    assert_eq!(
+        credentials.process_fd().is_some(),
+        own.process_fd().is_some()
+    );
+    if let Some(fd) = credentials.process_fd() {
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
+        let pid = format!("Pid:\t{}", std::process::id());
+        assert!(info.lines().any(|line| line == pid), "{info}");
+    }
 }
 
 /// The number of the client `conn`, which its unique name carries.

@@ -40,8 +40,9 @@ pub struct Peer {
     pending_calls: Arc<PendingCalls>,
     /// The peer, as the caller of the calls that wait for replies.
     caller: Arc<Caller>,
-    /// The gids of the client, as its credentials tell; none where they can't be told.
-    groups: Box<[u32]>,
+    /// The credentials of the client, as its socket reported them when the client connected, or
+    /// when the bus took the client over.
+    credentials: Arc<ConnectionCredentials>,
     /// What the policy of the bus has for the peer.
     policy: PeerPolicy,
     greeted: bool,
@@ -52,6 +53,7 @@ impl Peer {
         guid: OwnedGuid,
         id: usize,
         builder: connection::Builder<'_>,
+        credentials: ConnectionCredentials,
         send_timeout: Duration,
         user: Arc<User>,
         charge: Charge,
@@ -64,8 +66,7 @@ impl Peer {
         // creation. See https://github.com/z-galaxy/zbus/pull/1760.
         //
         // A client authenticates with the EXTERNAL mechanism, the only one that dbus-broker takes
-        // too: as the uid that its socket tells. zbus keeps the credentials that it looks up for
-        // that, so it has them without waiting for the sends to the client, when asked for them.
+        // too: as the uid that its socket tells, which `credentials` tell too.
         let msg_stream = builder
             .server(guid)
             .p2p()
@@ -74,8 +75,6 @@ impl Peer {
             .await?;
         let conn = Connection::from(&msg_stream);
         trace!("created: {:?}", conn);
-        // Those credentials tell the groups of the client too.
-        let groups = groups(conn.peer_creds().await?);
         let recipient = Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?;
         let client = Client::new(
             conn,
@@ -91,7 +90,7 @@ impl Peer {
             client,
             msg_stream,
             user,
-            groups,
+            Arc::new(credentials),
             PeerPolicy::default(),
             false,
         ))
@@ -117,9 +116,14 @@ impl Peer {
         self.caller.user()
     }
 
-    /// The gids of the client of the peer.
+    /// The gids of the client of the peer, as its credentials tell; none where they can't be told.
     pub fn groups(&self) -> &[u32] {
-        &self.groups
+        self.credentials.unix_group_ids().map_or(&[], Vec::as_slice)
+    }
+
+    /// The credentials of the peer's client, as its socket reports them.
+    pub fn credentials(&self) -> &Arc<ConnectionCredentials> {
+        &self.credentials
     }
 
     /// What the policy of the bus has for the peer.
@@ -221,6 +225,18 @@ impl Peer {
         } = client;
         debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
         let unique_name = unique_name(id);
+        // The credentials of the client are looked up from its socket, the first of the FDs of its
+        // connection, as for a new client. The socket reports them at once, whatever the previous
+        // instance left unwritten. They tell the user of the client too.
+        let socket = zoter::Save::fds(&handover)
+            .first()
+            .copied()
+            .context("The connection of the client was handed over without its socket")?;
+        let credentials = ConnectionCredentials::from_socket(socket)?;
+        let uid = credentials
+            .unix_user_id()
+            .context("The client has no user")?;
+        let user = users.user(uid);
         // The client authenticated with the instance of the bus that handed it over, and the
         // connection goes on from where that instance left it: with the messages that zbus read of
         // the client and that the bus didn't take, and the part of the one that the client was in
@@ -230,14 +246,6 @@ impl Peer {
             .await?;
         let conn = Connection::from(&msg_stream);
         trace!("handed over: {:?}", conn);
-        // No handshake looked the credentials of the client up, as for a new client, so they are
-        // looked up now, before anything is sent to the client, which a lookup would wait for,
-        // what the instance that handed the client over left unwritten included. zbus keeps them.
-        // They tell the user of the client too.
-        let creds = conn.peer_creds().await?;
-        let uid = creds.unix_user_id().context("The client has no user")?;
-        let groups = groups(creds);
-        let user = users.user(uid);
         let recipient = Recipient::client(conn.clone(), unique_name.clone(), send_timeout)?;
         let charge = Charge::taken_over(&user, &user);
         let client = Client::new(conn, recipient, id, unique_name, match_rules, charge);
@@ -247,7 +255,7 @@ impl Peer {
             client,
             msg_stream,
             user,
-            groups,
+            Arc::new(credentials),
             PeerPolicy::default(),
             greeted,
         ))
@@ -260,13 +268,13 @@ impl Peer {
     }
 
     /// Build a peer from `client`, and the stream of the peer's messages, which come from
-    /// `msg_stream`. The peer belongs to `user`, is in the groups `groups`, has `policy`, and
-    /// called `Hello` if `greeted`.
+    /// `msg_stream`. The peer belongs to `user`, its client has `credentials`, it has `policy`, and
+    /// it called `Hello` if `greeted`.
     fn assemble(
         client: Client,
         msg_stream: MessageStream,
         user: Arc<User>,
-        groups: Box<[u32]>,
+        credentials: Arc<ConnectionCredentials>,
         policy: PeerPolicy,
         greeted: bool,
     ) -> (Self, Stream) {
@@ -276,7 +284,7 @@ impl Peer {
             client,
             pending_calls: Arc::new(PendingCalls::new(user.clone())),
             caller: Caller::new(unique_name, user),
-            groups,
+            credentials,
             policy,
             greeted,
         };
@@ -298,13 +306,6 @@ pub(crate) struct HandedOver {
     pub(crate) greeted: bool,
     /// The match rules that the client added.
     pub(crate) match_rules: MatchRules,
-}
-
-/// The gids that `creds` tell, or none if they can't be told.
-fn groups(creds: &ConnectionCredentials) -> Box<[u32]> {
-    creds
-        .unix_group_ids()
-        .map_or_else(Box::default, |gids| gids.as_slice().into())
 }
 
 /// The number of the bus itself, which no client has.

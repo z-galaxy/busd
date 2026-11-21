@@ -14,7 +14,7 @@ use std::{
 };
 
 use futures_util::future::{join, select, Either};
-use zbus::{connection, Address, Connection, OwnedGuid};
+use zbus::{connection, fdo::ConnectionCredentials, Address, Connection, OwnedGuid};
 use zruntime::{Event, SharedRuntime, Task};
 
 use crate::{bus::Bus, peer::SEND_TIMEOUT, peers::Peers};
@@ -87,13 +87,16 @@ impl TestBus {
     /// Connect a client of `uid`, numbered `id`, to this bus. The client connects over a pair of
     /// sockets, not through the bus's listening socket.
     ///
-    /// The client belongs to that user, whichever user runs the test.
+    /// The client belongs to that user, whichever user runs the test. Its credentials, as its
+    /// socket reports them, are those of the user that runs the test.
     pub async fn connect_as(&self, id: usize, uid: u32) -> anyhow::Result<Connection> {
         let (ours, theirs) = UnixStream::pair()?;
+        let credentials = ConnectionCredentials::from_socket(&theirs)?;
         let adding = self.peers.add(
             &self.guid,
             id,
             connection::Builder::unix_stream(theirs),
+            credentials,
             SEND_TIMEOUT,
             uid,
         );

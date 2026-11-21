@@ -182,11 +182,13 @@ impl Bus {
         spawn(async move {
             let res = async {
                 // The client is an object of its user from the start, before its handshake, so
-                // its user is the one that its socket tells, as zbus looks it up for a connection
-                // over the socket, for a client in another PID namespace too.
-                let creds = ConnectionCredentials::of_peer(&stream).await?;
-                let uid = creds.unix_user_id().context("The client has no user")?;
-                let gids = creds.unix_group_ids().map_or(&[][..], Vec::as_slice);
+                // its user is the one that its socket tells, for a client in another PID namespace
+                // too. The peer keeps these credentials.
+                let credentials = ConnectionCredentials::from_socket(&stream)?;
+                let uid = credentials
+                    .unix_user_id()
+                    .context("The client has no user")?;
+                let gids = credentials.unix_group_ids().map_or(&[][..], Vec::as_slice);
                 // Dropping the stream closes the connection.
                 if !peers.may_connect(uid, gids).await {
                     warn!(
@@ -198,7 +200,9 @@ impl Bus {
                 }
                 let builder = connection::Builder::unix_stream(stream);
 
-                peers.add(&guid, id, builder, send_timeout, uid).await
+                peers
+                    .add(&guid, id, builder, credentials, send_timeout, uid)
+                    .await
             };
             if let Err(e) = res.await {
                 warn!("Failed to establish connection: {}", e);

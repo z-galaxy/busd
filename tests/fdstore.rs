@@ -379,11 +379,18 @@ fn hand_over_at_the_hard_fd_limit() {
 
     let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(HARD_NOFILE));
     systemd.until_ready();
-    // Clients connect until busd has hardly a file descriptor left.
+    // Clients connect until busd has hardly a file descriptor left. They stop once one more client
+    // could take the last FD, which busd needs to duplicate the client sockets as it hands over.
     let mut clients = Vec::new();
-    while HARD_NOFILE - first.open_fds() > FREE_FDS {
+    let mut open = first.open_fds();
+    // The most file descriptors that busd opened for a client.
+    let mut per_client = 0;
+    while HARD_NOFILE - open > per_client {
         let name = format!("{NAME}{}", clients.len());
         clients.push((Client::connect(&address, Some(&name)), name));
+        let before = open;
+        open = first.open_fds();
+        per_client = per_client.max(open.saturating_sub(before));
     }
     hand_over(&mut first, &mut systemd, &socket);
     let stored = systemd.check_stored();
@@ -1028,7 +1035,6 @@ const LOW_NOFILE: libc::rlim_t = 64;
 /// each, as many as that limit takes, so that they can't all fit, while many of them would.
 const CLIENTS: usize = LOW_NOFILE as usize;
 const HARD_NOFILE: libc::rlim_t = 64;
-const FREE_FDS: libc::rlim_t = 2;
 /// A limit of open FDs that what a bus under `HARD_NOFILE` hands over fits under, with the process
 /// FD of each client.
 const HIGH_NOFILE: libc::rlim_t = 4 * HARD_NOFILE;

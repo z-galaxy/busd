@@ -14,7 +14,7 @@ use rand::{
     distr::{Alphanumeric, SampleString},
     rng,
 };
-use zbus::{connection, message, MatchRule, Message, OwnedGuid};
+use zbus::{connection, fdo::ConnectionCredentials, message, MatchRule, Message, OwnedGuid};
 use zoter::{Restore, Save};
 use zruntime::unblock;
 
@@ -484,8 +484,9 @@ fn a_handshake_under_way_once_the_bus_paused_is_cut_off() {
         ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let uid = rustix::process::getuid().as_raw();
         let user = peers.users().user(uid);
+        let credentials = ConnectionCredentials::from_socket(&theirs).unwrap();
         let server = connection::Builder::unix_stream(theirs);
-        let adding = peers.add(bus.guid(), 1, server, SEND_TIMEOUT, uid);
+        let adding = peers.add(bus.guid(), 1, server, credentials, SEND_TIMEOUT, uid);
         let cutting_off = async {
             // The client authenticates, but never begins.
             let mut ours = unblock(move || {
@@ -816,8 +817,11 @@ async fn connect(bus: &Bus, id: usize) -> (Connection, UnixStream) {
     let (ours, theirs) = UnixStream::pair().unwrap();
     let socket = ours.try_clone().unwrap();
     let uid = rustix::process::getuid().as_raw();
+    let credentials = ConnectionCredentials::from_socket(&theirs).unwrap();
     let server = connection::Builder::unix_stream(theirs);
-    let adding = bus.peers().add(bus.guid(), id, server, SEND_TIMEOUT, uid);
+    let adding = bus
+        .peers()
+        .add(bus.guid(), id, server, credentials, SEND_TIMEOUT, uid);
     let connecting = connection::Builder::unix_stream(ours).build();
     let (added, conn) = join(adding, connecting).await;
     added.unwrap();

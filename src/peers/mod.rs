@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use zbus::{connection, names::UniqueName, Message, OwnedGuid};
+use zbus::{connection, fdo::ConnectionCredentials, names::UniqueName, Message, OwnedGuid};
 #[cfg(target_os = "linux")]
 use zruntime::Event;
 use zruntime::{
@@ -180,7 +180,13 @@ impl Peers {
         self.routing().await.policy.may_connect(uid, gids)
     }
 
-    /// Add a client, of the user of `uid`, which the bus gives `send_timeout` to take each message.
+    /// Add a client, whose connection `builder` builds, as an object of the user of `uid`.
+    ///
+    /// The client has `credentials`, as its socket reports them. The bus gives the client
+    /// `send_timeout` to take each message.
+    ///
+    /// `uid` is the user of `credentials`, except for the clients of other users that the tests
+    /// connect. The credentials of those clients are those of the user that runs the test.
     ///
     /// The client is an object of its user from the start, as with dbus-broker, so the bus refuses
     /// a client beyond the quota of its user before the client authenticates.
@@ -193,6 +199,7 @@ impl Peers {
         guid: &OwnedGuid,
         id: usize,
         builder: connection::Builder<'_>,
+        credentials: ConnectionCredentials,
         send_timeout: Duration,
         uid: u32,
     ) -> Result<()> {
@@ -203,7 +210,15 @@ impl Peers {
         // Perform the connection build and SASL handshake without holding the peers lock, as it
         // involves async I/O and would otherwise block all other peer operations (Hello
         // handling, etc.).
-        let handshake = Peer::new(guid.clone(), id, builder, send_timeout, user, charge);
+        let handshake = Peer::new(
+            guid.clone(),
+            id,
+            builder,
+            credentials,
+            send_timeout,
+            user,
+            charge,
+        );
         // Dropping the handshake closes the connection, and lets go of the charge.
         #[cfg(target_os = "linux")]
         let Some(handshake) = self.unless_sealed(handshake).await
