@@ -9,7 +9,8 @@ use anyhow::anyhow;
 use futures_util::{Stream as FutureStream, StreamExt};
 use zbus::{
     message,
-    names::{InterfaceName, OwnedUniqueName},
+    names::{InterfaceName, OwnedUniqueName, UniqueName},
+    wire::{serialized, Endian, Fd},
     Message, MessageStream, ObjectPath,
 };
 
@@ -136,14 +137,61 @@ pub(crate) fn checked(msg: Message, unique_name: &OwnedUniqueName) -> Result<Mes
             "failed to parse message: Invalid sender field"
         ))),
         None => {
-            let new_msg = msg
-                .with_sender(unique_name)
-                .map_err(|e| Invalid::Dropped(e.into()))?;
+            let new_msg = add_sender(&msg, unique_name).map_err(|e| Invalid::Dropped(e.into()))?;
             trace!("Added sender field to message: {:?}", new_msg);
 
             Ok(new_msg)
         }
     }
+}
+
+/// `msg`, which has no sender field, with `sender` for one, appended to its header fields, as
+/// zbus's `Message::with_sender` appends it.
+fn add_sender(msg: &Message, sender: &UniqueName<'_>) -> zbus::Result<Message> {
+    debug_assert!(msg.header().sender().is_none());
+    let data = msg.data();
+    let bytes: &[u8] = data;
+    let endian = Endian::from(msg.primary_header().endian_sig());
+    // The primary header (12 bytes), then the length of the array of the fields (4 bytes).
+    let fields_end = 16 + endian.read_u32(&bytes[12..16]) as usize;
+    // Each field starts on an 8-byte boundary, and so does the body.
+    let field_start = fields_end.next_multiple_of(8);
+    let body = &bytes[field_start..];
+    // The field: its code and the signature of its value, `s` (4 bytes), the length of the name
+    // (4 bytes), then the name and its 0.
+    let new_fields_end = field_start + 8 + sender.len() + 1;
+    let body_offset = new_fields_end.next_multiple_of(8);
+    if body_offset + body.len() > MAX_MESSAGE_SIZE {
+        return Err(zbus::Error::ExcessData);
+    }
+    let mut new = Vec::with_capacity(body_offset + body.len());
+    let mut word = [0; 4];
+    new.extend_from_slice(&bytes[..12]);
+    endian.write_u32(&mut word, (new_fields_end - 16) as u32);
+    new.extend_from_slice(&word);
+    new.extend_from_slice(&bytes[16..fields_end]);
+    new.resize(field_start, 0);
+    new.extend_from_slice(&[SENDER, 1, b's', 0]);
+    endian.write_u32(&mut word, sender.len() as u32);
+    new.extend_from_slice(&word);
+    new.extend_from_slice(sender.as_bytes());
+    new.push(0);
+    new.resize(body_offset, 0);
+    new.extend_from_slice(body);
+    // The copy carries duplicates of the FDs of `msg`, as with `with_sender`: `msg` goes with its
+    // own.
+    let fds = data
+        .fds()
+        .iter()
+        .map(Fd::try_to_owned)
+        .collect::<zbus::Result<Vec<_>>>()?;
+    let new = serialized::Data::new_fds(new, data.context(), fds);
+
+    // SAFETY: `from_bytes` is unsafe only in that the bytes might not encode a message. These are
+    // those of `msg`, which zbus checked as it received it, and whose body `checked` checked, with
+    // a sender field put after its other fields as `with_sender` puts one; and `from_bytes` checks
+    // the header in full again.
+    unsafe { Message::from_bytes(new) }
 }
 
 /// The interface that the specification reserves for the signal that a library raises locally.
@@ -154,9 +202,15 @@ const LOCAL_INTERFACE: InterfaceName<'static> =
 const LOCAL_PATH: ObjectPath<'static> =
     ObjectPath::from_static_str_unchecked("/org/freedesktop/DBus/Local");
 
+/// The code of the sender field of a header.
+const SENDER: u8 = 7;
+
+/// The most bytes that a message can take, as the specification has it, which zbus goes by too.
+const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
-    use zbus::wire::Endian;
+    use std::{fs::File, num::NonZeroU32};
 
     use super::*;
 
@@ -190,5 +244,53 @@ mod tests {
         let passed = checked(with_body(signal(), &[1, 0, 0, 0]), &peer).unwrap();
         assert_eq!(passed.header().sender(), Some(&peer.as_ref()));
         assert!(passed.body().deserialize::<bool>().unwrap());
+    }
+
+    /// The sender field that `add_sender` adds comes out byte for byte as zbus's
+    /// `Message::with_sender` adds one, to messages of either byte order, file descriptors and all.
+    #[test]
+    fn add_sender_matches_with_sender() {
+        let sender = UniqueName::try_from(":busd.42").unwrap();
+        let files = [(); 2].map(|()| File::open("/dev/null").unwrap());
+        for endian in [Endian::Little, Endian::Big] {
+            for msg in messages(endian, &files) {
+                let ours = add_sender(&msg, &sender).unwrap();
+                let theirs = msg.with_sender(&sender).unwrap();
+                assert_eq!(ours.data().bytes(), theirs.data().bytes(), "{msg:?}");
+                assert_eq!(ours.header().sender(), Some(&sender));
+                assert_eq!(ours.data().fds().len(), msg.data().fds().len());
+                ours.body().validate().unwrap();
+            }
+        }
+    }
+
+    /// Four messages of `endian` without a sender field, each with a serial of its own: a call with
+    /// a body of several types, a signal without a body, a call to a unique name whose body ends
+    /// off an 8-byte boundary, and a signal that brings `files`.
+    fn messages(endian: Endian, files: &[File; 2]) -> [Message; 4] {
+        let serial = |n| NonZeroU32::new(n).unwrap();
+
+        [
+            Message::method_call("/org/zbus/Test", "Ping")
+                .destination("org.zbus.Test")
+                .interface("org.zbus.Test")
+                .serial(serial(1))
+                .endian(endian)
+                .build(&(1u8, "abc", vec![1u32, 2, 3])),
+            Message::signal("/a", "a.b", "C")
+                .serial(serial(2))
+                .endian(endian)
+                .build(&()),
+            Message::method_call("/", "X")
+                .destination(":1.7")
+                .serial(serial(3))
+                .endian(endian)
+                .build(&("x".repeat(13),)),
+            Message::signal("/org/zbus/Test", "org.zbus.Test", "Fds")
+                .serial(serial(4))
+                .endian(endian)
+                .build(&(Fd::from(&files[0]), Fd::from(&files[1]))),
+        ]
+        .map(Result::unwrap)
     }
 }
