@@ -38,10 +38,66 @@ impl Outgoing {
         }
     }
 
+    /// What the previous instance left to write to a client, to write before anything else.
+    ///
+    /// That is `rest`, the rest of a partly written message, if there is one, and then `kept`, the
+    /// whole messages, with their file descriptors.
+    #[cfg(target_os = "linux")]
+    pub(super) fn taken_over(rest: Vec<u8>, kept: Vec<Message>) -> Self {
+        let mut outgoing = Self::new();
+        if !rest.is_empty() {
+            outgoing.queued += rest.len() as u64;
+            outgoing.chunks.push_back(Chunk::Rest(rest));
+        }
+        for msg in kept {
+            outgoing.push(msg);
+        }
+
+        outgoing
+    }
+
     /// Queue `msg`, whole, after what is queued already.
     pub(super) fn push(&mut self, msg: Message) {
         self.queued += msg.data().len() as u64;
         self.chunks.push_back(Chunk::Message(msg));
+    }
+
+    /// What is left to write, for the next instance to write.
+    ///
+    /// That is the rest of the message at the front, if a write ended in the middle of it, or if
+    /// the front is the rest of a message already. The rest goes without the message's file
+    /// descriptors, which went with its first byte. Then come the whole messages, with their FDs.
+    #[cfg(target_os = "linux")]
+    pub(super) fn into_unwritten(self) -> (Vec<u8>, Vec<Message>) {
+        let Self {
+            mut chunks,
+            front_written: written,
+            ..
+        } = self;
+        let rest = match chunks.pop_front() {
+            Some(Chunk::Rest(mut rest)) => {
+                rest.drain(..written);
+
+                rest
+            }
+            Some(Chunk::Message(msg)) if written > 0 => msg.data().bytes()[written..].to_vec(),
+            Some(front) => {
+                chunks.push_front(front);
+
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let kept = chunks
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                Chunk::Message(msg) => Some(msg),
+                // Only the first chunk is ever the rest of a message.
+                Chunk::Rest(_) => None,
+            })
+            .collect();
+
+        (rest, kept)
     }
 
     /// Whether a send of the bytes up to `target`, of those ever queued, has nothing more to wait
@@ -98,7 +154,8 @@ impl Outgoing {
     /// did.
     ///
     /// This does nothing if the bus stopped writing already, as when another write got there first.
-    /// The bus stops writing this way when a write fails or times out.
+    /// The bus stops writing this way when a write fails or times out, and when it closes the
+    /// connection.
     pub(super) fn cut(&mut self) -> bool {
         if !self.takes_messages() {
             return false;
@@ -112,7 +169,7 @@ impl Outgoing {
 
     /// Whether messages are still queued and written.
     ///
-    /// They aren't once a write failed or timed out.
+    /// They aren't once a write failed or timed out, or once the bus closed the connection.
     pub(super) fn takes_messages(&self) -> bool {
         match self.state {
             State::Open => true,
@@ -194,28 +251,38 @@ impl Outgoing {
 pub(super) enum Chunk {
     /// A whole message, with its file descriptors, which go along with its first byte.
     Message(Message),
+    /// The rest of a message that the previous instance partly wrote, without its file
+    /// descriptors, which went along with its first byte.
+    #[cfg(target_os = "linux")]
+    Rest(Vec<u8>),
 }
 
 impl Chunk {
     /// The bytes of the chunk.
     fn bytes(&self) -> &[u8] {
-        let Self::Message(msg) = self;
-
-        msg.data().bytes()
+        match self {
+            Self::Message(msg) => msg.data().bytes(),
+            #[cfg(target_os = "linux")]
+            Self::Rest(rest) => rest,
+        }
     }
 
     /// Whether the chunk has file descriptors, which go along with its first byte.
     fn carries_fds(&self) -> bool {
-        let Self::Message(msg) = self;
-
-        !msg.data().fds().is_empty()
+        match self {
+            Self::Message(msg) => !msg.data().fds().is_empty(),
+            #[cfg(target_os = "linux")]
+            Self::Rest(_) => false,
+        }
     }
 
     /// The file descriptors of the chunk.
     fn fds(&self) -> Vec<BorrowedFd<'_>> {
-        let Self::Message(msg) = self;
-
-        msg.data().fds().iter().map(AsFd::as_fd).collect()
+        match self {
+            Self::Message(msg) => msg.data().fds().iter().map(AsFd::as_fd).collect(),
+            #[cfg(target_os = "linux")]
+            Self::Rest(_) => Vec::new(),
+        }
     }
 }
 
@@ -228,7 +295,8 @@ pub(super) enum State {
     /// nothing. What is left goes with the hand-over.
     #[cfg(target_os = "linux")]
     Paused,
-    /// A write failed or timed out: nothing more is written, and the socket is shut down.
+    /// A write failed or timed out, or the bus closed the connection: nothing more is written, and
+    /// the socket is shut down.
     Disconnecting,
 }
 

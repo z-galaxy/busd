@@ -1294,6 +1294,96 @@ mod linux {
             assert_eq!(connection.unwritten_len(), 0);
         });
     }
+
+    /// A reader that took over the start of a message, and nothing more, reads the rest of the
+    /// message off the socket once it comes, whether or not the start holds all of the message's
+    /// primary header. The message is shorter than the reader reads at a time.
+    #[test]
+    #[timeout(30000)]
+    fn taken_over_start_of_a_message() {
+        zruntime::block_on(async {
+            let msg = signal(100, 1);
+            let bytes = msg.data().bytes();
+            for taken in [5, 30] {
+                let (bus, client) = pair();
+                let mut reader = Reader::taken_over(bus, bytes[..taken].to_vec(), Vec::new());
+
+                assert!(poll_once(&mut reader).await.is_pending());
+                send_raw(&client, &bytes[taken..], &[]);
+                assert_eq!(next(&mut reader).await.data().bytes(), bytes);
+                assert!(poll_once(&mut reader).await.is_pending());
+            }
+        });
+    }
+
+    /// A reader that took over a message longer than it reads at a time, or the start of one, and
+    /// nothing more, yields the message once the rest of it has come, and then the messages after
+    /// it. The file descriptors that the reader took over go to the first message that counts
+    /// them. In the middle of such a message, the reader hands over what it has read of the
+    /// message.
+    #[test]
+    #[timeout(30000)]
+    fn taken_over_long_message() {
+        zruntime::block_on(async {
+            let long = signal(10_000, 7);
+            let bytes = long.data().bytes();
+            let (bus, client) = pair();
+            let mut reader = Reader::taken_over(bus.clone(), bytes.to_vec(), Vec::new());
+            assert_eq!(next(&mut reader).await.data().bytes(), bytes);
+            assert!(poll_once(&mut reader).await.is_pending());
+
+            let (ours, theirs) = fd_pair();
+            let after = signal_with_fds(&[&theirs]);
+            let fds = vec![OwnedFd::from(theirs.try_clone().unwrap())];
+            let mut reader = Reader::taken_over(bus.clone(), bytes[..3000].to_vec(), fds);
+            assert!(poll_once(&mut reader).await.is_pending());
+            send_raw(&client, &bytes[3000..6000], &[]);
+            assert!(poll_once(&mut reader).await.is_pending());
+            let (unread, fds) = reader.into_unread();
+            assert_eq!(unread, bytes[..6000]);
+            assert_eq!(fds.len(), 1);
+
+            let mut reader = Reader::taken_over(bus, unread, fds);
+            let mut rest = bytes[6000..].to_vec();
+            rest.extend_from_slice(after.data().bytes());
+            send_raw(&client, &rest, &[]);
+            assert_eq!(next(&mut reader).await.data().bytes(), bytes);
+            let read = next(&mut reader).await;
+            assert_eq!(read.data().bytes(), after.data().bytes());
+            assert_end_of(read.data().fds()[0].as_fd(), &ours);
+        });
+    }
+
+    /// A reader that took over a message and then the start of a message longer than it reads at a
+    /// time yields the message, then the long message once the rest of it has come, and then the
+    /// messages after it. A reader that read both at once hands such bytes over.
+    #[test]
+    #[timeout(30000)]
+    fn taken_over_message_and_the_start_of_a_long_one() {
+        zruntime::block_on(async {
+            let (bus, client) = pair();
+            let msg = signal(100, 1);
+            let long = signal(10_000, 2);
+            let bytes = long.data().bytes();
+            let mut unread = msg.data().bytes().to_vec();
+            unread.extend_from_slice(&bytes[..3000]);
+            let mut reader = Reader::taken_over(bus, unread, Vec::new());
+            assert_eq!(next(&mut reader).await.data().bytes(), msg.data().bytes());
+            assert!(poll_once(&mut reader).await.is_pending());
+
+            // The rest of the long message, and messages that come to several times what the
+            // reader reads at a time, in one write.
+            let after: Vec<_> = (0..100).map(|n| signal(100, n)).collect();
+            let mut sent = bytes[3000..].to_vec();
+            sent.extend(concat(&after));
+            send_raw(&client, &sent, &[]);
+            assert_eq!(next(&mut reader).await.data().bytes(), bytes);
+            for msg in &after {
+                assert_eq!(next(&mut reader).await.data().bytes(), msg.data().bytes());
+            }
+            assert!(poll_once(&mut reader).await.is_pending());
+        });
+    }
 }
 
 /// Whether `error` is an I/O error of `kind`.
@@ -1402,7 +1492,7 @@ fn uid() -> u32 {
 
 /// The bus's end of a pair of connected sockets, and the client's end, both on the runtime that
 /// runs the test.
-fn pair() -> (Arc<UnixStream<Shared>>, UnixStream<Shared>) {
+pub(super) fn pair() -> (Arc<UnixStream<Shared>>, UnixStream<Shared>) {
     let (bus, client) = UnixStream::pair(&SharedRuntime::current().unwrap()).unwrap();
 
     (Arc::new(bus), client)
@@ -1419,24 +1509,24 @@ fn std_pair() -> (net::UnixStream, UnixStream<Shared>) {
 
 /// A connection to the client at the other end of `bus`, which passes file descriptors, and has
 /// `timeout` to take each send.
-fn connection(bus: Arc<UnixStream<Shared>>, timeout: Duration) -> Arc<Connection> {
+pub(super) fn connection(bus: Arc<UnixStream<Shared>>, timeout: Duration) -> Arc<Connection> {
     Arc::new(Connection::new(bus, name(), true, timeout))
 }
 
 /// The unique name of the client of the tests.
-fn name() -> OwnedUniqueName {
+pub(super) fn name() -> OwnedUniqueName {
     OwnedUniqueName::try_from(":busd.1").unwrap()
 }
 
 /// A signal with `len` times `byte` in its body.
-fn signal(len: usize, byte: u8) -> Message {
+pub(super) fn signal(len: usize, byte: u8) -> Message {
     Message::signal("/org/busd/Test", "org.busd.Test", "Bytes")
         .build(&(Bytes::new(&vec![byte; len]),))
         .unwrap()
 }
 
 /// A signal that carries duplicates of `fds`.
-fn signal_with_fds(fds: &[&net::UnixStream]) -> Message {
+pub(super) fn signal_with_fds(fds: &[&net::UnixStream]) -> Message {
     let fds: Vec<_> = fds.iter().map(|&fd| Fd::from(fd)).collect();
 
     Message::signal("/org/busd/Test", "org.busd.Test", "Fds")
@@ -1445,7 +1535,7 @@ fn signal_with_fds(fds: &[&net::UnixStream]) -> Message {
 }
 
 /// The bytes of `msgs`, one after the other.
-fn concat(msgs: &[Message]) -> Vec<u8> {
+pub(super) fn concat(msgs: &[Message]) -> Vec<u8> {
     msgs.iter()
         .flat_map(|msg| msg.data().bytes())
         .copied()
@@ -1456,7 +1546,7 @@ fn concat(msgs: &[Message]) -> Vec<u8> {
 ///
 /// A test passes the second as a file descriptor, and identifies it by what comes out of the first,
 /// which doesn't block.
-fn fd_pair() -> (net::UnixStream, net::UnixStream) {
+pub(super) fn fd_pair() -> (net::UnixStream, net::UnixStream) {
     let (ours, theirs) = net::UnixStream::pair().unwrap();
     ours.set_nonblocking(true).unwrap();
 
@@ -1474,13 +1564,13 @@ fn assert_end_of(fd: BorrowedFd<'_>, ours: &net::UnixStream) {
 }
 
 /// The next message that `reader` yields, as soon as it is whole.
-async fn next(reader: &mut Reader) -> Message {
+pub(super) async fn next(reader: &mut Reader) -> Message {
     within(reader.next()).await.unwrap().unwrap()
 }
 
 /// What `reader` yields at once, polled once, whatever share of I/O operations the poll of the
 /// test has left.
-async fn poll_once(reader: &mut Reader) -> Poll<Option<zbus::Result<Message>>> {
+pub(super) async fn poll_once(reader: &mut Reader) -> Poll<Option<zbus::Result<Message>>> {
     zruntime::unconstrained(poll_fn(|cx| Poll::Ready(reader.poll_next_unpin(cx)))).await
 }
 
@@ -1488,7 +1578,7 @@ async fn poll_once(reader: &mut Reader) -> Poll<Option<zbus::Result<Message>>> {
 /// socket took at once, and found that it has to wait for more room.
 ///
 /// The task gives back what the send gives back.
-async fn start_send(
+pub(super) async fn start_send(
     connection: &Arc<Connection>,
     msgs: Vec<Message>,
 ) -> Task<Vec<Message>, Shared> {
@@ -1521,7 +1611,7 @@ async fn yield_now() {
 /// that took.
 ///
 /// The writes go through a non-blocking duplicate of the socket.
-fn fill(bus: &UnixStream<Shared>) -> usize {
+pub(super) fn fill(bus: &UnixStream<Shared>) -> usize {
     // The duplicate shares the mode of the socket, which the runtime set to non-blocking.
     let duplicate = net::UnixStream::from(bus.as_fd().try_clone_to_owned().unwrap());
     let chunk = vec![FILL; 64 * 1024];
@@ -1541,7 +1631,7 @@ fn fill(bus: &UnixStream<Shared>) -> usize {
 }
 
 /// Read `len` bytes of what [`fill`] wrote off `client`, as they come.
-async fn read_fill(client: &UnixStream<Shared>, len: usize) {
+pub(super) async fn read_fill(client: &UnixStream<Shared>, len: usize) {
     let read = read_exact(client, len).await;
     assert!(read.iter().all(|&byte| byte == FILL));
 }
@@ -1564,14 +1654,14 @@ fn read_fill_now(client: &UnixStream<Shared>, len: usize) {
 const FILL: u8 = b'#';
 
 /// Write `bytes` to the socket of `client` in one write, with `fds` along with the first byte.
-fn send_raw(client: &impl AsFd, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
+pub(super) fn send_raw(client: &impl AsFd, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
     let sent = socket::send(client.as_fd(), &[IoSlice::new(bytes)], fds).unwrap();
     assert_eq!(sent, bytes.len(), "the socket took only part of the write");
 }
 
 /// Write all of `bytes` to `client`, with `fds` along with the first byte, as the socket takes
 /// them.
-async fn write_all(client: &UnixStream<Shared>, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
+pub(super) async fn write_all(client: &UnixStream<Shared>, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
     let mut written = 0;
     let mut fds = fds;
     while written < bytes.len() {
@@ -1586,12 +1676,12 @@ async fn write_all(client: &UnixStream<Shared>, bytes: &[u8], fds: &[BorrowedFd<
 }
 
 /// Read `len` bytes off `client`, as they come.
-async fn read_exact(client: &UnixStream<Shared>, len: usize) -> Vec<u8> {
+pub(super) async fn read_exact(client: &UnixStream<Shared>, len: usize) -> Vec<u8> {
     recv_exact(client, len).await.0
 }
 
 /// Read `len` bytes off `client`, as they come, with the file descriptors that come along.
-async fn recv_exact(client: &UnixStream<Shared>, len: usize) -> (Vec<u8>, Vec<OwnedFd>) {
+pub(super) async fn recv_exact(client: &UnixStream<Shared>, len: usize) -> (Vec<u8>, Vec<OwnedFd>) {
     let mut bytes = vec![0; len];
     let mut fds = Vec::new();
     let mut read = 0;
@@ -1614,7 +1704,7 @@ async fn recv_exact(client: &UnixStream<Shared>, len: usize) -> (Vec<u8>, Vec<Ow
 /// bus whose handshake with the client failed does. On Linux, the client's read then fails with
 /// `ECONNRESET`, which [`socket::recv`] takes for EOF. This takes `ECONNRESET` for EOF on other
 /// platforms too.
-async fn read_to_end(client: &UnixStream<Shared>) -> Vec<u8> {
+pub(super) async fn read_to_end(client: &UnixStream<Shared>) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut buf = vec![0; 64 * 1024];
     loop {
@@ -1635,4 +1725,4 @@ async fn read_to_end(client: &UnixStream<Shared>) -> Vec<u8> {
 ///
 /// It is far longer than the tests wait for what should happen at once, so that a send that waits
 /// for no reason fails the test.
-const LONG_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const LONG_TIMEOUT: Duration = Duration::from_secs(60);

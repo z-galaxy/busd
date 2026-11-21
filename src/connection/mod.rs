@@ -4,8 +4,14 @@
 //!
 //! - the handshake that opens a client's connection ([`Connection::accept`]);
 //! - the reader of a client's messages ([`Reader`]);
-//! - the bus's writes to a client ([`Connection`]).
+//! - the bus's writes to a client ([`Connection`]);
+//! - on Linux, the hand-over of a client's connection to the next instance, and its take-over from
+//!   the previous instance, in `Handover`.
 
+#[cfg(target_os = "linux")]
+pub mod handover;
+#[cfg(target_os = "linux")]
+pub use handover::Handover;
 mod handshake;
 mod read;
 pub use read::Reader;
@@ -36,12 +42,14 @@ use write::State;
 /// taken yet. A send queues its messages, whole, after those of the earlier sends, and waits until
 /// the socket has taken their last byte, within the client's time limit. While it waits, it writes
 /// whatever the socket takes, its own messages or those ahead of them. So the messages of each send
-/// go out together, in the order of the sends.
+/// go out together, in the order of the sends. A taken-over connection also holds what the previous
+/// instance left to write, and that goes out before the messages of any send.
 ///
 /// The bus disconnects a client if the client doesn't take a send within its time limit, or if a
 /// write to the client fails. The bus then writes nothing more to the client, drops what is left to
 /// write, and shuts the socket down. The client's reader then yields what the socket still holds,
-/// which the client sent before, and then EOF.
+/// which the client sent before, and then EOF. The bus does the same to a client whose connection
+/// it closes (`Connection::close`).
 #[derive(Debug)]
 pub struct Connection {
     socket: Arc<UnixStream<Shared>>,
@@ -84,6 +92,43 @@ impl Connection {
         Ok((reader, Self::new(socket, unique_name, fd_passing, timeout)))
     }
 
+    /// The two halves of a connection that the previous instance handed over in `handover`.
+    ///
+    /// The `Reader` yields the unread bytes that the previous instance handed over before what it
+    /// reads itself. The `Connection` writes what the previous instance left to write before
+    /// anything else, as part of the next send or flush. The client goes by `unique_name`, and the
+    /// bus gives it `timeout` to take each send.
+    ///
+    /// The socket goes on the shared runtime of zruntime that runs the calling code.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the runtime can't watch the socket.
+    #[cfg(target_os = "linux")]
+    pub fn taken_over(
+        handover: Handover,
+        unique_name: OwnedUniqueName,
+        timeout: Duration,
+    ) -> io::Result<(Reader, Self)> {
+        let Handover {
+            socket,
+            fd_passing,
+            unread,
+            unread_fds,
+            rest,
+            kept,
+        } = handover;
+        let socket = std::os::unix::net::UnixStream::from(socket);
+        let socket = Arc::new(UnixStream::from_std(&SharedRuntime::current()?, socket)?);
+        let reader = Reader::taken_over(socket.clone(), unread, unread_fds);
+        let outgoing = Outgoing::taken_over(rest, kept);
+
+        Ok((
+            reader,
+            Self::with_outgoing(socket, unique_name, fd_passing, timeout, outgoing),
+        ))
+    }
+
     /// The connection of the client at the other end of `socket`.
     ///
     /// The client goes by `unique_name`, and takes file descriptors if `fd_passing`. The bus gives
@@ -94,14 +139,7 @@ impl Connection {
         fd_passing: bool,
         timeout: Duration,
     ) -> Self {
-        Self {
-            socket,
-            unique_name,
-            fd_passing,
-            timeout,
-            outgoing: Mutex::new(Outgoing::new()),
-            changed: Event::new(),
-        }
+        Self::with_outgoing(socket, unique_name, fd_passing, timeout, Outgoing::new())
     }
 
     /// Send `msgs`, in order, in one go, and return the messages that the client can't take.
@@ -183,7 +221,68 @@ impl Connection {
         self.changed.notify(usize::MAX);
     }
 
-    /// Whether the bus is disconnecting the client because a write to it failed or timed out.
+    /// The hand-over of the connection to the next instance, with the unread bytes of `reader`, the
+    /// client's reader.
+    ///
+    /// This takes the connection and the reader, so the bus writes nothing more to the client, and
+    /// reads nothing more from it. The socket closes with them, so the hand-over holds a duplicate
+    /// of it. It also holds the unread bytes of `reader`, and what is left to write to the client,
+    /// with the file descriptors of both.
+    ///
+    /// There is no hand-over if the bus is disconnecting the client, or if the client's socket
+    /// fails to be duplicated. The socket closes then, which disconnects the client.
+    #[cfg(target_os = "linux")]
+    pub fn hand_over(self, reader: Reader) -> Option<Handover> {
+        let outgoing = self
+            .outgoing
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        if outgoing.state == State::Disconnecting {
+            debug!(
+                "Leaving `{}` out of the hand-over, as the bus is disconnecting it",
+                self.unique_name
+            );
+
+            return None;
+        }
+        let socket = match self.socket.as_fd().try_clone_to_owned() {
+            Ok(socket) => socket,
+            Err(e) => {
+                warn!(
+                    "Disconnecting `{}`, as its connection failed to be handed over: {e}",
+                    self.unique_name
+                );
+
+                return None;
+            }
+        };
+        let (rest, kept) = outgoing.into_unwritten();
+        let (unread, unread_fds) = reader.into_unread();
+
+        Some(Handover {
+            socket,
+            fd_passing: self.fd_passing,
+            unread,
+            unread_fds,
+            rest,
+            kept,
+        })
+    }
+
+    /// Disconnect the client: write nothing more to it, drop what is left to write, and shut its
+    /// socket down, as when a write to it fails. The client's reader then yields what the socket
+    /// still holds, which the client sent before, and then EOF.
+    ///
+    /// This does nothing if the bus is disconnecting the client already.
+    #[cfg(target_os = "linux")]
+    pub fn close(&self) {
+        if self.outgoing().cut() {
+            self.shut_down();
+        }
+    }
+
+    /// Whether the bus is disconnecting the client because a write to it failed or timed out, or
+    /// because the bus closed the connection.
     #[cfg(target_os = "linux")]
     pub fn is_disconnecting(&self) -> bool {
         self.outgoing().state == State::Disconnecting
@@ -203,6 +302,25 @@ impl Connection {
     /// How long the bus gives the client to take each send.
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// The connection of the client at the other end of `socket`, as [`Connection::new`] makes it,
+    /// with `outgoing` to write.
+    fn with_outgoing(
+        socket: Arc<UnixStream<Shared>>,
+        unique_name: OwnedUniqueName,
+        fd_passing: bool,
+        timeout: Duration,
+        outgoing: Outgoing,
+    ) -> Self {
+        Self {
+            socket,
+            unique_name,
+            fd_passing,
+            timeout,
+            outgoing: Mutex::new(outgoing),
+            changed: Event::new(),
+        }
     }
 
     /// Write what was queued up to `target`, of the bytes ever queued, within the client's time
@@ -307,8 +425,13 @@ impl Connection {
                 self.unique_name
             ),
         }
-        // Shutting the socket down makes the client's reader reach EOF, once it has taken what the
-        // socket still holds.
+        self.shut_down();
+    }
+
+    /// Shut the client's socket down, and have the sends that wait look again.
+    ///
+    /// The client's reader then reaches EOF, once it has taken what the socket still holds.
+    fn shut_down(&self) {
         if let Err(e) = self.socket.shutdown(Shutdown::Both) {
             debug!(
                 "Failed to shut the socket of `{}` down: {e}",

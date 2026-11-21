@@ -111,6 +111,78 @@ impl Reader {
         }
     }
 
+    /// The reader of the client at the other end of `socket`, taken over from the previous
+    /// instance.
+    ///
+    /// It yields `unread` first, and then what it reads from the socket. `unread` holds the bytes
+    /// that the previous instance read but no message took, from the start of a message. `fds`
+    /// holds the file descriptors that came with those bytes and that no message took.
+    ///
+    /// The FDs wait as one set, which stands for the sets that waited in the previous instance.
+    /// There was at least one such set, so no more sets wait here than waited there. If `unread`
+    /// starts a message longer than the reader reads at a time and holds nothing more, it gets its
+    /// own allocation, as any such message does. Any other bytes go into the buffer that the reader
+    /// reads into.
+    #[cfg(target_os = "linux")]
+    pub fn taken_over(socket: Arc<UnixStream<Shared>>, unread: Vec<u8>, fds: Vec<OwnedFd>) -> Self {
+        let fd_sets = match fds.len() {
+            0 => VecDeque::new(),
+            count => VecDeque::from([count]),
+        };
+        // The buffer is only as long as what it holds, which leaves it no room to read into. The
+        // reader grows it back to its usual size before each read.
+        let (buffer, end, long, long_filled) = match long_start(&unread) {
+            Some(len) => {
+                let filled = unread.len();
+                let mut long = unread;
+                long.resize(len, 0);
+
+                (Vec::new(), 0, long, filled)
+            }
+            None => {
+                let end = unread.len();
+
+                (unread, end, Vec::new(), 0)
+            }
+        };
+
+        Self {
+            socket,
+            buffer,
+            start: 0,
+            end,
+            long,
+            long_filled,
+            fds,
+            fd_sets,
+            ended: false,
+        }
+    }
+
+    /// The unread bytes, from the start of a message, and their file descriptors that no message
+    /// took, in the order that they came in, for the next instance to take over.
+    ///
+    /// If the reader is in the middle of a message longer than it reads at a time, the unread bytes
+    /// are the bytes of that message that came in. Otherwise, they are what the reader read after
+    /// the last message that it yielded.
+    #[cfg(target_os = "linux")]
+    pub fn into_unread(self) -> (Vec<u8>, Vec<OwnedFd>) {
+        let unread = if self.long.is_empty() {
+            let mut buffer = self.buffer;
+            buffer.copy_within(self.start..self.end, 0);
+            buffer.truncate(self.end - self.start);
+
+            buffer
+        } else {
+            let mut long = self.long;
+            long.truncate(self.long_filled);
+
+            long
+        };
+
+        (unread, self.fds)
+    }
+
     /// Whether the client closed its end of the socket or shut its writes down, the bus shut the
     /// socket down, or the socket failed, even if the socket still holds bytes to read.
     ///
@@ -222,11 +294,21 @@ impl Reader {
     /// bytes came, 0 at EOF.
     ///
     /// The buffer first moves its bytes to its start.
+    ///
+    /// A read is made only once no whole message is left in the buffer, and the start of a message
+    /// longer than [`BUFFER_SIZE`] has gone to its own allocation by then. So the buffer holds less
+    /// than that size, and it has room after its bytes once it is of that size again.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<zbus::Result<usize>> {
         if self.start > 0 {
             self.buffer.copy_within(self.start..self.end, 0);
             self.end -= self.start;
             self.start = 0;
+        }
+        // The buffer of a taken-over reader is only as long as the unread bytes that it took over,
+        // which leaves no room after them. A read into no room would come back with nothing,
+        // as at EOF.
+        if self.buffer.len() < BUFFER_SIZE {
+            self.buffer.resize(BUFFER_SIZE, 0);
         }
         let room = &mut self.buffer[self.end..];
         let read = ready!(poll_recv(
@@ -309,6 +391,15 @@ fn poll_recv(
     }
 
     Poll::Ready(Ok(read))
+}
+
+/// The length of the message that `bytes` start, if it is longer than [`BUFFER_SIZE`], and `bytes`
+/// hold no more than that message.
+#[cfg(target_os = "linux")]
+fn long_start(bytes: &[u8]) -> Option<usize> {
+    let (_, len) = PrimaryHeader::parse_with_len(bytes).ok()?;
+
+    (len > BUFFER_SIZE && bytes.len() <= len).then_some(len)
 }
 
 /// The error of an input that ended in the middle of a message.
