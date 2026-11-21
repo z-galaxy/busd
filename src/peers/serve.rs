@@ -5,15 +5,20 @@ use futures_util::{
     future::{select, Either},
     stream::StreamExt,
 };
-use zbus::{names::OwnedUniqueName, MessageStream};
+use zbus::{
+    names::{OwnedUniqueName, UniqueName},
+    MessageStream,
+};
 use zruntime::EventListener;
 
 use super::{forward::no_reply, outbox::Outbox, Peers};
 use crate::{
-    debug,
+    debug, fdo,
     name_registry::NameOwnerChanged,
-    peer::{Caller, Invalid, Peer, PendingCalls, Stream},
-    trace, warn,
+    peer::{Caller, Invalid, Peer, PendingCalls, Stream, BUS_ID},
+    trace,
+    user::User,
+    warn,
 };
 
 impl Peers {
@@ -100,8 +105,8 @@ impl Peers {
         {
             let mut routing = self.routing_mut().await;
             if routing.remove_peer(served.unique_name.as_str()).is_none() {
-                // The bus cleaned up after the peer as it turned it into a monitor, and the
-                // `Monitoring` interface emits the signals then.
+                // The bus cleaned up after the peer as it turned it into a monitor, and sent the
+                // signals then.
                 routing.monitors.remove(&served.unique_name);
                 // This task may have forwarded calls that the peer sent after the one that made it
                 // a monitor, which can't get their replies to it either.
@@ -234,31 +239,29 @@ impl Peers {
     }
 
     /// Finish cleaning up after the peer `unique_name`, which went, and whose names changed owners
-    /// with `names_changes`, as they were released: signal the changes, and answer the calls that
-    /// waited for its replies, `waiting`, with errors.
+    /// with `names_changes`, as they were released: signal the changes, then that the peer went,
+    /// and answer the calls that waited for its replies, `waiting`, with errors, in that order.
     pub(super) async fn finish_clean_up(
         &self,
         unique_name: &OwnedUniqueName,
-        names_changes: Vec<NameOwnerChanged>,
+        mut names_changes: Vec<NameOwnerChanged>,
         waiting: Vec<(OwnedUniqueName, NonZeroU32)>,
     ) -> Result<()> {
-        for changed in names_changes {
-            self.notify_name_changes(changed).await?;
-        }
-        self.notify_name_changes(NameOwnerChanged::vanished(unique_name.clone()))
-            .await?;
+        names_changes.push(NameOwnerChanged::vanished(unique_name.clone()));
+        let mut msgs = fdo::name_change_signals(&names_changes)?;
         // Nor will the calls that wait on the peer get its replies, so they get an error from the
         // bus instead, as with dbus-broker, rather than wait for as long as their callers do.
         for (caller, serial) in waiting {
-            let error = no_reply(&caller, serial)?;
-            self.send_from_bus(&error).await;
+            msgs.push(no_reply(&caller, serial)?);
         }
+        self.send_from_bus(&msgs).await;
 
         Ok(())
     }
 }
 
 /// What the task that serves a peer keeps of the peer: see [`Peers::serve_peer`].
+#[derive(Debug)]
 pub(super) struct Served {
     pub(super) unique_name: OwnedUniqueName,
     /// The number of the peer.
@@ -277,6 +280,21 @@ impl Served {
             id: peer.client().id(),
             pending_calls: peer.pending_calls().clone(),
             caller: peer.caller().clone(),
+        }
+    }
+
+    /// The bus itself, of `user`, as the sender of its own messages.
+    ///
+    /// The bus makes no calls, so no call of the bus waits for a reply.
+    pub(super) fn bus(user: Arc<User>) -> Self {
+        let unique_name: OwnedUniqueName =
+            UniqueName::from_static_str_unchecked(fdo::BUS_NAME).into();
+
+        Self {
+            unique_name: unique_name.clone(),
+            id: BUS_ID,
+            pending_calls: Arc::new(PendingCalls::new(user.clone())),
+            caller: Caller::new(unique_name, user),
         }
     }
 }

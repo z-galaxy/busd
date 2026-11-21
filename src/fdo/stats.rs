@@ -1,61 +1,47 @@
-use std::collections::HashMap;
+//! The `org.freedesktop.DBus.Debug.Stats` interface.
+//!
+//! What the methods ask the peers for only takes the lock of the routing, as the methods of the
+//! `org.freedesktop.DBus` interface do.
 
 use zbus::{
     fdo::{Error, Result},
-    interface,
-    names::{BusName, OwnedUniqueName},
-    OwnedMatchRule, SerializeDict, Type,
+    message::Header,
+    names::{BusName, MemberName, OwnedUniqueName},
+    Message, SerializeDict, Type,
 };
 
-use crate::{
-    fdo::{upgrade, BUS_NAME},
-    peers::{ConnectionCounts, Counts, Peers, WeakPeers},
-};
+use super::{args, unknown_method, Answer, Driver, BUS_NAME};
+use crate::peers::{ConnectionCounts, Counts, Peers};
 
-#[derive(Debug)]
-pub struct Stats {
-    peers: WeakPeers,
-    /// The number of the last call of `GetStats`.
-    serial: u32,
-    /// The number of the last call of `GetConnectionStats` that the bus answered, which counts
-    /// independently of that of `GetStats`, as with the reference implementation of D-Bus.
-    connection_serial: u32,
-}
+impl Driver {
+    /// Answer the call of `member` of the `org.freedesktop.DBus.Debug.Stats` interface, `call`,
+    /// whose header is `header`.
+    pub(super) async fn answer_stats(
+        &mut self,
+        peers: &Peers,
+        call: &Message,
+        header: &Header<'_>,
+        member: &MemberName<'_>,
+    ) -> Result<Answer> {
+        match member.as_str() {
+            // Statistics about the message bus itself.
+            "GetStats" => {
+                let counts = peers.counts().await;
+                self.stats_serial = self.stats_serial.wrapping_add(1);
 
-impl Stats {
-    pub const PATH: &'static str = "/org/freedesktop/DBus";
-    pub const INTERFACE: &'static str = "org.freedesktop.DBus.Debug.Stats";
+                Answer::reply(header, &BusStats::new(self.stats_serial, counts))
+            }
+            "GetConnectionStats" => {
+                let body = call.body();
+                let stats = self.connection_stats(peers, args(&body)?).await?;
 
-    pub fn new(peers: &Peers) -> Self {
-        Self {
-            peers: peers.downgrade(),
-            serial: 0,
-            connection_serial: 0,
+                Answer::reply(header, &stats)
+            }
+            // The match rules of all the peers, by their unique names. A peer without match rules
+            // has an empty list. The bus itself is not listed, and neither are the monitors.
+            "GetAllMatchRules" => Answer::reply(header, &peers.all_match_rules().await),
+            _ => Err(unknown_method(member)),
         }
-    }
-
-    /// The peers of the bus, unless the bus is shutting down.
-    fn peers(&self) -> Result<Peers> {
-        upgrade(&self.peers)
-    }
-}
-
-// One call at a time, in order, as with the `org.freedesktop.DBus` interface, and with the same
-// rule: a method never waits for anything that waits for the bus to take the calls after it.
-// What the methods ask the peers for only takes the lock of the routing, as the methods of that
-// interface do.
-#[interface(
-    interface = "org.freedesktop.DBus.Debug.Stats",
-    introspection_docs = false,
-    spawn = false
-)]
-impl Stats {
-    /// Statistics about the message bus itself.
-    async fn get_stats(&mut self) -> Result<BusStats> {
-        let counts = self.peers()?.counts().await;
-        self.serial = self.serial.wrapping_add(1);
-
-        Ok(BusStats::new(self.serial, counts))
     }
 
     /// Statistics for the connection identified by `name`, either its unique name or a well-known
@@ -63,28 +49,24 @@ impl Stats {
     ///
     /// The bus itself and monitors cannot be queried. The reply omits the counts of queued
     /// messages, bytes and file descriptors, because the bus does not track them.
-    async fn get_connection_stats(&mut self, name: BusName<'_>) -> Result<ConnectionStats> {
+    async fn connection_stats(
+        &mut self,
+        peers: &Peers,
+        name: BusName<'_>,
+    ) -> Result<ConnectionStats> {
         if name == BUS_NAME {
             return Err(Error::InvalidArgs(
                 "`GetConnectionStats` is not meaningful for the bus itself.".to_string(),
             ));
         }
-        let Some(counts) = self.peers()?.connection_counts(&name).await else {
+        let Some(counts) = peers.connection_counts(&name).await else {
             return Err(Error::NameHasNoOwner(format!(
                 "Name `{name}` has no owner."
             )));
         };
-        self.connection_serial = self.connection_serial.wrapping_add(1);
+        self.connection_stats_serial = self.connection_stats_serial.wrapping_add(1);
 
-        Ok(ConnectionStats::new(self.connection_serial, counts))
-    }
-
-    /// The match rules of all the connections, by their unique names.
-    ///
-    /// A connection without match rules has an empty list. The bus itself is not listed, and
-    /// neither are the monitors.
-    async fn get_all_match_rules(&self) -> Result<HashMap<OwnedUniqueName, Vec<OwnedMatchRule>>> {
-        Ok(self.peers()?.all_match_rules().await)
+        Ok(ConnectionStats::new(self.connection_stats_serial, counts))
     }
 }
 

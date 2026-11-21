@@ -19,7 +19,7 @@ use super::{Bus, Listener};
 use crate::{
     info,
     peers::{
-        handover::{ClientHandover, MonitorState, NameState, OwnHandover, PeerState, Snapshot},
+        handover::{ClientHandover, MonitorState, NameState, PeerState, Snapshot},
         Peers,
     },
     policy::Policy,
@@ -30,14 +30,13 @@ impl Bus {
     ///
     /// The bus pauses: it stops taking the messages of each client, once it is done with those that
     /// it took, and forwards those. Then it finishes its own chores, such as its clean-up after the
-    /// clients that went meanwhile, and stops taking the calls to itself: it answers those that it
-    /// has under way, and sends the signals that follow their replies, such as those of the names
-    /// that change owners, without waiting for its clients to take what it sends them.
-    ///
-    /// The bus hands over the connection on which it serves the D-Bus API as well, with whatever is
-    /// on its way between it and its clients by then: the calls to the bus that it didn't take, and
-    /// what it sent and didn't pass on. The next instance answers those calls and passes the rest
-    /// on, each once and in order.
+    /// clients that went meanwhile, and answers the calls to it that it took, sending the signals
+    /// that follow their replies, such as those of the names that change owners, without waiting
+    /// for its clients to take what it sends them. The calls to the bus that it didn't take are
+    /// still in the connections of their clients, with everything else that the bus didn't take of
+    /// those clients. The connections go to the next instance, so nothing is on its way to or from
+    /// the bus itself when it hands over. The next instance answers those calls, and each call gets
+    /// one answer, in the order of the calls.
     ///
     /// The connection of each client then goes to the next instance, with the messages that zbus
     /// read of the client and that the bus didn't take, what it read of a message that the client
@@ -68,9 +67,6 @@ impl Bus {
         let peers = self.peers.clone();
         peers.pause(STOP_TIMEOUT).await?;
         peers.settle().await;
-        // The bus's own connection goes first: if that fails, the bus still has its clients, and
-        // disconnects them as it goes.
-        let own = peers.hand_over_us().await?;
         let (snapshot, clients) = peers.snapshot().await?;
         let state = State {
             guid: self.guid.clone(),
@@ -90,7 +86,6 @@ impl Bus {
             state,
             listener,
             clients,
-            own: Some(own),
         })
     }
 
@@ -111,10 +106,9 @@ impl Bus {
     /// took over too, once set on the returned bus. The objects that it took over count, even
     /// beyond a maximum that is lower than the previous one.
     ///
-    /// The bus serves the D-Bus API on the connection of the previous instance, if `handover` has
-    /// it. Once its clients, their names and their match rules are back, it answers the calls
-    /// that the previous instance didn't take, and passes on what that instance sent and didn't
-    /// pass on, before it does anything else.
+    /// The calls to the bus that the previous instance didn't take are still in the connections of
+    /// their clients, with everything else that the previous instance didn't take of them. The bus
+    /// takes those calls while it serves the clients, as it takes any call.
     pub async fn take_over(
         handover: Handover,
         listener: Option<OwnedFd>,
@@ -131,10 +125,9 @@ impl Bus {
         let guid = state.guid;
         let address = listener.address(&guid)?;
         let last_id = usize::try_from(state.last_id)?;
-        let peers = Peers::new();
+        let peers = Peers::new(guid.clone());
         // Before the bus has the clients of the hand-over, which it serves as soon as it has them.
         peers.set_policy(policy).await;
-        let us = Self::us(&peers, &guid, handover.own).await?;
         let clients: HashMap<_, _> = handover
             .clients
             .into_iter()
@@ -145,8 +138,8 @@ impl Bus {
             monitors: state.monitors,
             names: state.names,
         };
-        let service_conn = peers.restore(snapshot, clients, send_timeout, us).await?;
-        let mut bus = Self::with_peers(listener, address, guid, peers, service_conn);
+        peers.restore(snapshot, clients, send_timeout).await?;
+        let mut bus = Self::with_peers(listener, address, guid, peers);
         bus.next_id = last_id;
         bus.set_send_timeout(send_timeout);
 
@@ -170,10 +163,6 @@ pub struct Handover {
     pub(crate) listener: Option<OwnedFd>,
     /// The clients, peers and monitors.
     pub(crate) clients: Vec<ClientHandover>,
-    /// The connection on which the previous instance served the D-Bus API. `None` in a hand-over
-    /// of a version that came without it: the next instance then serves the API on a new
-    /// connection.
-    pub(crate) own: Option<OwnHandover>,
 }
 
 impl Handover {
@@ -224,35 +213,31 @@ impl State {
         Ok(data.bytes().to_vec())
     }
 
-    /// The state that `bytes` hold, as [`State::encode`] encoded it, and whether its bus handed
-    /// over the connection on which it served the D-Bus API as well. A bus of
-    /// `VERSION_WITHOUT_OWN` didn't: it made sure that nothing was on its way on that connection.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<(Self, bool)> {
+    /// The state that `bytes` hold, as [`State::encode`] encoded it, if it is of [`VERSION`].
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let data = serialized::Data::new(bytes, serialized::Context::new(LE, 0));
         let (version, _) = data
             .deserialize::<u32>()
             .context("The state that was handed over has no version")?;
-        let with_own = match version {
-            VERSION => true,
-            VERSION_WITHOUT_OWN => false,
-            _ => bail!("The state that was handed over is of version {version}, not {VERSION}."),
-        };
+        if version != VERSION {
+            bail!("The state that was handed over is of version {version}, not {VERSION}.");
+        }
         let ((_, state), _) = data
             .deserialize::<(u32, Self)>()
             .context("Failed to decode the state that was handed over")?;
 
-        Ok((state, with_own))
+        Ok(state)
     }
 }
 
-/// The version of the state. A bus takes over from a bus of the same version, or of the version
-/// before it, and from no other.
-const VERSION: u32 = 2;
-/// The version of the state before the bus handed over the connection on which it serves the
-/// D-Bus API. Its state is encoded in the same way. This bus takes over from a bus of that
-/// version, which made sure that nothing was on its way on that connection. A bus of that version
-/// doesn't take over from this one: it would lose what is on its way there.
-const VERSION_WITHOUT_OWN: u32 = 1;
+/// The version of the state.
+///
+/// A bus takes over only from a bus of the same version. Taking over from a bus of another version
+/// fails, which disconnects the clients.
+///
+/// A bus of this version answers the calls to it that it took before it hands over, so nothing is
+/// on its way to or from the bus at that point.
+const VERSION: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -290,9 +275,8 @@ mod tests {
         };
 
         let encoded = state.encode().unwrap();
-        let (decoded, with_own) = State::decode(&encoded).unwrap();
+        let decoded = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
-        assert!(with_own);
 
         let mut other = encoded.clone();
         let version = VERSION + 1;
@@ -305,74 +289,30 @@ mod tests {
     /// A bus and the instance that takes over from it share only the bytes of the state, and the
     /// two may run different versions of busd. A state of this version encodes to these bytes and
     /// decodes from them, however the types that hold it change. Changing the encoding requires a
-    /// new version.
+    /// new version, which an instance of another version refuses.
     #[test]
     fn encoding_of_the_state_is_pinned() {
-        let name = |id: u32| OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
-        // At most one rule per peer, because a peer's rules are in no particular order.
-        let rules = |rule: &str| {
-            let mut rules = MatchRules::default();
-            rules.add(OwnedMatchRule::try_from(rule).unwrap());
-
-            rules
-        };
-        let state = State {
-            guid: zbus::Guid::from_static_str("0123456789abcdef0123456789abcdef")
-                .unwrap()
-                .into(),
-            last_id: 3,
-            peers: vec![
-                PeerState {
-                    id: 1,
-                    greeted: true,
-                    match_rules: rules("type='signal',sender='org.zbus.Test'"),
-                    pending_calls: vec![(2, name(2), 7)],
-                },
-                PeerState {
-                    id: 2,
-                    greeted: false,
-                    match_rules: MatchRules::default(),
-                    pending_calls: Vec::new(),
-                },
-            ],
-            monitors: vec![MonitorState {
-                id: 3,
-                match_rules: rules("type='method_call'"),
-            }],
-            names: vec![NameState {
-                name: OwnedWellKnownName::try_from("org.zbus.Test").unwrap(),
-                owners: vec![(name(1), false, true), (name(2), true, false)],
-            }],
-        };
+        let state = pinned_state();
 
         let encoded = state.encode().unwrap();
         let hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(hex, ENCODED);
 
-        let (decoded, with_own) = State::decode(&encoded).unwrap();
+        let decoded = State::decode(&encoded).unwrap();
         assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
-        assert!(with_own);
     }
 
-    /// A bus takes over from a state of the version before this one. That version came without
-    /// the connection on which the bus serves the D-Bus API, as its bus made sure that nothing was
-    /// on its way there.
+    /// A bus doesn't take over from a state of version 2, the version before this one, even though
+    /// that state is encoded in the same way as a state of this version. A bus takes over from no
+    /// other version.
     #[test]
-    fn state_of_the_version_before_comes_without_the_connection_of_the_bus() {
-        let state = State {
-            guid: zbus::Guid::generate().into(),
-            last_id: 7,
-            peers: Vec::new(),
-            monitors: Vec::new(),
-            names: Vec::new(),
-        };
-        let mut encoded = state.encode().unwrap();
-        encoded[..4].copy_from_slice(&VERSION_WITHOUT_OWN.to_le_bytes());
+    fn state_of_version_2_is_refused() {
+        let mut encoded = pinned_state().encode().unwrap();
+        encoded[..4].copy_from_slice(&2u32.to_le_bytes());
 
-        let (decoded, with_own) = State::decode(&encoded).unwrap();
+        let error = State::decode(&encoded).unwrap_err();
 
-        assert_eq!(format!("{decoded:?}"), format!("{state:?}"));
-        assert!(!with_own);
+        assert!(error.to_string().contains("version 2"), "{error}");
     }
 
     /// A bus doesn't take over from a state that it can't decode, rather than panic: garbage, the
@@ -401,9 +341,50 @@ mod tests {
         }
     }
 
-    /// The state of `encoding_of_the_state_is_pinned`, encoded by version 2, in hexadecimal.
+    /// The state that `encoding_of_the_state_is_pinned` encodes.
+    fn pinned_state() -> State {
+        let name = |id: u32| OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap();
+        // At most one rule per peer, because a peer's rules are in no particular order.
+        let rules = |rule: &str| {
+            let mut rules = MatchRules::default();
+            rules.add(OwnedMatchRule::try_from(rule).unwrap());
+
+            rules
+        };
+
+        State {
+            guid: zbus::Guid::from_static_str("0123456789abcdef0123456789abcdef")
+                .unwrap()
+                .into(),
+            last_id: 3,
+            peers: vec![
+                PeerState {
+                    id: 1,
+                    greeted: true,
+                    match_rules: rules("type='signal',sender='org.zbus.Test'"),
+                    pending_calls: vec![(2, name(2), 7)],
+                },
+                PeerState {
+                    id: 2,
+                    greeted: false,
+                    match_rules: MatchRules::default(),
+                    pending_calls: Vec::new(),
+                },
+            ],
+            monitors: vec![MonitorState {
+                id: 3,
+                match_rules: rules("type='method_call'"),
+            }],
+            names: vec![NameState {
+                name: OwnedWellKnownName::try_from("org.zbus.Test").unwrap(),
+                owners: vec![(name(1), false, true), (name(2), true, false)],
+            }],
+        }
+    }
+
+    /// The state of [`pinned_state`], encoded by this version, in hexadecimal.
     const ENCODED: &str = concat!(
-        "02000000000000002000000030313233343536373839616263646566303132333435363738396162",
+        "03000000000000002000000030313233343536373839616263646566303132333435363738396162",
         "63646566000000000300000000000000700000000000000001000000000000000100000029000000",
         "24000000747970653d277369676e616c272c73656e6465723d276f72672e7a6275732e5465737427",
         "00000000180000000200000000000000070000003a627573642e3200070000000200000000000000",

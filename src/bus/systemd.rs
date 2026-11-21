@@ -6,8 +6,9 @@
 //! With [zoter], an instance of busd that stops hands its state and the connections of its clients
 //! over to the next instance, through the file descriptor store that systemd keeps for the service
 //! across its restarts. The clients notice nothing but a pause: the next instance serves them on
-//! the same connections, with the same names, match rules and calls that wait for replies, answers
-//! the calls to the bus that were on their way to it, and passes on what was on its way from it.
+//! the same connections, with the same names, match rules and calls that wait for replies, writes
+//! them what the previous instance left to write, and answers the calls to the bus that the
+//! previous instance didn't take.
 //!
 //! A hand-over takes file descriptors (FDs) of many kinds, which these docs name so:
 //!
@@ -25,13 +26,12 @@
 //!   look the credentials of the client up.
 //!
 //! The bus hands over under socket activation, as [Socket activation](#socket-activation) tells.
-//! On `SIGTERM`, it pauses its clients and itself, finishes what it took, and hands their
-//! connections and its own over ([`Bus::hand_over`]). It hands its state and, as the items of the
-//! hand-over, its own connection, and the connections of the clients, each under the number of its
-//! client, to zoter, which stores them under `busd/` and waits for systemd to
-//! have dealt with them, and it exits ([`Bus::hand_over_to_systemd`]). systemd starts the next
-//! instance with the sockets of socket activation and what was stored, which it takes over from
-//! ([`Bus::for_systemd`]):
+//! On `SIGTERM`, it pauses its clients, finishes what it took, which includes answering the calls
+//! to it that it took, and hands their connections over ([`Bus::hand_over`]). It hands its state
+//! and, as the items of the hand-over, the connections of the clients, each under the number of its
+//! client, to zoter, which stores them under `busd/` and waits for systemd to have dealt with them,
+//! and it exits ([`Bus::hand_over_to_systemd`]). systemd starts the next instance with the sockets
+//! of socket activation and what was stored, which it takes over from ([`Bus::for_systemd`]):
 #![doc = simple_mermaid::mermaid!("systemd/restart.mmd")]
 //!
 //! zoter lays the hand-over out in the store: a memfd, under `busd/state`, which holds the state
@@ -39,16 +39,12 @@
 //! whose queues hold the connection FDs, some 70000 in each, as many as that takes. The state of
 //! the bus refers to each client by its number, which zoter gives back with its connection.
 //!
-//! The bus serves the D-Bus API on a connection to itself, over a channel in its process, whose two
-//! ends it hands over too, with what was on its way between the bus and its clients: the calls to
-//! the bus that it didn't take, and what it sent and didn't pass on. The channel stays behind: the
-//! two ends go together as one item of the hand-over, ahead of the clients, with what the channel
-//! held for each, and the FDs of their messages for connection FDs, under the number of the peer
-//! of the bus, which no client has. The next instance joins the two with a channel of its own. It
-//! takes nothing over without them, rather than leave the clients whose calls were on their way
-//! waiting for replies that would never come. It does take over from the state of an earlier
-//! version of busd, which came without that connection, as that version made sure that nothing was
-//! on its way before it stopped, while an earlier version takes nothing over from this one.
+//! The bus answers the calls to it that it took before it hands over, so nothing is on its way to
+//! or from the bus itself at that point. The calls to the bus that it didn't take are still in the
+//! connections of their clients. Those connections go to the next instance with everything else
+//! that the bus didn't take of their clients. The bus wrote its answers to the other calls to the
+//! connections of their clients, and each connection keeps what its client didn't take, for the
+//! next instance.
 //!
 //! zoter stores a hand-over whole, or fails to, and the next instance takes it over whole, or fails
 //! to: zoter leaves no client out of it. The next instance takes the connection FDs out once it
@@ -93,20 +89,15 @@
 //!
 //! [zoter]: https://github.com/z-galaxy/zoter
 
-use std::{iter, os::fd::OwnedFd, sync::Arc, time::Duration};
+use std::{os::fd::OwnedFd, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use zbus::connection::{self, socket::ChannelHandover};
+use zbus::connection;
 use zoter::{Passed, Restored, Save, Store};
 use zruntime::SharedRuntime;
 
-use super::{handover::State, Bus, ClientHandover, Handover, OwnHandover};
-use crate::{
-    debug, error, info,
-    peer::{BUS_ID, SEND_TIMEOUT},
-    policy::Policy,
-    warn,
-};
+use super::{handover::State, Bus, ClientHandover, Handover};
+use crate::{debug, error, info, peer::SEND_TIMEOUT, policy::Policy, warn};
 
 impl Bus {
     /// Create a bus that systemd runs, out of the FDs that systemd passed, `passed`, and the store
@@ -171,14 +162,13 @@ impl Bus {
     /// cleans up as [`Bus::cleanup`] does, only logging a failure to, and fails.
     ///
     /// The bus hands over as [`Bus::hand_over`] does, and stores what it hands over, for
-    /// [`Bus::for_systemd`] to take over from on the restart: its state, the connection on which it
-    /// serves the D-Bus API, both of its ends, and the connections of its clients, each under the
-    /// number of its client. It stores all of them or fails: it fails if the bus takes longer than
-    /// 30 s to hand over, if the two ends of its own connection can't go together, or if storing
-    /// fails, as when the FDs of the hand-over don't fit in the store, which disconnects the
-    /// clients as the bus goes. The next instance needs to be able to open all of the FDs that the
-    /// bus stored, and the process FD of each client, under its limit of open FDs: it takes nothing
-    /// over if it can't open those that were stored, which disconnects the clients.
+    /// [`Bus::for_systemd`] to take over from on the restart: its state, and the connections of its
+    /// clients, each under the number of its client. It stores all of them or fails: it fails if
+    /// the bus takes longer than 30 s to hand over, or if storing fails, as when the FDs of the
+    /// hand-over don't fit in the store, which disconnects the clients as the bus goes. The next
+    /// instance needs to be able to open all of the FDs that the bus stored, and the process FD of
+    /// each client, under its limit of open FDs: it takes nothing over if it can't open those that
+    /// were stored, which disconnects the clients.
     pub async fn hand_over_to_systemd(self, store: Store) -> Result<()> {
         if self.listener.is_bound() {
             if let Err(e) = self.cleanup().await {
@@ -197,24 +187,17 @@ impl Bus {
             .await
             .context("The bus took too long to hand over")??;
 
-        let OwnHandover { service, peer } = handover
-            .own
-            .context("The bus didn't hand over the connection on which it serves the D-Bus API")?;
-        // The channel between its two ends is in this process alone, so the two go without it,
-        // each with what the channel held for it.
-        let own = ChannelHandover::new(service, peer)?;
         let state = handover.state.encode()?;
-        let clients = handover
+        let items = handover
             .clients
             .iter()
             .map(|client| (client.id as u64, &client.connection as &dyn Save));
-        let items = iter::once((OWN_ID, &own as &dyn Save)).chain(clients);
         let stored = store.hand_over(&state[..], items)?;
         debug!(
-            "Stored the state of the bus, its own connection and {} file descriptors of {} \
-             clients for the next instance",
+            "Stored the state of the bus and {} file descriptors of {} clients for the next \
+             instance",
             stored.fds(),
-            stored.items() - 1
+            stored.items()
         );
 
         Ok(())
@@ -287,27 +270,16 @@ impl Bus {
 
 impl Handover {
     /// What the previous instance of the bus handed over, out of what zoter took over, if its
-    /// state can be decoded, and the connection on which that instance served the D-Bus API came
-    /// with it, whole.
+    /// state can be decoded.
     ///
     /// Each client gets its connection back from the record of its connection, read in place, and
     /// from its connection FDs. One whose connection can't be restored is gone: the next instance
-    /// cleans up after it as after any client that goes. If the state can't be decoded, or the
-    /// connection of the bus is missing or can't be restored, everything that was handed over
-    /// closes, which disconnects the clients.
+    /// cleans up after it as after any client that goes. If the state can't be decoded,
+    /// everything that was handed over closes, which disconnects the clients.
     fn from_restored(mut restored: Restored) -> Result<Self> {
-        let (state, with_own) = State::decode(restored.state())?;
-        let mut own = None;
+        let state = State::decode(restored.state())?;
         let mut clients = Vec::new();
         for item in restored.take_items() {
-            if item.id == OWN_ID {
-                let channel = item.restore::<ChannelHandover>().context(
-                    "Failed to restore the connection on which the bus serves the D-Bus API",
-                )?;
-                own = Some(OwnHandover::from(channel));
-
-                continue;
-            }
             let Ok(id) = usize::try_from(item.id) else {
                 continue;
             };
@@ -321,39 +293,17 @@ impl Handover {
         // The connections hold what they need of their records, and the memfd is unmapped as
         // `restored` goes.
 
-        // A bus that lost what was on its way between the instance before it and its clients
-        // would leave those clients waiting for it, so it takes nothing over then.
-        if with_own && own.is_none() {
-            bail!("The connection on which the bus serves the D-Bus API wasn't handed over");
-        }
-
         // The listening socket is that of the socket activation, which systemd passes on its own.
         Ok(Self {
             state,
             listener: None,
             clients,
-            own,
         })
-    }
-}
-
-impl From<ChannelHandover> for OwnHandover {
-    /// The connection on which a bus serves the D-Bus API, out of its two ends as they got to the
-    /// next instance in another process, which a new channel joins, with what the channel before
-    /// held for each.
-    fn from(channel: ChannelHandover) -> Self {
-        let (service, peer) = channel.into_ends();
-
-        Self { service, peer }
     }
 }
 
 /// The key that busd hands over under, in the store of systemd.
 pub const STORE_KEY: &str = "busd";
-/// The id of the item of a hand-over that is the connection on which the bus serves the D-Bus
-/// API, both of its ends: the number of the peer of the bus, which no client has, as the clients go
-/// under their numbers.
-const OWN_ID: u64 = BUS_ID as u64;
 /// How long the bus may take to hand over, before busd gives up on it, and its clients get
 /// disconnected as it goes.
 ///

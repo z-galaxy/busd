@@ -1,80 +1,66 @@
-use crate::{debug, warn};
+//! The `org.freedesktop.DBus.Monitoring` interface.
+
 use zbus::{
     fdo::{Error, Result},
-    interface, message,
-    object_server::{ResponseDispatchNotifier, SignalEmitter},
+    message::Header,
+    names::MemberName,
+    Message,
 };
 
-use super::{ensure_privileged, msg_sender, upgrade};
-use crate::{
-    match_rules::MatchRules,
-    name_registry::NameOwnerChanged,
-    peers::{Peers, WeakPeers},
-};
+use super::{args, failed, name_change_signals, unknown_method, Answer, Driver};
+use crate::{debug, match_rules::MatchRules, name_registry::NameOwnerChanged, peers::Peers};
 
-#[derive(Debug)]
-pub struct Monitoring {
-    peers: WeakPeers,
-}
+impl Driver {
+    /// Answer the call of `member` of the `org.freedesktop.DBus.Monitoring` interface, `call`,
+    /// whose header is `header`.
+    pub(super) async fn answer_monitoring(
+        &self,
+        peers: &Peers,
+        call: &Message,
+        header: &Header<'_>,
+        member: &MemberName<'_>,
+    ) -> Result<Answer> {
+        match member.as_str() {
+            "BecomeMonitor" => {
+                let body = call.body();
+                let (match_rules, _flags): (MatchRules, u32) = args(&body)?;
 
-impl Monitoring {
-    pub const PATH: &'static str = "/org/freedesktop/DBus";
-    pub const INTERFACE: &'static str = "org.freedesktop.DBus.Monitoring";
-
-    pub fn new(peers: &Peers) -> Self {
-        Self {
-            peers: peers.downgrade(),
+                peers.become_monitor(header, match_rules).await
+            }
+            _ => Err(unknown_method(member)),
         }
     }
 }
 
-// One call at a time, in order, as with the `org.freedesktop.DBus` interface, and with the same
-// rule: a method never waits for anything that waits for the bus to take the calls after it.
-#[interface(
-    interface = "org.freedesktop.DBus.Monitoring",
-    introspection_docs = false,
-    spawn = false
-)]
-impl Monitoring {
-    async fn become_monitor(
-        &self,
-        match_rules: MatchRules,
-        _flags: u32,
-        #[zbus(header)] hdr: message::Header<'_>,
-        #[zbus(signal_emitter)] ctxt: SignalEmitter<'_>,
-    ) -> Result<ResponseDispatchNotifier<()>> {
-        let owner = msg_sender(&hdr).to_owned();
-        let peers = upgrade(&self.peers)?;
-        ensure_privileged(&peers, &hdr).await?;
-        if !peers.make_monitor(&owner, match_rules).await {
+impl Peers {
+    /// Answer `BecomeMonitor` of the peer that sent the call of `header`.
+    ///
+    /// The call makes the peer a monitor of the messages that `match_rules` match, or of every
+    /// message if there are none. Since it is no longer a peer, it lets go of its names, and of its
+    /// unique name last. The reply comes before the signals of those names, because some clients,
+    /// such as `busctl monitor`, get confused otherwise.
+    async fn become_monitor(&self, header: &Header<'_>, match_rules: MatchRules) -> Result<Answer> {
+        let Some(owner) = header.sender().map(|sender| sender.to_owned()) else {
+            return Err(Error::Failed("The call has no sender".to_string()));
+        };
+        self.ensure_privileged(&owner).await?;
+        if !self.make_monitor(&owner, match_rules).await {
             return Err(Error::NameHasNoOwner(format!("No such peer: {owner}")));
         }
         debug!("{} became a monitor", owner);
+        let reply = super::reply(header, &())?;
+        // The names pass on to the peers that queue for them, as when their owner goes.
+        let mut changes = self
+            .routing_mut()
+            .await
+            .names_mut()
+            .release_all(owner.clone());
+        changes.push(NameOwnerChanged::vanished(owner.into()));
 
-        // We want to emit the name change signals **after** the `BecomeMonitor` method returns.
-        // Otherwise, some clients (e.g `busctl monitor`) can get confused.
-        let conn = ctxt.connection().clone();
-        let notify = async move {
-            let names_changes = peers
-                .routing_mut()
-                .await
-                .names_mut()
-                .release_all(owner.clone());
-            // Notify each new owner, as when the previous owner disconnects.
-            for changed in names_changes {
-                if let Err(e) = peers.notify_name_changes(changed).await {
-                    warn!("Failed to notify peers of name change: {}", e);
-                }
-            }
-
-            if let Err(e) = peers
-                .notify_name_changes(NameOwnerChanged::vanished(owner.into()))
-                .await
-            {
-                warn!("Failed to notify peers of name change: {}", e);
-            }
-        };
-
-        Ok(ResponseDispatchNotifier::followed_by((), &conn, notify))
+        Ok(Answer {
+            before: Vec::new(),
+            reply,
+            after: name_change_signals(&changes).map_err(failed)?,
+        })
     }
 }

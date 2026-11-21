@@ -129,14 +129,13 @@ on one of its own.
 With socket activation and a [file descriptor store], under systemd 254 or later, busd survives its
 restarts without its clients noticing anything but a pause. On `SIGTERM`, rather than disconnect
 them, it stops taking their messages, finishes what it took, forwarding those messages and answering
-the calls to it that it has under way, without waiting for the clients to take what it sends them,
-and hands their connections and its state over to systemd: their unique names, the well-known names
-that they own or queue for, their match rules, the calls that wait for their replies, what zbus read
-of their messages but busd hasn't taken yet, as the start of one that a client is in the middle of
-sending, what busd sent them that they haven't taken yet, and the calls to busd itself that it
-hasn't answered, with the file descriptors that came with those. On a restart, systemd hands all of
-that over to the next instance of busd, which serves the clients on from there, on the same
-connections, answers those calls, and writes the clients what they hadn't taken first. On a stop,
+the calls to it among them, without waiting for the clients to take what it sends them, and hands
+their connections and its state over to systemd: their unique names, the well-known names that they
+own or queue for, their match rules, the calls that wait for their replies, what zbus read of their
+messages but busd hasn't taken yet, as the start of one that a client is in the middle of sending,
+and what busd sent them that they haven't taken yet, with the file descriptors that came with those.
+On a restart, systemd hands all of that over to the next instance of busd, which serves the clients
+on from there, on the same connections, and writes them what they hadn't taken first. On a stop,
 systemd closes them. A session bus, for example:
 
 ```ini
@@ -161,15 +160,14 @@ ExecStart=/usr/bin/busd --session
 FileDescriptorStoreMax=16
 ```
 
-`systemctl --user restart busd` then restarts busd, as after an update, with its clients connected
-throughout, while those that connect meanwhile wait in the socket, which systemd keeps open. The
-store only keeps what busd hands over until the next instance takes it, which `systemctl restart`
-starts right away, while `systemctl stop` followed by `systemctl start` doesn't keep it. The
-hand-over needs all three: the socket unit, `FileDescriptorStoreMax=` of 2 at least, and systemd 254
-or later. The next instance raises its limit of open files to the hard limit of `LimitNOFILE=` as it
-takes what busd handed over out of the store, and needs to be able to open all of it: if it can't,
-it takes nothing over, which disconnects all of the clients. So lower that limit with a stop and a
-start, rather than a restart.
+`systemctl --user restart busd` then restarts busd with its clients connected throughout, while
+those that connect meanwhile wait in the socket, which systemd keeps open. The store only keeps what
+busd hands over until the next instance takes it, which `systemctl restart` starts right away, while
+`systemctl stop` followed by `systemctl start` doesn't keep it. The hand-over needs all three: the
+socket unit, `FileDescriptorStoreMax=` of 2 at least, and systemd 254 or later. The next instance
+raises its limit of open files to the hard limit of `LimitNOFILE=` as it takes what busd handed over
+out of the store, and needs to be able to open all of it: if it can't, it takes nothing over, which
+disconnects all of the clients. So lower that limit with a stop and a start, rather than a restart.
 
 busd tells systemd that it has started as it takes over through the store, which a unit of
 `Type=notify` has systemd wait for, while its clients wait in the socket. So under a unit

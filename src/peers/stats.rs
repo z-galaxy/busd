@@ -6,7 +6,6 @@ use zbus::{
 };
 
 use super::Peers;
-use crate::fdo;
 
 impl Peers {
     /// What the bus counts for the `GetStats` method of its `org.freedesktop.DBus.Debug.Stats`
@@ -17,10 +16,7 @@ impl Peers {
         let routing = self.routing().await;
         let mut greeted = 0;
         let mut not_greeted = 0;
-        for (name, peer) in routing.peers.iter() {
-            if *name == fdo::BUS_NAME {
-                continue;
-            }
+        for peer in routing.peers.values() {
             if peer.greeted() {
                 greeted += 1;
             } else {
@@ -66,8 +62,8 @@ impl Peers {
         })
     }
 
-    /// The match rules of each peer but the bus itself, by the unique name of the peer, for the
-    /// `GetAllMatchRules` method of the `org.freedesktop.DBus.Debug.Stats` interface.
+    /// The match rules of each peer, by the unique name of the peer, for the `GetAllMatchRules`
+    /// method of the `org.freedesktop.DBus.Debug.Stats` interface.
     ///
     /// A peer without match rules has an empty list, and a monitor has none, as it is no peer. A
     /// client that has yet to say `Hello` is listed like any other peer, as `ListNames` lists it.
@@ -78,7 +74,6 @@ impl Peers {
         routing
             .peers
             .iter()
-            .filter(|(name, _)| **name != fdo::BUS_NAME)
             .map(|(name, peer)| {
                 (
                     name.clone(),

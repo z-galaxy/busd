@@ -93,10 +93,10 @@ fn restart() {
 }
 
 /// The calls to the bus that are on their way as systemd stops it get their replies, each once, in
-/// the order of the calls: the instance that stops answers those that it took, and stores the
-/// others, with the replies that it didn't pass on, along with its state, as it hands over the
-/// connection on which it serves the D-Bus API. The next instance answers those calls, and passes
-/// those replies on, as it does what the client sent and the instance that stopped didn't read.
+/// the order of the calls: the instance that stops answers those that it took, and leaves the
+/// others in the client's connection. It hands the connection over with what the client sent and
+/// it didn't read. The next instance answers those calls, as it does anything else that the client
+/// sent and the instance that stopped didn't read.
 #[test]
 #[timeout(60000)]
 fn restart_with_calls_to_the_bus_on_their_way() {

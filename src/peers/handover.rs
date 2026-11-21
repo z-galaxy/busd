@@ -20,9 +20,9 @@ use zbus::{
 };
 use zruntime::{spawn, SharedRuntime};
 
-use super::{Peers, Routing, Served, Us};
+use super::{Peers, Routing, Served};
 use crate::{
-    debug, fdo,
+    debug,
     match_rules::MatchRules,
     name_registry::{NameOwner, NameRegistry},
     peer::{unique_name, Caller, Client, HandedOver, Monitor, Peer, Recipient, Stream},
@@ -36,10 +36,10 @@ impl Peers {
     /// pause as soon as they are connected, and those in the middle of their handshakes have
     /// `timeout` to be done with them.
     ///
-    /// The bus itself pauses as its clients do: it passes nothing more on of what it sends, nor
-    /// waits to send it, and takes no more calls once it hands the connection on which it serves
-    /// the D-Bus API over ([`Peers::hand_over_us`]). What is on its way between the bus and its
-    /// clients from then on stays on that connection, which is handed over with it.
+    /// The bus goes on answering the calls to it that its clients sent before they paused, while
+    /// the task of each client queues the calls to the bus that it took. [`Peers::settle`] waits
+    /// for the bus to have answered them. The calls that the tasks didn't take stay with the
+    /// connections of their clients, and go to the next instance with those connections.
     ///
     /// From now on, no send to a client waits for the client to take what the bus sends it. What a
     /// client doesn't take goes along with the hand-over of its connection, and the next instance
@@ -55,12 +55,6 @@ impl Peers {
         {
             let mut routing = self.routing_mut().await;
             routing.handing_over = true;
-            // The bus keeps what its peer doesn't take of what it sends, as the task that serves
-            // that peer is to take no more of it.
-            if let Some(bus) = self.bus_conn().clone() {
-                let prepared = bus.prepare_hand_over();
-                debug_assert!(prepared, "the connection of the bus can't be handed over");
-            }
             for client in routing.clients_mut() {
                 client.pause();
             }
@@ -120,7 +114,7 @@ impl Peers {
     }
 
     /// Wait for the bus to settle: to have no chores under way, such as its clean-up after a
-    /// client that went.
+    /// client that went, or calls to the bus that it has yet to answer.
     ///
     /// A hand-over waits for this once the bus is paused, so the bus only has its own work to
     /// finish, as nothing new comes in for it to do, but for what the clients whose connections
@@ -128,11 +122,11 @@ impl Peers {
     /// went, and those that the bus disconnected, as they didn't take what it sent them in time, or
     /// as a send to them failed, as one to a client that went does.
     ///
-    /// The bus still takes the calls to it meanwhile, and until it hands the connection on which
-    /// it serves the D-Bus API over ([`Peers::hand_over_us`]), which waits for the calls that the
-    /// bus has under way, and for the signals that follow their replies. Neither waits for what is
-    /// on its way between the bus and its clients: the calls to the bus that it didn't take, and
-    /// what it sent and didn't pass on, go to the next instance on that connection.
+    /// Each call to the bus is a chore from the moment its caller's task queues it until the bus
+    /// has sent the reply and the signals that follow the reply. So the bus answers every call that
+    /// it took before it settles. Those are the calls under way, the calls in the queue, and the
+    /// calls that clients' tasks wait to queue while the queue is full. It doesn't wait for the
+    /// clients to take what it sends them.
     pub(crate) async fn settle(&self) {
         loop {
             let started = self.inner.chores.done().await;
@@ -142,38 +136,6 @@ impl Peers {
                 return;
             }
         }
-    }
-
-    /// Hand the connection on which the bus serves the D-Bus API over, both ends of it, once the
-    /// bus settled: the end on which it answers the calls to it, with those that it didn't take,
-    /// and the end of its peer, with what the bus sent and the task that served that peer didn't
-    /// take, each with what it took to send and the other end didn't read.
-    ///
-    /// The bus takes no more calls from then on, leaving those that it didn't take to its next
-    /// instance, and this waits for it to have answered those that it has under way, and to have
-    /// sent the signals that follow their replies, which are part of them.
-    ///
-    /// The end that answers goes first, so that nothing more comes out of it by the time that the
-    /// other one goes.
-    pub(crate) async fn hand_over_us(&self) -> Result<OwnHandover> {
-        let service = self.bus_conn().clone().context("The bus isn't up")?;
-        let mut stream = self
-            .routing_mut()
-            .await
-            .peers
-            .get_mut(fdo::BUS_NAME)
-            .and_then(|bus| bus.client_mut().paused().take())
-            .context("The bus isn't paused")?;
-        let service = service
-            .hand_over()
-            .await
-            .context("Failed to hand the connection of the bus over")?;
-        let peer = stream
-            .hand_over()
-            .await
-            .context("Failed to hand the connection of the peer of the bus over")?;
-
-        Ok(OwnHandover { service, peer })
     }
 
     /// The peers, monitors and names, as the bus hands them over, and what it hands over of the
@@ -196,7 +158,7 @@ impl Peers {
         let names = {
             let mut routing = self.routing_mut().await;
             let routing = &mut *routing;
-            for peer in routing.peers.values_mut().filter(|peer| !peer.is_bus()) {
+            for peer in routing.peers.values_mut() {
                 let state = PeerState {
                     id: peer.client().id() as u64,
                     greeted: peer.greeted(),
@@ -263,9 +225,8 @@ impl Peers {
     /// Let go of the clients without disconnecting them, as the bus handed them over: nothing more
     /// goes to them from this instance of the bus.
     pub(crate) async fn retire(&self) {
-        // Nothing more comes from the bus, such as its errors to the calls that wait on the peers
-        // that go now.
-        self.remove_us();
+        // The bus takes no more calls.
+        self.inner.itself.recipient.hand_over();
         let mut routing = self.routing_mut().await;
         for client in routing.clients_mut() {
             client.recipient().hand_over();
@@ -287,18 +248,12 @@ impl Peers {
     /// client first, as the client takes it: a client that doesn't take it within `send_timeout`
     /// gets disconnected, as when a send to it times out. What is left of it once the bus pauses,
     /// to hand over in turn, goes on with that hand-over.
-    ///
-    /// The bus itself is added to its peers along with them, on the connection of `us`, and the
-    /// end of that connection on which it answers the calls to it is returned. The calls to the
-    /// bus that it was handed over with, and what the instance before it sent and didn't pass on,
-    /// so find the peers, monitors and names all back.
     pub(crate) async fn restore(
         &self,
         snapshot: Snapshot,
         mut clients: HashMap<usize, ClientHandover>,
         send_timeout: Duration,
-        us: Us,
-    ) -> Result<Connection> {
+    ) -> Result<()> {
         let Snapshot {
             peers,
             monitors,
@@ -355,12 +310,8 @@ impl Peers {
                 }
             }
         }
-        let service_conn = {
+        {
             let mut routing = self.routing_mut().await;
-            // The object server of the bus answers the calls that the bus was handed over with,
-            // and the task that serves the bus passes on what it was handed over with, only once
-            // they get this lock: once all that follows is in place.
-            let service_conn = self.insert_us(&mut routing, us).await?;
             for NameState { name, owners } in names {
                 let mut owners = owners
                     .into_iter()
@@ -377,8 +328,8 @@ impl Peers {
                     .name_registry
                     .release_all(unique_name.inner().clone());
             }
-            // The calls that wait on the peers, of the callers that are back too, the bus itself
-            // among them: the bus would forget the calls of the others as it cleans up after them.
+            // The calls that wait on the peers, of the callers that are back too: the bus would
+            // forget the calls of the others as it cleans up after them.
             let callers: HashMap<usize, Arc<Caller>> = routing
                 .peers
                 .values()
@@ -405,9 +356,7 @@ impl Peers {
                 monitor.client_mut().flush();
                 self.insert_monitor(&mut routing, monitor, stream);
             }
-
-            service_conn
-        };
+        }
         // The bus serves its clients from here on, so it goes on whatever comes.
         for (unique_name, records, names_changes) in gone {
             let waiting = records
@@ -426,7 +375,7 @@ impl Peers {
             );
         }
 
-        Ok(service_conn)
+        Ok(())
     }
 
     /// Add `monitor`, whose messages come out of `stream`, to the monitors of `routing`, and serve
@@ -509,21 +458,6 @@ pub struct ClientHandover {
     pub connection: Handover,
 }
 
-/// The hand-over of the connection on which a bus serves the D-Bus API: both of its ends.
-///
-/// The bus serves the API as a peer of its own, over a channel in its process. It answers the
-/// calls to it on one end. Its peer has the other end, and the bus forwards the messages of that
-/// peer as it does those of any client. Whatever is on its way between the two ends as the bus
-/// hands over goes with them: the calls to the bus that it didn't take, and the replies and
-/// signals that it sent and didn't pass on to its clients.
-#[derive(Debug)]
-pub struct OwnHandover {
-    /// The end on which the bus answers the calls to it.
-    pub(crate) service: Handover,
-    /// The other end, which the peer of the bus has.
-    pub(crate) peer: Handover,
-}
-
 /// The peers, monitors and names of a bus, as it hands them over.
 #[derive(Debug)]
 pub(crate) struct Snapshot {
@@ -562,8 +496,8 @@ pub(crate) struct NameState {
     pub(crate) owners: Vec<(OwnedUniqueName, bool, bool)>,
 }
 
-/// Whether the task that served each peer of `routing`, the bus itself included, and each monitor,
-/// gave the stream of its messages back, as the bus pauses.
+/// Whether the task that served each peer of `routing`, and each monitor, gave the stream of its
+/// messages back, as the bus pauses.
 fn paused(routing: &mut Routing) -> bool {
     routing
         .clients_mut()

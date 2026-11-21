@@ -1,4 +1,4 @@
-use crate::{debug, trace, warn};
+use crate::{debug, warn};
 use anyhow::{bail, Context, Ok, Result};
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
@@ -9,19 +9,14 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use zbus::{
-    address::Transport,
-    connection::{self, socket::Channel},
-    fdo::ConnectionCredentials,
-    Address, Connection, Guid, OwnedGuid,
-};
+use zbus::{address::Transport, connection, fdo::ConnectionCredentials, Address, Guid, OwnedGuid};
 use zruntime::spawn;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod handover;
 mod listener;
 #[cfg(target_os = "linux")]
-pub use crate::peers::handover::{ClientHandover, OwnHandover};
+pub use crate::peers::handover::ClientHandover;
 #[cfg(target_os = "linux")]
 pub use handover::{Handover, STOP_TIMEOUT};
 use listener::Listener;
@@ -30,12 +25,7 @@ mod systemd;
 #[cfg(target_os = "linux")]
 pub use systemd::STORE_KEY;
 
-use crate::{
-    fdo::{self, DBus, Monitoring, Stats},
-    peer::SEND_TIMEOUT,
-    peers::{Peers, Us},
-    policy::Policy,
-};
+use crate::{peer::SEND_TIMEOUT, peers::Peers, policy::Policy};
 
 /// The bus.
 ///
@@ -52,9 +42,6 @@ pub struct Bus {
     /// The number of the last client that connected.
     next_id: usize,
     send_timeout: Duration,
-    /// The end of the bus's own connection on which the bus answers the calls to it. The bus
-    /// keeps this end for as long as it lives.
-    _self_conn: Connection,
 }
 
 impl Bus {
@@ -72,7 +59,7 @@ impl Bus {
         };
         let listener = Listener::bind(unix).await?;
 
-        Self::new(listener, guid).await
+        Self::new(listener, guid)
     }
 
     /// Create a bus that listens on `listener`, a socket that listens already, such as the one that
@@ -84,7 +71,7 @@ impl Bus {
     pub async fn for_listener(listener: OwnedFd) -> Result<Self> {
         let listener = Listener::from_fd(listener, false)?;
 
-        Self::new(listener, Guid::generate().into()).await
+        Self::new(listener, Guid::generate().into())
     }
 
     pub fn address(&self) -> &Address {
@@ -164,38 +151,16 @@ impl Bus {
     }
 
     /// Create a bus with `guid` that listens on `listener`.
-    async fn new(listener: Listener, guid: OwnedGuid) -> Result<Self> {
+    fn new(listener: Listener, guid: OwnedGuid) -> Result<Self> {
         let address = listener.address(&guid)?;
-        let peers = Peers::new();
-        let us = Self::us(
-            &peers,
-            &guid,
-            #[cfg(target_os = "linux")]
-            None,
-        )
-        .await?;
-        let service_conn = peers.add_us(us).await?;
-        trace!("Self-dial connection created.");
+        let peers = Peers::new(guid.clone());
 
-        Ok(Self::with_peers(
-            listener,
-            address,
-            guid,
-            peers,
-            service_conn,
-        ))
+        Ok(Self::with_peers(listener, address, guid, peers))
     }
 
-    /// Create a bus with `guid` that listens on `listener` at `address`. `peers` are its peers,
-    /// the bus itself among them, and `service_conn` is the connection on which it serves the
-    /// D-Bus API.
-    fn with_peers(
-        listener: Listener,
-        address: Address,
-        guid: OwnedGuid,
-        peers: Peers,
-        service_conn: Connection,
-    ) -> Self {
+    /// Create a bus with `guid` that listens on `listener` at `address`, and whose peers are
+    /// `peers`.
+    fn with_peers(listener: Listener, address: Address, guid: OwnedGuid, peers: Peers) -> Self {
         Self {
             listener,
             address,
@@ -203,47 +168,7 @@ impl Bus {
             guid,
             next_id: 0,
             send_timeout: SEND_TIMEOUT,
-            _self_conn: service_conn,
         }
-    }
-
-    /// The connection on which a bus of `guid` serves the D-Bus API to `peers`, as a peer of its
-    /// own, for the bus to be added to them: a new one, or the one that `own` hands over, with the
-    /// calls to the bus that the instance before this one didn't answer, and what it sent and
-    /// didn't pass on.
-    ///
-    /// The bus talks to itself over a channel, which is in this process alone.
-    pub(crate) async fn us(
-        peers: &Peers,
-        guid: &OwnedGuid,
-        #[cfg(target_os = "linux")] own: Option<OwnHandover>,
-    ) -> Result<Us> {
-        trace!("Creating self-dial connection.");
-        #[cfg(target_os = "linux")]
-        let handed_over = own.map(|OwnHandover { service, peer }| {
-            let take_over = connection::Builder::take_over;
-
-            (take_over(service), take_over(peer))
-        });
-        #[cfg(not(target_os = "linux"))]
-        let handed_over = None;
-        let (service, peer) = handed_over.unwrap_or_else(|| {
-            let (service, peer) = Channel::pair();
-            let end = |socket| connection::Builder::authenticated_socket(socket, guid.clone());
-
-            (
-                end(service).p2p().unique_name(fdo::BUS_NAME),
-                end(peer).p2p(),
-            )
-        });
-        let stream = peer.build_message_stream().await?;
-        let service = service
-            .name(fdo::BUS_NAME)
-            .serve_at(fdo::DBus::PATH, DBus::new(peers, guid.clone()))
-            .serve_at(fdo::Monitoring::PATH, Monitoring::new(peers))
-            .serve_at(fdo::Stats::PATH, Stats::new(peers));
-
-        Ok(Us { service, stream })
     }
 
     async fn accept_next(&mut self) -> Result<()> {
@@ -288,12 +213,6 @@ impl Bus {
         self.next_id += 1;
 
         self.next_id
-    }
-}
-
-impl Drop for Bus {
-    fn drop(&mut self) {
-        self.peers.remove_us();
     }
 }
 
