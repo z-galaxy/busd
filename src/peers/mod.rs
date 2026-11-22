@@ -2,7 +2,6 @@ use std::{
     fmt, iter,
     ops::{Deref, DerefMut},
     rc::{self, Rc},
-    sync::Arc,
     time::Duration,
 };
 
@@ -141,7 +140,7 @@ impl Peers {
 
     /// Have the bus go by `policy` from now on: for the clients that connect, and for the peers
     /// that it has, each of which gets what `policy` has for it.
-    pub async fn set_policy(&self, policy: Arc<Policy>) {
+    pub async fn set_policy(&self, policy: Rc<Policy>) {
         let mut routing = self.routing_mut().await;
         for peer in routing.peers.values_mut() {
             peer.set_policy(policy.for_peer(peer.user().uid(), peer.groups()));
@@ -179,7 +178,7 @@ impl Peers {
             Ok(policy) => policy,
             Err(e) => return Some(Err(e)),
         };
-        self.set_policy(Arc::new(policy)).await;
+        self.set_policy(Rc::new(policy)).await;
 
         Some(Ok(()))
     }

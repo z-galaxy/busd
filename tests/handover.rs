@@ -15,6 +15,7 @@ use std::{
         unix::net::{UnixListener, UnixStream},
     },
     pin::pin,
+    rc::Rc,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -221,7 +222,7 @@ fn users_keep_their_objects() {
 
         // The two clients and the call are all of the objects that the next instance keeps for
         // their user, the user of the tests.
-        let mut next = Bus::take_over(bus.hand_over().await, None, SEND_TIMEOUT, Arc::default())
+        let mut next = Bus::take_over(bus.hand_over().await, None, SEND_TIMEOUT, Rc::default())
             .await
             .unwrap();
         next.set_max_objects_per_user(3);
@@ -273,7 +274,7 @@ fn policy_from_the_first_message() {
             .unwrap()
             .sleep(Duration::ZERO)
             .await;
-        let policy = Arc::new(owns_no_name());
+        let policy = Rc::new(owns_no_name());
         let bus = Bus::take_over(handover, None, SEND_TIMEOUT, policy)
             .await
             .unwrap();
@@ -678,7 +679,7 @@ fn bus_on_a_given_socket_hands_over() {
 
         let handover = bus.hand_over().await;
         assert!(handover.listener().is_none());
-        let bus = Bus::take_over(handover, Some(activator_copy), SEND_TIMEOUT, Arc::default())
+        let bus = Bus::take_over(handover, Some(activator_copy), SEND_TIMEOUT, Rc::default())
             .await
             .unwrap();
         let (bus, _) = serve(bus);
@@ -2003,7 +2004,7 @@ impl Running {
     /// Run the instance of the bus that takes over from the one that handed `handover` over, and
     /// gives each client `send_timeout` to take a message, those that it takes over included.
     async fn take_over_with(handover: Handover, send_timeout: Duration) -> Self {
-        let bus = Bus::take_over(handover, None, send_timeout, Arc::default()).await;
+        let bus = Bus::take_over(handover, None, send_timeout, Rc::default()).await;
 
         Self::new(bus.unwrap())
     }

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::{
+    cell::{RefCell, RefMut},
+    rc::Rc,
+};
 
 use zruntime::Event;
 #[cfg(target_os = "linux")]
@@ -11,7 +14,7 @@ use zruntime::EventListener;
 /// A handle: cheap to clone, and the clones share the counts.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Chores {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 impl Chores {
@@ -109,16 +112,15 @@ impl Drop for Connecting {
 
 #[derive(Debug, Default)]
 struct Inner {
-    counts: Mutex<Counts>,
+    counts: RefCell<Counts>,
     /// Notified when a chore or a handshake ends, that is when a [`Chore`] or a [`Connecting`]
     /// guard is dropped. Starting a chore or a handshake changes `counts` without notifying.
     changed: Event,
 }
 
 impl Inner {
-    fn counts(&self) -> MutexGuard<'_, Counts> {
-        // Nothing can panic while the lock is held.
-        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    fn counts(&self) -> RefMut<'_, Counts> {
+        self.counts.borrow_mut()
     }
 }
 

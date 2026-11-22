@@ -11,7 +11,7 @@ pub use pending_calls::*;
 
 use crate::trace;
 use anyhow::{Context, Result};
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{rc::Rc, time::Duration};
 use zbus::{fdo::ConnectionCredentials, names::BusName, OwnedGuid, OwnedMatchRule};
 
 #[cfg(target_os = "linux")]
@@ -31,12 +31,12 @@ pub struct Peer {
     /// The most match rules that the peer had at a time, since this instance of the bus has it.
     peak_match_rules: usize,
     /// The calls to the peer that wait for its reply.
-    pending_calls: Arc<PendingCalls>,
+    pending_calls: Rc<PendingCalls>,
     /// The peer, as the caller of the calls that wait for replies.
-    caller: Arc<Caller>,
+    caller: Rc<Caller>,
     /// The credentials of the client, as its socket reported them when the client connected, or
     /// when the bus took the client over.
-    credentials: Arc<ConnectionCredentials>,
+    credentials: Rc<ConnectionCredentials>,
     /// What the policy of the bus has for the peer.
     policy: PeerPolicy,
     greeted: bool,
@@ -58,7 +58,7 @@ impl Peer {
         socket: std::os::unix::net::UnixStream,
         credentials: ConnectionCredentials,
         send_timeout: Duration,
-        user: Arc<User>,
+        user: Rc<User>,
         charge: Charge,
     ) -> Result<(Self, Stream)> {
         debug_assert_ne!(id, BUS_ID, "a client numbered as the bus");
@@ -77,7 +77,7 @@ impl Peer {
             client,
             reader,
             user,
-            Arc::new(credentials),
+            Rc::new(credentials),
             PeerPolicy::default(),
             false,
         ))
@@ -89,12 +89,12 @@ impl Peer {
     }
 
     /// The calls to the peer that wait for its reply.
-    pub fn pending_calls(&self) -> &Arc<PendingCalls> {
+    pub fn pending_calls(&self) -> &Rc<PendingCalls> {
         &self.pending_calls
     }
 
     /// The peer, as the caller of the calls that wait for replies.
-    pub fn caller(&self) -> &Arc<Caller> {
+    pub fn caller(&self) -> &Rc<Caller> {
         &self.caller
     }
 
@@ -109,7 +109,7 @@ impl Peer {
     }
 
     /// The credentials of the peer's client, as its socket reports them.
-    pub fn credentials(&self) -> &Arc<ConnectionCredentials> {
+    pub fn credentials(&self) -> &Rc<ConnectionCredentials> {
         &self.credentials
     }
 
@@ -234,7 +234,7 @@ impl Peer {
             client,
             reader,
             user,
-            Arc::new(credentials),
+            Rc::new(credentials),
             PeerPolicy::default(),
             greeted,
         ))
@@ -258,8 +258,8 @@ impl Peer {
     fn assemble(
         client: Client,
         reader: Reader,
-        user: Arc<User>,
-        credentials: Arc<ConnectionCredentials>,
+        user: Rc<User>,
+        credentials: Rc<ConnectionCredentials>,
         policy: PeerPolicy,
         greeted: bool,
     ) -> (Self, Stream) {
@@ -267,7 +267,7 @@ impl Peer {
         let peer = Self {
             peak_match_rules: client.match_rules().len(),
             client,
-            pending_calls: Arc::new(PendingCalls::new(user.clone())),
+            pending_calls: Rc::new(PendingCalls::new(user.clone())),
             caller: Caller::new(unique_name, user),
             credentials,
             policy,

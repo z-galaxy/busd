@@ -5,8 +5,8 @@ use std::os::fd::OwnedFd;
 use std::{
     env,
     path::{Path, PathBuf},
+    rc::Rc,
     str::FromStr,
-    sync::Arc,
     time::Duration,
 };
 use zbus::{address::Transport, fdo::ConnectionCredentials, Address, Guid, OwnedGuid};
@@ -108,7 +108,7 @@ impl Bus {
     /// It is the open policy of [`Policy::default`] unless set otherwise, or given to
     /// `Bus::take_over`, and applies to the clients that connect from then on, and to those that
     /// the bus has.
-    pub async fn set_policy(&mut self, policy: Arc<Policy>) {
+    pub async fn set_policy(&mut self, policy: Rc<Policy>) {
         self.peers.set_policy(policy).await;
     }
 

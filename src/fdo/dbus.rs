@@ -1,6 +1,6 @@
 //! The `org.freedesktop.DBus` interface.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, rc::Rc};
 
 use zbus::{
     fdo::{ConnectionCredentials, Error, RequestNameFlags, Result, StartServiceReply},
@@ -271,10 +271,10 @@ impl Peers {
 
     /// The credentials that the bus has of the owner of `name`: those of the peer's process, or
     /// those of the bus's own process.
-    async fn credentials(&self, name: BusName<'_>) -> Result<Arc<ConnectionCredentials>> {
+    async fn credentials(&self, name: BusName<'_>) -> Result<Rc<ConnectionCredentials>> {
         let owner = self.name_owner(name.clone()).await?;
         if owner == BUS_NAME {
-            return Ok(Arc::new(own_credentials()));
+            return Ok(Rc::new(own_credentials()));
         }
         // Each peer has the credentials that the bus looked up when its client connected, or when
         // the bus took the client over.

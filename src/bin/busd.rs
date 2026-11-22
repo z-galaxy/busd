@@ -6,7 +6,7 @@ use std::{
     os::fd::FromRawFd,
     path::{Path, PathBuf},
     pin::pin,
-    sync::Arc,
+    rc::Rc,
 };
 
 use busd::{
@@ -106,7 +106,7 @@ async fn run(
         .or_else(|| config.listen.as_ref().map(ToString::to_string));
 
     // Before the bus serves anyone, as building the policy reads files.
-    let policy = Arc::new(policy_of(&config));
+    let policy = Rc::new(policy_of(&config));
 
     // SIGTERM is what service managers, such as systemd, and `kill` send to stop a service. Taking
     // the signals over before the bus listens, and so before anyone can tell that it's ready, has

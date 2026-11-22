@@ -89,7 +89,7 @@
 //!
 //! [zoter]: https://github.com/z-galaxy/zoter
 
-use std::{os::fd::OwnedFd, sync::Arc, time::Duration};
+use std::{os::fd::OwnedFd, rc::Rc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use zoter::{Passed, Restored, Save, Store};
@@ -124,7 +124,7 @@ impl Bus {
         mut passed: Passed,
         store: Option<&mut Store>,
         address: Option<&str>,
-        policy: Arc<Policy>,
+        policy: Rc<Policy>,
     ) -> Result<Self> {
         let has_store = store.is_some();
         let restored = store.and_then(|store| {
@@ -233,7 +233,7 @@ impl Bus {
     async fn out_of_restored(
         restored: Restored,
         activation: OwnedFd,
-        policy: Arc<Policy>,
+        policy: Rc<Policy>,
     ) -> Result<Self> {
         let handover = match Handover::from_restored(restored) {
             Ok(handover) => handover,

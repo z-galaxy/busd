@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    rc::Rc,
 };
 
 use zbus::{
@@ -44,7 +44,7 @@ pub struct Routing {
     /// that counting them takes no pass over the peers.
     pub(super) match_rule_counts: MatchRuleCounts,
     /// The policy of the bus, which each peer gets its part of as it is added.
-    pub(super) policy: Arc<Policy>,
+    pub(super) policy: Rc<Policy>,
 }
 
 impl Routing {

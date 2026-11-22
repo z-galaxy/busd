@@ -1,11 +1,6 @@
 #![cfg(feature = "testing")]
 
-use std::{
-    collections::VecDeque,
-    fmt::Debug,
-    future::Future,
-    sync::{mpsc, Arc},
-};
+use std::{collections::VecDeque, fmt::Debug, future::Future, rc::Rc, sync::mpsc};
 
 use anyhow::{anyhow, bail, ensure, Context};
 use busd::{
@@ -494,7 +489,7 @@ async fn set_policy_applies_to_connected_peers_(bus: TestBus) -> anyhow::Result<
             <deny own="*"/>
         </policy>"#
     );
-    bus.peers().set_policy(Arc::new(policy(&policies)?)).await;
+    bus.peers().set_policy(Rc::new(policy(&policies)?)).await;
     let result = request_name(&dbus, "org.busd.Policy.After").await;
     ensure_denied(result, OWN_REFUSED)?;
 
@@ -868,7 +863,7 @@ where
 {
     let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
     // Before the bus serves anyone.
-    bus.set_policy(Arc::new(policy)).await;
+    bus.set_policy(Rc::new(policy)).await;
 
     with(bus, test).await;
 }

@@ -19,12 +19,12 @@ mod socket;
 mod write;
 
 use std::{
+    cell::{RefCell, RefMut},
     io,
     net::Shutdown,
     os::fd::AsFd,
     pin::pin,
     rc::Rc,
-    sync::{Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
@@ -58,7 +58,7 @@ pub struct Connection {
     fd_passing: bool,
     timeout: Duration,
     /// What is left to write to the client, and how the bus writes to it.
-    outgoing: Mutex<Outgoing>,
+    outgoing: RefCell<Outgoing>,
     /// Notified when a write completes a message, and when the state changes, so that the sends
     /// that wait look again.
     changed: Event,
@@ -236,10 +236,7 @@ impl Connection {
     /// fails to be duplicated. The socket closes then, which disconnects the client.
     #[cfg(target_os = "linux")]
     pub fn hand_over(self, reader: Reader) -> Option<Handover> {
-        let outgoing = self
-            .outgoing
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner);
+        let outgoing = self.outgoing.into_inner();
         if outgoing.state == State::Disconnecting {
             debug!(
                 "Leaving `{}` out of the hand-over, as the bus is disconnecting it",
@@ -316,7 +313,7 @@ impl Connection {
             unique_name,
             fd_passing,
             timeout,
-            outgoing: Mutex::new(outgoing),
+            outgoing: RefCell::new(outgoing),
             changed: Event::new(),
         }
     }
@@ -440,9 +437,8 @@ impl Connection {
     }
 
     /// What is left to write to the client.
-    fn outgoing(&self) -> MutexGuard<'_, Outgoing> {
-        // Nothing can panic while the lock is held.
-        self.outgoing.lock().unwrap_or_else(PoisonError::into_inner)
+    fn outgoing(&self) -> RefMut<'_, Outgoing> {
+        self.outgoing.borrow_mut()
     }
 }
 

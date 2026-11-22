@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
-    sync::Arc,
+    rc::Rc,
     time::Duration,
 };
 
@@ -114,7 +114,7 @@ impl Bus {
         handover: Handover,
         listener: Option<OwnedFd>,
         send_timeout: Duration,
-        policy: Arc<Policy>,
+        policy: Rc<Policy>,
     ) -> Result<Self> {
         let state = handover.state;
         let (listener, bound) = match (listener, handover.listener) {

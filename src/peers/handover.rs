@@ -6,7 +6,7 @@ use std::{
     iter, mem,
     num::NonZeroU32,
     pin::pin,
-    sync::Arc,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -310,7 +310,7 @@ impl Peers {
             }
             // The calls that wait on the peers, of the callers that are back too: the bus would
             // forget the calls of the others as it cleans up after them.
-            let callers: HashMap<usize, Arc<Caller>> = routing
+            let callers: HashMap<usize, Rc<Caller>> = routing
                 .peers
                 .values()
                 .map(|peer| (peer.client().id(), peer.caller().clone()))

@@ -8,7 +8,7 @@
 //!   then waits at [`Hook::follow`]. Then it makes the bus send a `Followed` signal, which follows
 //!   the reply.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
 use zbus::Message;
 use zruntime::Event;
@@ -28,8 +28,8 @@ pub(crate) struct Hook {
 /// A gate that the answer of the bus to a call waits at, until the test opens it.
 #[derive(Debug, Default)]
 pub(crate) struct Gate {
-    reached: AtomicBool,
-    open: AtomicBool,
+    reached: Cell<bool>,
+    open: Cell<bool>,
     changed: Event,
 }
 
@@ -41,22 +41,22 @@ impl Gate {
 
     /// Open the gate for the answers that wait at it, and for those that reach it.
     pub(crate) fn open(&self) {
-        self.open.store(true, Ordering::SeqCst);
+        self.open.set(true);
         self.changed.notify(usize::MAX);
     }
 
     /// Wait at the gate until it is open, and tell that it was reached.
     async fn pass(&self) {
-        self.reached.store(true, Ordering::SeqCst);
+        self.reached.set(true);
         self.changed.notify(usize::MAX);
         self.wait_for(&self.open).await;
     }
 
-    async fn wait_for(&self, flag: &AtomicBool) {
+    async fn wait_for(&self, flag: &Cell<bool>) {
         loop {
             // The listener comes first, so that a change right after the check isn't missed.
             let listener = self.changed.listen();
-            if flag.load(Ordering::SeqCst) {
+            if flag.get() {
                 return;
             }
             listener.await;

@@ -1,4 +1,4 @@
-use std::{future::poll_fn, num::NonZeroU32, sync::Arc, task::Poll};
+use std::{future::poll_fn, num::NonZeroU32, rc::Rc, task::Poll};
 
 use anyhow::Result;
 use futures_util::{
@@ -265,9 +265,9 @@ pub(super) struct Served {
     /// The number of the peer.
     pub(super) id: usize,
     /// The calls to the peer that wait for its reply.
-    pub(super) pending_calls: Arc<PendingCalls>,
+    pub(super) pending_calls: Rc<PendingCalls>,
     /// The peer, as the caller of the calls that wait for replies.
-    pub(super) caller: Arc<Caller>,
+    pub(super) caller: Rc<Caller>,
 }
 
 impl Served {
@@ -284,14 +284,14 @@ impl Served {
     /// The bus itself, of `user`, as the sender of its own messages.
     ///
     /// The bus makes no calls, so no call of the bus waits for a reply.
-    pub(super) fn bus(user: Arc<User>) -> Self {
+    pub(super) fn bus(user: Rc<User>) -> Self {
         let unique_name: OwnedUniqueName =
             UniqueName::from_static_str_unchecked(fdo::BUS_NAME).into();
 
         Self {
             unique_name: unique_name.clone(),
             id: BUS_ID,
-            pending_calls: Arc::new(PendingCalls::new(user.clone())),
+            pending_calls: Rc::new(PendingCalls::new(user.clone())),
             caller: Caller::new(unique_name, user),
         }
     }
