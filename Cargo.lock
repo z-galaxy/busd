@@ -1243,7 +1243,6 @@ dependencies = [
  "zbus_macros",
  "zbus_utils",
  "zcheapstr",
- "zoter",
  "zruntime",
 ]
 

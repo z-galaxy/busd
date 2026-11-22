@@ -49,13 +49,11 @@ harness = false
 bench = false
 
 [dependencies]
-# `p2p` is for the GUID that the bus generates for its end of each client's connection, where the
-# bus is the server.
-zbus = { version = "6.4.0", features = [
-    "default-rt",
-    "p2p",
-    "handover",
-], default-features = false }
+# The bus reads and writes the messages of its clients itself, so it builds on zbus through its
+# `core` and `core-p2p` features alone, without zbus's connections. `core-p2p` is for the GUID that
+# the bus generates for its end of each client's connection, where the bus is the server. It is also
+# for the credentials that the bus looks up from each client's socket.
+zbus = { version = "6.4.0", features = ["core", "core-p2p"], default-features = false }
 clap = { version = "4.5.4", features = [
     "derive",
     "std",
@@ -97,8 +95,7 @@ foldhash = "0.2.0"
 simple-mermaid = "0.2.0"
 
 # Restarts through the file descriptor store of systemd, with the clients connected throughout.
-# zbus builds on it too, and Cargo builds one zoter for both, so the hand-overs of zbus are items
-# of its hand-overs.
+# busd's record of each client's connection is an item of zoter's hand-over.
 [target.'cfg(target_os = "linux")'.dependencies.zoter]
 version = "0.2.0"
 default-features = false
@@ -117,10 +114,13 @@ testing = ["zbus/default-rt", "zruntime/helper"]
 # too, with `--no-default-features`. Cargo leaves it out of the packaged crate, whose tests take
 # `--features testing` instead.
 busd = { path = ".", default-features = false, features = ["testing"] }
-# The tests drive the bus through proxies, and serve their own interfaces on its clients, which
-# the binary itself does not need. The benchmarks send byte arrays with `serde_bytes`, which
-# (de)serializes them whole rather than byte by byte.
+# The tests drive the bus through zbus connections and proxies, peer-to-peer ones among them, and
+# serve their own interfaces on its clients, none of which the binary itself needs. The
+# benchmarks send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte
+# by byte.
 zbus = { version = "6.4.0", features = [
+    "default-rt",
+    "p2p",
     "proxy",
     "serde_bytes",
     "service",

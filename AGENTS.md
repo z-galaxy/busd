@@ -12,9 +12,11 @@ more — follow the guidelines in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## Project Overview
 
 busd is a pure-Rust D-Bus bus (broker) implementation — the sibling daemon to the [zbus]
-library, which it builds on. Being pure Rust, it cross-builds far more easily than the
-reference C broker. Status is alpha: only the essentials of the D-Bus specification are in
-place.
+library, which it builds on through its `core` and `core-p2p` features, without zbus's
+connections. busd reads and writes the messages of its clients itself. Only the tests and
+the benchmarks, and the helpers of `src/testing.rs` that the tests share, use zbus's
+connections. Being pure Rust, it cross-builds far more easily than the reference C broker.
+Status is alpha: only the essentials of the D-Bus specification are in place.
 
 busd runs on a [zruntime] `LocalRuntime`, which the binary drives on its main thread. The
 bus, its tasks and the connections of its clients all run there, and the bus spawns its
