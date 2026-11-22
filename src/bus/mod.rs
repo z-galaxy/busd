@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use zbus::{address::Transport, connection, fdo::ConnectionCredentials, Address, Guid, OwnedGuid};
+use zbus::{address::Transport, fdo::ConnectionCredentials, Address, Guid, OwnedGuid};
 use zruntime::spawn;
 
 #[cfg(target_os = "linux")]
@@ -198,10 +198,8 @@ impl Bus {
 
                     return Ok(());
                 }
-                let builder = connection::Builder::unix_stream(stream);
-
                 peers
-                    .add(&guid, id, builder, credentials, send_timeout, uid)
+                    .add(&guid, id, stream, credentials, send_timeout, uid)
                     .await
             };
             if let Err(e) = res.await {

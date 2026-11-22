@@ -38,19 +38,21 @@ impl Bus {
     /// the bus itself when it hands over. The next instance answers those calls, and each call gets
     /// one answer, in the order of the calls.
     ///
-    /// The connection of each client then goes to the next instance, with the messages that zbus
-    /// read of the client and that the bus didn't take, what it read of a message that the client
-    /// is in the middle of sending, if any, what the bus sent the client and the client didn't
-    /// take, and the file descriptors that came with those, for the next instance to go on from
-    /// there: it writes the client what the client didn't take first. What the clients send
-    /// meanwhile waits for the next instance too, as do the clients that connect, in the socket
-    /// that the bus listens on. A client that goes meanwhile, by the time that the bus is done with
-    /// what it took, has what it sent before it went taken, and the bus cleans up after it, as
-    /// after any client that goes, as its connection may have ended on an error, or been closed by
-    /// the bus, as a send to the client failed, neither of which can be handed over. One that goes
-    /// after that, as it closes its end, is handed over with what it sent, for the next instance to
-    /// pass that on, and clean up after it. The clients still in the middle of their handshakes
-    /// have [`STOP_TIMEOUT`] to finish them, and get disconnected if they don't.
+    /// The connection of each client then goes to the next instance, for the next instance to go on
+    /// from there. It goes with the bytes that the bus read from the client and didn't take, from
+    /// the start of a message, such as the start of a message that the client is in the middle of
+    /// sending. It also goes with what is left to write to the client, and with the file
+    /// descriptors of both. The next instance first writes the client what is left to write.
+    /// What the client sent and the bus didn't read is still in its socket, which goes with its
+    /// connection. What the clients send meanwhile waits for the next instance too, as do the
+    /// clients that connect, in the socket that the bus listens on. A client that goes meanwhile,
+    /// by the time that the bus is done with what it took, has what it sent before it went taken,
+    /// and the bus cleans up after it, as after any client that goes. The bus does the same after a
+    /// client that it disconnected because a send to the client failed, since it hands over no such
+    /// client. One that goes after that, as it closes its end, is handed over with what it sent,
+    /// for the next instance to pass that on, and clean up after it. The clients still in the
+    /// middle of their handshakes have [`STOP_TIMEOUT`] to finish them, and get disconnected if
+    /// they don't.
     ///
     /// The bus lets go of its clients without disconnecting them: their connections end only once
     /// all of their sockets are closed, those of the [`Handover`] included. A client whose
@@ -67,7 +69,7 @@ impl Bus {
         let peers = self.peers.clone();
         peers.pause(STOP_TIMEOUT).await?;
         peers.settle().await;
-        let (snapshot, clients) = peers.snapshot().await?;
+        let (snapshot, clients) = peers.hand_over().await;
         let state = State {
             guid: self.guid.clone(),
             last_id: self.next_id as u64,
@@ -75,7 +77,6 @@ impl Bus {
             monitors: snapshot.monitors,
             names: snapshot.names,
         };
-        peers.retire().await;
         info!(
             "Handing over {} clients and {} names.",
             clients.len(),

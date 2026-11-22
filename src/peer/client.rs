@@ -1,11 +1,16 @@
-#[cfg(target_os = "linux")]
-use zbus::MessageStream;
-use zbus::{names::OwnedUniqueName, Connection};
+use std::sync::Arc;
+
+use zbus::names::OwnedUniqueName;
 use zruntime::{Event, EventListener};
 #[cfg(target_os = "linux")]
 use zruntime::{Shared, Task};
 
-use crate::{match_rules::MatchRules, user::Charge};
+use crate::{connection::Connection, match_rules::MatchRules, user::Charge};
+#[cfg(target_os = "linux")]
+use crate::{
+    connection::{Handover, Reader},
+    warn,
+};
 
 use super::Recipient;
 
@@ -13,7 +18,7 @@ use super::Recipient;
 /// connection and what the bus needs to serve the client and to hand it over.
 #[derive(Debug)]
 pub struct Client {
-    conn: Connection,
+    connection: Arc<Connection>,
     recipient: Recipient,
     id: usize,
     unique_name: OwnedUniqueName,
@@ -23,11 +28,11 @@ pub struct Client {
     _charge: Charge,
     /// Notified when the client leaves, when it becomes a monitor, and when the bus pauses to hand
     /// over, so that the task that serves the client checks why.
-    canceled: Event,
-    /// The client's message stream, after the task that served the client gave it back when the
-    /// bus paused to hand over.
+    canceled: Canceled,
+    /// The reader of the client's messages, after the task that served the client gave it back
+    /// when the bus paused to hand over.
     #[cfg(target_os = "linux")]
-    paused: Option<MessageStream>,
+    paused: Option<Reader>,
     /// The task that writes to the client what the previous instance of the bus left unwritten,
     /// while that task runs. See [`Client::flush`].
     #[cfg(target_os = "linux")]
@@ -35,8 +40,9 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    /// The bus's end of the client's connection, for writing to the client.
+    pub fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     /// The recipient through which the bus sends messages to the client. It stays the same when a
@@ -61,25 +67,23 @@ impl Client {
     }
 
     pub fn listen_cancellation(&self) -> EventListener {
-        self.canceled.listen()
+        self.canceled.0.listen()
     }
 
     /// Pause the client while the bus hands over.
     ///
     /// Pausing makes the task that serves the client finish the messages that it already took, and
-    /// then give the client's message stream back. From then on, neither a send to the client nor
-    /// the hand-over of its connection waits for the client to take what the bus sends it, because
-    /// whatever it doesn't take goes along with the hand-over. Pausing also stops the write of what
-    /// the previous instance of the bus left unwritten, if that write is still under way
-    /// ([`Client::flush`]).
+    /// then give the reader of the client's messages back. From then on, neither a send to the
+    /// client nor the hand-over of its connection waits for the client to take what the bus sends
+    /// it, because whatever it doesn't take goes along with the hand-over. Pausing also stops the
+    /// write of what the previous instance of the bus left unwritten, if that write is still under
+    /// way ([`Client::flush`]).
     #[cfg(target_os = "linux")]
     pub(crate) fn pause(&mut self) {
-        let prepared = self.conn.prepare_hand_over();
-        debug_assert!(prepared, "the connection of a client can't be handed over");
-        // The write waits for the client to take it, for up to the time that the client has to
-        // take a message. Meanwhile it holds the turn to write, and the sends to the client and
-        // the hand-over of its connection wait for that turn. Dropping the write's task releases
-        // the turn and leaves what the write didn't write to those sends and to the hand-over.
+        // Every write that waits for the client stops waiting, including the write of what the
+        // previous instance left unwritten. Each write leaves what it didn't write to the
+        // hand-over.
+        self.connection.pause();
         self.flushing = None;
         self.notify_canceled();
     }
@@ -93,33 +97,74 @@ impl Client {
         self.flushing = self.recipient.flush();
     }
 
-    /// The client's message stream, if the task that served the client gave it back when the bus
-    /// paused to hand over. That task may have served the client as a peer or as the monitor that
-    /// the peer became.
+    /// The reader of the client's messages, if the task that served the client gave it back when
+    /// the bus paused to hand over. That task may have served the client as a peer or as the
+    /// monitor that the peer became.
     #[cfg(target_os = "linux")]
-    pub(crate) fn paused(&mut self) -> &mut Option<MessageStream> {
+    pub(crate) fn paused(&mut self) -> &mut Option<Reader> {
         &mut self.paused
     }
 
-    /// Create the client numbered `id` and named `unique_name`, on `conn`. The bus sends its
-    /// messages through `recipient`. The client has `match_rules`, and `charge` counts the client
-    /// as an object of its user.
+    /// The hand-over of the client's connection, with the unread bytes of the client's reader.
+    ///
+    /// This takes the client. The task that served the client gave the reader back when the bus
+    /// paused. The unread bytes are those that the reader read and the bus didn't take. There is
+    /// no hand-over if the task didn't give the reader back, if the bus is disconnecting the
+    /// client, or if the connection fails to be handed over, which disconnects the client.
+    ///
+    /// Nothing but the client holds its connection once the bus is paused and settled, since
+    /// nothing sends to the client then. A connection that something else still holds can't go to
+    /// the next instance: the bus closes it, which disconnects the client.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn hand_over(self) -> Option<Handover> {
+        let (connection, reader) = {
+            // The client's recipient shares the connection, and so does the task that writes what
+            // the previous instance left unwritten, while that task runs. Both go at the end of
+            // this scope.
+            let Self {
+                connection,
+                recipient: _recipient,
+                flushing: _flushing,
+                paused,
+                ..
+            } = self;
+
+            (connection, paused?)
+        };
+        let connection = match Arc::try_unwrap(connection) {
+            Ok(connection) => connection,
+            Err(connection) => {
+                warn!(
+                    "Disconnecting `{}`, as its connection is still in use as the bus hands it \
+                     over",
+                    connection.unique_name()
+                );
+                connection.close();
+
+                return None;
+            }
+        };
+
+        connection.hand_over(reader)
+    }
+
+    /// Create the client numbered `id` on `connection`. The client goes by the unique name of the
+    /// connection, and the bus sends messages to the client through the connection. The client has
+    /// `match_rules`, and `charge` counts the client as an object of its user.
     pub(super) fn new(
-        conn: Connection,
-        recipient: Recipient,
+        connection: Arc<Connection>,
         id: usize,
-        unique_name: OwnedUniqueName,
         match_rules: MatchRules,
         charge: Charge,
     ) -> Self {
         Self {
-            conn,
-            recipient,
+            recipient: Recipient::client(connection.clone()),
+            unique_name: connection.unique_name().clone(),
+            connection,
             id,
-            unique_name,
             match_rules,
             _charge: charge,
-            canceled: Event::new(),
+            canceled: Canceled::default(),
             #[cfg(target_os = "linux")]
             paused: None,
             #[cfg(target_os = "linux")]
@@ -135,17 +180,23 @@ impl Client {
     /// Notify [`Client::listen_cancellation`]'s listeners when the client leaves, becomes a monitor
     /// or pauses, so that the task that serves the client checks why.
     pub(super) fn notify_canceled(&self) {
-        self.canceled.notify(usize::MAX);
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.notify_canceled();
+        self.canceled.0.notify(usize::MAX);
     }
 }
 
 /// The unique name of the client numbered `id`.
 pub(crate) fn unique_name(id: usize) -> OwnedUniqueName {
     OwnedUniqueName::try_from(format!(":busd.{id}")).unwrap()
+}
+
+/// The cancellation of the task that serves a client.
+///
+/// It is also notified when the client goes.
+#[derive(Debug, Default)]
+struct Canceled(Event);
+
+impl Drop for Canceled {
+    fn drop(&mut self) {
+        self.0.notify(usize::MAX);
+    }
 }

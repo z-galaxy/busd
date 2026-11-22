@@ -12,10 +12,13 @@ use zbus::{
     message,
     names::{InterfaceName, OwnedUniqueName, UniqueName},
     wire::Endian,
-    Message, MessageStream, ObjectPath,
+    Message, ObjectPath,
 };
 
-use crate::peer::{Peer, MAX_MESSAGE_FDS};
+use crate::{
+    connection::Reader,
+    peer::{Peer, MAX_MESSAGE_FDS},
+};
 
 /// Message stream for a peer.
 ///
@@ -27,23 +30,25 @@ use crate::peer::{Peer, MAX_MESSAGE_FDS};
 /// * The destination field is present and readable for non-signals.
 /// * The sender field is present and set to the unique name of the peer.
 pub struct Stream {
-    msg_stream: MessageStream,
+    reader: Reader,
     unique_name: OwnedUniqueName,
 }
 
 impl Stream {
-    pub fn for_peer(peer: &Peer, msg_stream: MessageStream) -> Self {
+    /// The messages of `peer`, which `reader` reads.
+    pub fn for_peer(peer: &Peer, reader: Reader) -> Self {
         Self {
-            msg_stream,
+            reader,
             unique_name: peer.client().unique_name().clone(),
         }
     }
 
-    /// The stream of the messages of the connection of the peer, which this takes them from: the
-    /// one that has had all of them, from the first, as the monitor that the peer becomes, and a
-    /// hand-over of the connection, take it.
-    pub fn into_inner(self) -> MessageStream {
-        self.msg_stream
+    /// The reader from which this stream takes the peer's messages.
+    ///
+    /// The reader goes on with the message after the last one that this stream yielded. The monitor
+    /// that the peer becomes takes it, and so does a hand-over of the connection.
+    pub fn into_inner(self) -> Reader {
+        self.reader
     }
 }
 
@@ -52,7 +57,7 @@ impl FutureStream for Stream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let msg = ready!(this.msg_stream.poll_next_unpin(cx));
+        let msg = ready!(this.reader.poll_next_unpin(cx));
 
         Poll::Ready(msg.map(|msg| match msg {
             Ok(msg) => checked(msg, &this.unique_name),

@@ -3,7 +3,6 @@ use std::{
     io::{self, Read, Write},
     mem,
     net::Shutdown,
-    num::NonZeroUsize,
     os::unix::net::UnixStream,
     task::Poll,
 };
@@ -14,7 +13,10 @@ use rand::{
     distr::{Alphanumeric, SampleString},
     rng,
 };
-use zbus::{connection, fdo::ConnectionCredentials, message, MatchRule, Message, OwnedGuid};
+use zbus::{
+    connection, fdo::ConnectionCredentials, message, Connection, MatchRule, Message, MessageStream,
+    OwnedGuid,
+};
 use zoter::{Restore, Save};
 use zruntime::unblock;
 
@@ -32,10 +34,10 @@ use crate::{
     user::Charge,
 };
 
-/// A client that sends a last signal and closes its end of the connection, once the bus took
-/// the last of its messages that it forwards itself, but before it hands the connection over,
-/// as zbus read the signal and the end of what the client sent by then, is handed over with
-/// the signal: the next instance passes the signal on, and then cleans up after the client.
+/// A client that sends a last signal and shuts its writes down, once the bus settled, but before it
+/// hands the connection over, is handed over with the signal and the end of what it sent, which are
+/// still in its socket: the next instance passes the signal on, and then cleans up after the
+/// client.
 #[test]
 #[timeout(30000)]
 fn last_signal_of_a_client_that_closes_its_end_is_handed_over() {
@@ -60,14 +62,6 @@ fn last_signal_of_a_client_that_closes_its_end_is_handed_over() {
             .unwrap();
         sender.send(&bye).await.unwrap();
         socket.shutdown(Shutdown::Write).unwrap();
-        let conn = peers
-            .routing()
-            .await
-            .peers
-            .get(sender_name.as_str())
-            .map(|peer| peer.client().conn().clone())
-            .unwrap();
-        conn.closed().await;
         let handed_over = HandedOver::new(bus).await;
         assert!(
             handed_over.clients.iter().any(|client| client.id == 2),
@@ -100,8 +94,8 @@ fn last_signal_of_a_client_that_closes_its_end_is_handed_over() {
 
 /// A client that sends a last signal and goes while the bus settles, and that a send of the
 /// bus fails to then, as it went, has its signal passed on all the same, though the bus is
-/// disconnecting it, and is cleaned up after: zbus hands over no connection that the bus
-/// closed, so the bus serves the client to the end of its stream, as any client that went.
+/// disconnecting it, and is cleaned up after: the bus hands over no client that it disconnects,
+/// so it serves the client to the end of its input, as any client that went.
 #[test]
 #[timeout(30000)]
 fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
@@ -130,15 +124,7 @@ fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
         x.send(&bye).await.unwrap();
         y.send(&bye).await.unwrap();
         y_socket.shutdown(Shutdown::Both).unwrap();
-        let y_conn = peers
-            .routing()
-            .await
-            .peers
-            .get(y_name.as_str())
-            .map(|peer| peer.client().conn().clone())
-            .unwrap();
-        y_conn.closed().await;
-        // `x` goes once the bus took the stream of `y` back, to serve it on, and before the
+        // `x` goes once the bus took the reader of `y` back, to serve it on, and before the
         // chore that serves it forwards the signal of `y` to `x`: the runtime runs one task at
         // a time, and `join` polls this each time that it is polled, so this runs as soon as
         // the bus waits for that chore, before the chore runs.
@@ -340,10 +326,12 @@ async fn one_reply_each_across_a_hand_over(carry: Carry) {
     paused.unwrap();
     peers.settle().await;
     let handed_over = HandedOver::new(bus).await;
+    // The calls that the bus didn't take are in the unread bytes of the caller's connection, or
+    // still in the caller's socket, which goes to the next instance with the connection.
     let connection = &handed_over.clients[0].connection;
-    assert_ne!(
-        connection.unread_len(),
-        0,
+    let unread = rustix::io::ioctl_fionread(connection.socket()).unwrap();
+    assert!(
+        connection.unread_len() > 0 || unread > 0,
         "the bus took every call, rather than leave some to the next instance"
     );
 
@@ -419,7 +407,7 @@ fn reload_under_way_holds_a_hand_over_up() {
     });
 }
 
-/// The bus is done pausing as soon as the tasks that serve its clients gave the streams of
+/// The bus is done pausing as soon as the tasks that serve its clients gave the readers of
 /// their messages back, rather than at a later look: a pause takes no longer than its clients
 /// take to pause.
 #[test]
@@ -432,7 +420,7 @@ fn pause_ends_once_the_clients_paused() {
         let _second = connect(&bus, 2).await;
 
         let mut pausing = pin!(peers.pause(STOP_TIMEOUT));
-        // The tasks that serve the clients only give their streams back once they run, after
+        // The tasks that serve the clients only give their readers back once they run, after
         // this yields.
         assert!(
             pausing.as_mut().now_or_never().is_none(),
@@ -454,7 +442,7 @@ fn pause_ends_once_the_clients_paused() {
 }
 
 /// A client that goes while the bus pauses, as the task that serves it removes it rather than
-/// give the stream of its messages back, holds the pause up no longer: the bus is done pausing
+/// give the reader of its messages back, holds the pause up no longer: the bus is done pausing
 /// as soon as the client is gone.
 #[test]
 #[timeout(30000)]
@@ -485,8 +473,7 @@ fn a_handshake_under_way_once_the_bus_paused_is_cut_off() {
         let uid = rustix::process::getuid().as_raw();
         let user = peers.users().user(uid);
         let credentials = ConnectionCredentials::from_socket(&theirs).unwrap();
-        let server = connection::Builder::unix_stream(theirs);
-        let adding = peers.add(bus.guid(), 1, server, credentials, SEND_TIMEOUT, uid);
+        let adding = peers.add(bus.guid(), 1, theirs, credentials, SEND_TIMEOUT, uid);
         let cutting_off = async {
             // The client authenticates, but never begins.
             let mut ours = unblock(move || {
@@ -541,70 +528,85 @@ fn a_handshake_under_way_once_the_bus_paused_is_cut_off() {
     });
 }
 
-/// A client that the bus starts disconnecting while the hand-over of its connection waits for
-/// its turn to write, as when a send to the client that holds the turn fails, isn't handed
-/// over, even where the hand-over gets the connection before the closing of the connection
-/// does, as with a lock that goes to the first to wait for it.
+/// A client that the bus disconnects once it has paused, because a send to the client fails, isn't
+/// handed over. The bus leaves it out, for the next instance to clean up after it as after a client
+/// that went.
 #[test]
 #[timeout(30000)]
-fn client_that_the_bus_disconnects_as_its_hand_over_waits_is_left_out() {
-    const CHUNK: usize = 64 * 1024;
-    const CHUNKS: usize = 16;
-
+fn client_that_the_bus_disconnects_once_it_paused_is_left_out() {
     zruntime::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
-        let (mut receiver, _socket) = connect(&bus, 1).await;
+        let (receiver, socket) = connect(&bus, 1).await;
         let name = receiver.unique_name().unwrap().to_string();
-        // The receiver takes no more of what the bus sends it once a message waits in its
-        // queue.
-        let _messages = MessageStream::from(&receiver);
-        receiver.set_max_queued(NonZeroUsize::MIN);
         peers.pause(STOP_TIMEOUT).await.unwrap();
         peers.settle().await;
-        let (conn, recipient) = peers
-            .routing()
-            .await
-            .peers
-            .get(name.as_str())
-            .map(|peer| {
-                (
-                    peer.client().conn().clone(),
-                    peer.client().recipient().clone(),
-                )
-            })
-            .unwrap();
-        // The connection keeps what the socket of the receiver doesn't take, and a flush holds
-        // the connection as it waits for the receiver to take that.
-        let chunk = "x".repeat(CHUNK);
-        let chunks: Vec<_> = (0..CHUNKS)
-            .map(|_| {
-                Message::signal("/org/zbus/Test", "org.zbus.Test", "Chunk")
-                    .build(&chunk)
-                    .unwrap()
-            })
-            .collect();
-        recipient.send(&chunks).await;
-        let mut flushing = Box::pin(conn.flush());
-        assert!(
-            flushing.as_mut().now_or_never().is_none(),
-            "the flush didn't wait for the receiver"
-        );
-        let mut handing_over = Box::pin(peers.snapshot());
-        assert!(
-            handing_over.as_mut().now_or_never().is_none(),
-            "the hand-over didn't wait for the flush"
-        );
+        {
+            // The test lets go of the recipient once the send is done, as a send of the bus does.
+            let recipient = peers
+                .routing()
+                .await
+                .peers
+                .get(name.as_str())
+                .map(|peer| peer.client().recipient().clone())
+                .unwrap();
 
-        // The bus flags the client before the flush lets go of the connection, as it flags one
-        // that a send fails to, and nothing closes the connection before the hand-over gets it.
-        recipient.hand_over();
-        drop(flushing);
-        let (_, clients) = handing_over.await.unwrap();
+            // The receiver shut its end down, so the send to it fails.
+            socket.shutdown(Shutdown::Both).unwrap();
+            let signal = Message::signal("/org/zbus/Test", "org.zbus.Test", "Gone")
+                .build(&())
+                .unwrap();
+            recipient.send(&[signal]).await;
+        }
+        let (snapshot, clients) = peers.hand_over().await;
         assert!(
             clients.iter().all(|client| client.id != 1),
             "the client was handed over, though the bus was disconnecting it"
         );
+        assert!(snapshot.peers.iter().any(|peer| peer.id == 1));
+    });
+}
+
+/// The bus disconnects a client whose connection is still held elsewhere when the bus hands over.
+///
+/// The hand-over takes the connection, so such a connection can't go to the next instance. The bus
+/// closes the connection instead, which disconnects the client. Whoever holds the connection then
+/// sends nothing more to the client. The bus leaves the client out, and the next instance cleans up
+/// after it as after a client that went. Nothing in the bus but the client holds its connection
+/// once the bus is paused and settled, since the bus sends nothing then and has let go of what it
+/// sent.
+#[test]
+#[timeout(30000)]
+fn client_whose_connection_is_still_held_is_disconnected() {
+    zruntime::block_on(async {
+        let bus = Bus::for_address(Some(&address())).await.unwrap();
+        let peers = bus.peers().clone();
+        let (receiver, mut socket) = connect(&bus, 1).await;
+        let name = receiver.unique_name().unwrap().to_string();
+        peers.pause(STOP_TIMEOUT).await.unwrap();
+        peers.settle().await;
+        // The clone holds the client's connection, as a send to the client does while it lasts.
+        let _recipient = peers
+            .routing()
+            .await
+            .peers
+            .get(name.as_str())
+            .map(|peer| peer.client().recipient().clone())
+            .unwrap();
+
+        let (snapshot, clients) = peers.hand_over().await;
+        assert!(
+            clients.iter().all(|client| client.id != 1),
+            "the client was handed over, though something still held its connection"
+        );
+        assert!(snapshot.peers.iter().any(|peer| peer.id == 1));
+        // The bus shut its end of the socket down as it closed the connection, so the client reads
+        // what its socket still holds, and then EOF, without waiting. A read that would wait finds
+        // the connection still open.
+        socket.set_nonblocking(true).unwrap();
+        if let Err(e) = socket.read_to_end(&mut Vec::new()) {
+            panic!("the connection outlived the hand-over: {e}");
+        }
     });
 }
 
@@ -674,9 +676,8 @@ impl HandedOver {
     /// of `bus` itself, as its process does as it exits.
     async fn new(bus: Bus) -> Self {
         let peers = bus.peers().clone();
-        let (snapshot, clients) = peers.snapshot().await.unwrap();
+        let (snapshot, clients) = peers.hand_over().await;
         let guid = bus.guid().clone();
-        peers.retire().await;
 
         Self {
             guid,
@@ -818,10 +819,9 @@ async fn connect(bus: &Bus, id: usize) -> (Connection, UnixStream) {
     let socket = ours.try_clone().unwrap();
     let uid = rustix::process::getuid().as_raw();
     let credentials = ConnectionCredentials::from_socket(&theirs).unwrap();
-    let server = connection::Builder::unix_stream(theirs);
     let adding = bus
         .peers()
-        .add(bus.guid(), id, server, credentials, SEND_TIMEOUT, uid);
+        .add(bus.guid(), id, theirs, credentials, SEND_TIMEOUT, uid);
     let connecting = connection::Builder::unix_stream(ours).build();
     let (added, conn) = join(adding, connecting).await;
     added.unwrap();

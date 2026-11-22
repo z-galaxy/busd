@@ -5,14 +5,12 @@ use futures_util::{
     future::{select, Either},
     stream::StreamExt,
 };
-use zbus::{
-    names::{OwnedUniqueName, UniqueName},
-    MessageStream,
-};
+use zbus::names::{OwnedUniqueName, UniqueName};
 use zruntime::EventListener;
 
 use super::{forward::no_reply, outbox::Outbox, Peers};
 use crate::{
+    connection::Reader,
     debug, fdo,
     name_registry::NameOwnerChanged,
     peer::{Caller, Invalid, Peer, PendingCalls, Stream, BUS_ID},
@@ -129,33 +127,33 @@ impl Peers {
         self.clean_up(&served.unique_name, served.id, waiting).await
     }
 
-    /// Go on with the peer `unique_name`, numbered `id`, whose messages come out of `stream`, now
-    /// that the task that served it was canceled: serve the monitor that it became, unless the bus
-    /// pauses to hand over, which takes the stream back.
-    async fn serve_on(self, stream: MessageStream, unique_name: OwnedUniqueName, id: usize) {
-        let Some((stream, listener)) = self.monitor_to_serve(stream, &unique_name, id).await else {
+    /// Go on with the peer `unique_name`, numbered `id`, whose messages `reader` reads, now that
+    /// the task that served it was canceled: serve the monitor that it became, unless the bus
+    /// pauses to hand over, which takes the reader back.
+    async fn serve_on(self, reader: Reader, unique_name: OwnedUniqueName, id: usize) {
+        let Some((reader, listener)) = self.monitor_to_serve(reader, &unique_name, id).await else {
             return;
         };
 
-        self.serve_monitor(stream, listener, unique_name).await;
+        self.serve_monitor(reader, listener, unique_name).await;
     }
 
-    /// What the task that served the peer `unique_name`, numbered `id`, whose messages come out of
-    /// `stream`, serves the monitor that the peer became with: `stream`, and the listener of the
+    /// What the task that served the peer `unique_name`, numbered `id`, whose messages `reader`
+    /// reads, serves the monitor that the peer became with: `reader`, and the listener of the
     /// cancellation of the task, taken under the lock that a pause takes, so that the task hears of
     /// any pause that it missed. Nothing if the peer is gone, or if the bus pauses to hand over,
-    /// which takes `stream` back, as it does if the peer is still one.
+    /// which takes `reader` back, as it does if the peer is still one.
     async fn monitor_to_serve(
         &self,
-        stream: MessageStream,
+        reader: Reader,
         unique_name: &OwnedUniqueName,
         id: usize,
-    ) -> Option<(MessageStream, EventListener)> {
+    ) -> Option<(Reader, EventListener)> {
         let mut guard = self.routing_mut().await;
         let routing = &mut *guard;
         #[cfg(target_os = "linux")]
         if let Some(peer) = routing.peers.get_mut(unique_name) {
-            *peer.client_mut().paused() = Some(stream);
+            *peer.client_mut().paused() = Some(reader);
             self.inner.paused_changed.notify(usize::MAX);
 
             return None;
@@ -168,35 +166,35 @@ impl Peers {
         }
         #[cfg(target_os = "linux")]
         if routing.handing_over {
-            *monitor.client_mut().paused() = Some(stream);
+            *monitor.client_mut().paused() = Some(reader);
             self.inner.paused_changed.notify(usize::MAX);
 
             return None;
         }
 
-        Some((stream, monitor.client().listen_cancellation()))
+        Some((reader, monitor.client().listen_cancellation()))
     }
 
-    /// Serve the monitor `unique_name`, whose messages come out of `stream`, until it goes, or
-    /// until the bus pauses to hand over, which `cancellation_listener` tells.
+    /// Serve the monitor `unique_name`, whose messages `reader` reads, until it goes, or until the
+    /// bus pauses to hand over, which `cancellation_listener` tells.
     ///
     /// A monitor is to send nothing, so it gets disconnected as soon as it sends anything.
     pub(super) async fn serve_monitor(
         self,
-        mut stream: MessageStream,
+        mut reader: Reader,
         cancellation_listener: EventListener,
         unique_name: OwnedUniqueName,
     ) {
-        let msg = match select(cancellation_listener, stream.next()).await {
+        let msg = match select(cancellation_listener, reader.next()).await {
             Either::Left(_) => None,
             Either::Right((msg, _)) => Some(msg),
         };
         let Some(msg) = msg else {
-            // The bus pauses to hand over, which takes the stream back, unless it let go of the
+            // The bus pauses to hand over, which takes the reader back, unless it let go of the
             // monitor.
             #[cfg(target_os = "linux")]
             if let Some(monitor) = self.routing_mut().await.monitors.get_mut(&unique_name) {
-                *monitor.client_mut().paused() = Some(stream);
+                *monitor.client_mut().paused() = Some(reader);
                 self.inner.paused_changed.notify(usize::MAX);
             }
 
@@ -208,7 +206,7 @@ impl Peers {
                 unique_name
             );
         }
-        // Removing the monitor, and the end of its stream, close its connection.
+        // Removing the monitor, and letting go of its reader, close its connection.
         self.routing_mut().await.monitors.remove(&unique_name);
         // A pause waits for the monitor no more.
         #[cfg(target_os = "linux")]

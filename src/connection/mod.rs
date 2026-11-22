@@ -299,11 +299,6 @@ impl Connection {
         &self.unique_name
     }
 
-    /// How long the bus gives the client to take each send.
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
     /// The connection of the client at the other end of `socket`, as [`Connection::new`] makes it,
     /// with `outgoing` to write.
     fn with_outgoing(

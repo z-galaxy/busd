@@ -131,9 +131,9 @@ restarts without its clients noticing anything but a pause. On `SIGTERM`, rather
 them, it stops taking their messages, finishes what it took, forwarding those messages and answering
 the calls to it among them, without waiting for the clients to take what it sends them, and hands
 their connections and its state over to systemd: their unique names, the well-known names that they
-own or queue for, their match rules, the calls that wait for their replies, what zbus read of their
-messages but busd hasn't taken yet, as the start of one that a client is in the middle of sending,
-and what busd sent them that they haven't taken yet, with the file descriptors that came with those.
+own or queue for, their match rules, the calls that wait for their replies, what busd read of their
+messages but hasn't taken yet, as the start of one that a client is in the middle of sending, and
+what busd sent them that they haven't taken yet, with the file descriptors that came with those.
 On a restart, systemd hands all of that over to the next instance of busd, which serves the clients
 on from there, on the same connections, and writes them what they hadn't taken first. On a stop,
 systemd closes them. A session bus, for example:

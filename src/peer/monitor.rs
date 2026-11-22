@@ -44,6 +44,12 @@ impl Monitor {
         &mut self.client
     }
 
+    /// The monitor's client, which the monitor gives up.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn into_client(self) -> Client {
+        self.client
+    }
+
     /// Turn `client`, a peer until then, into a monitor.
     pub(super) fn new(client: Client) -> Self {
         Self { client }

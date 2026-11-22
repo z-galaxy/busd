@@ -20,7 +20,7 @@
 //! - The **outgoing FDs** of a client are those of the messages that the bus is sending it and
 //!   didn't write to it yet.
 //! - The **connection FDs** of a client are its client socket, its client-sent FDs and its outgoing
-//!   FDs, in that order, as zbus gives them with the record of its connection
+//!   FDs, in that order, as the bus gives them with the record of its connection
 //!   ([`zoter::Save::fds`]).
 //! - The **process FD** of a client is the pidfd of its process, which the next instance opens to
 //!   look the credentials of the client up.
@@ -92,12 +92,11 @@
 use std::{os::fd::OwnedFd, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use zbus::connection;
 use zoter::{Passed, Restored, Save, Store};
 use zruntime::SharedRuntime;
 
 use super::{handover::State, Bus, ClientHandover, Handover};
-use crate::{debug, error, info, peer::SEND_TIMEOUT, policy::Policy, warn};
+use crate::{connection, debug, error, info, peer::SEND_TIMEOUT, policy::Policy, warn};
 
 impl Bus {
     /// Create a bus that systemd runs, out of the FDs that systemd passed, `passed`, and the store
@@ -307,9 +306,6 @@ pub const STORE_KEY: &str = "busd";
 /// How long the bus may take to hand over, before busd gives up on it, and its clients get
 /// disconnected as it goes.
 ///
-/// The bus doesn't wait for its clients to take what it sends them as it hands over, but it gives
-/// the hand-over of the connection of a client, which nothing should hold up, as long as the client
-/// has to take a message, `SEND_TIMEOUT`, 10 s, before it gives up on it, as it gives a client to
-/// take what the instance before it left unwritten. This is longer, with room for the rest of the
-/// hand-over, and well within the 90 s that systemd gives a service to stop by default.
+/// The bus doesn't wait for its clients to take what it sends them as it hands over. This is well
+/// within the 90 s that systemd gives a service to stop by default.
 const HAND_OVER_TIMEOUT: Duration = Duration::from_secs(30);

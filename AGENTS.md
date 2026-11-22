@@ -59,8 +59,8 @@ argument parsing via clap). Key modules:
 - **`bus/systemd.rs`, `bus/handover.rs`** — running under systemd: socket activation, and
   restarts through systemd's file descriptor store, which hand the clients over to the next
   instance. The protocols of systemd, telling it that the bus has started among them, and the
-  layout of a hand-over in the store, are [zoter]'s; zbus's hand-over of each connection is an
-  item of zoter's hand-over.
+  layout of a hand-over in the store, are [zoter]'s; busd's record of each connection is an item
+  of zoter's hand-over.
   The bus answers the calls to it that it took before it hands over, so nothing is on its way to
   or from the bus itself at that point. The calls that it didn't take go to the next instance with
   the connections of their clients, like everything else that the bus didn't take of them.
@@ -68,6 +68,9 @@ argument parsing via clap). Key modules:
   (`bus/systemd/restart.mmd`, in mermaid), and name the many kinds of FDs that it takes. The
   tests restart busd through zoter's fake service manager, and the benchmark through a fake
   systemd of its own (`benches/bus/handover.rs`).
+- **`connection/`** — the bus's end of each client's connection: its reads (`read.rs`), its
+  writes (`write.rs`, and `Connection` in `mod.rs`), its handshake (`handshake.rs`), its
+  credentials, and, on Linux, its records for a hand-over (`handover.rs`).
 - **`peer/`** — the state of one connection. A connection starts as a peer and can become a
   monitor (an eavesdropper); `client.rs` holds the state that both share.
 - **`peers/`** — the set of connected peers, as a handle that the bus and the task that answers

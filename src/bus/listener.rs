@@ -124,8 +124,9 @@ impl Listener {
                         info!("Accepting new connections again.");
                     }
 
-                    // zbus is given the standard library stream that the zruntime one wraps, and
-                    // the connection then drives it on the runtime it is built on.
+                    // The client's connection is given the standard library stream that the
+                    // zruntime one wraps, and drives that stream on the runtime that serves the
+                    // client.
                     return Ok(stream.into_std());
                 }
                 Err(e) => e,

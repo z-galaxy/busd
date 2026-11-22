@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    iter,
+    iter, mem,
     num::NonZeroU32,
     pin::pin,
     sync::Arc,
@@ -11,28 +11,28 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use futures_util::future::{join_all, select, Either};
+use futures_util::future::{select, Either};
 use serde::{Deserialize, Serialize};
 use zbus::{
-    connection::Handover,
     names::{OwnedUniqueName, OwnedWellKnownName},
-    Connection, MessageStream, Type,
+    Type,
 };
 use zruntime::{spawn, SharedRuntime};
 
 use super::{Peers, Routing, Served};
 use crate::{
+    connection::{Handover, Reader},
     debug,
     match_rules::MatchRules,
     name_registry::{NameOwner, NameRegistry},
-    peer::{unique_name, Caller, Client, HandedOver, Monitor, Peer, Recipient, Stream},
+    peer::{unique_name, Caller, Client, HandedOver, Monitor, Peer, Stream},
     warn,
 };
 
 impl Peers {
     /// Pause the bus, for it to hand over: have the task that serves each client, peer or
     /// monitor, take no more of its messages, once it is done with those that it took, and give
-    /// the stream of the messages back, and wait for that. The clients that connect from now on
+    /// the reader of the messages back, and wait for that. The clients that connect from now on
     /// pause as soon as they are connected, and those in the middle of their handshakes have
     /// `timeout` to be done with them.
     ///
@@ -44,11 +44,10 @@ impl Peers {
     /// From now on, no send to a client waits for the client to take what the bus sends it. What a
     /// client doesn't take goes along with the hand-over of its connection, and the next instance
     /// writes it to the client first. The bus also stops writing to a client what the previous
-    /// instance left unwritten, if that write is still under way ([`Client::flush`]). Otherwise,
-    /// the sends to the client and the hand-over of its connection would wait for that write. So a
-    /// client that doesn't read holds up no hand-over. Once the bus is paused, it takes no more
-    /// clients: if a client's handshake is still under way by then, the bus disconnects it at
-    /// once, as [`Peers::add`] says.
+    /// instance left unwritten, if that write is still under way ([`Client::flush`]), just as it
+    /// stops the sends. So a client that doesn't read holds up no hand-over. Once the bus is
+    /// paused, it takes no more clients: if a client's handshake is still under way by then, the
+    /// bus disconnects it at once, as [`Peers::add`] says.
     pub(crate) async fn pause(&self, timeout: Duration) -> Result<()> {
         let runtime = SharedRuntime::current()?;
         let deadline = Instant::now() + timeout;
@@ -117,9 +116,9 @@ impl Peers {
     /// client that went, or calls to the bus that it has yet to answer.
     ///
     /// A hand-over waits for this once the bus is paused, so the bus only has its own work to
-    /// finish, as nothing new comes in for it to do, but for what the clients whose connections
-    /// ended meanwhile sent before that, which it takes, as [`Peers::serve_gone`] says: those that
-    /// went, and those that the bus disconnected, as they didn't take what it sent them in time, or
+    /// finish, as nothing new comes in for it to do, but for what the clients that went meanwhile
+    /// sent before that, which it takes, as [`Peers::serve_gone`] says: those that closed their
+    /// ends, and those that the bus disconnected, as they didn't take what it sent them in time, or
     /// as a send to them failed, as one to a client that went does.
     ///
     /// Each call to the bus is a chore from the moment its caller's task queues it until the bus
@@ -138,102 +137,83 @@ impl Peers {
         }
     }
 
-    /// The peers, monitors and names, as the bus hands them over, and what it hands over of the
-    /// connection of each client.
+    /// Take the peers, monitors and names out of the bus as it hands them over, with the hand-over
+    /// of each client's connection, and take no more calls.
     ///
-    /// The connections of the clients are handed over all at once, each through the stream of its
-    /// messages, with what the bus sent the client and the client didn't take, which nothing waits
-    /// for the client to take. One whose hand-over takes longer than the time that its client has
-    /// to take a message all the same is given up on, rather than hold the others up. That of a
-    /// client that went since the bus settled, as it closed its end, is handed over too, with what
-    /// zbus read of it, for the next instance to pass that on and clean up after the client. A
-    /// client whose connection fails to be handed over, as when the bus is disconnecting it, when
-    /// the connection ended on an error, when its hand-over is given up on, or when its socket
-    /// fails to be duplicated, as the process has too many file descriptors open, gets
-    /// disconnected: the bus leaves it out, so that the next instance cleans up after it as after a
-    /// client that went.
-    pub(crate) async fn snapshot(&self) -> Result<(Snapshot, Vec<ClientHandover>)> {
-        let runtime = SharedRuntime::current()?;
-        let mut clients = Vec::new();
-        let names = {
-            let mut routing = self.routing_mut().await;
-            let routing = &mut *routing;
-            for peer in routing.peers.values_mut() {
-                let state = PeerState {
-                    id: peer.client().id() as u64,
-                    greeted: peer.greeted(),
-                    match_rules: peer.client().match_rules().clone(),
-                    pending_calls: peer
-                        .pending_calls()
-                        .records()
-                        .map(|(caller_id, caller, serial)| (caller_id as u64, caller, serial.get()))
-                        .collect(),
-                };
-                clients.push(Outgoing::new(peer.client_mut(), ClientState::Peer(state)));
-            }
-            for monitor in routing.monitors.values_mut() {
-                let client = monitor.client_mut();
-                let state = MonitorState {
-                    id: client.id() as u64,
-                    match_rules: client.match_rules().clone(),
-                };
-                clients.push(Outgoing::new(client, ClientState::Monitor(state)));
-            }
-
-            routing
-                .name_registry
-                .all_names()
-                .iter()
-                .map(|(name, entry)| NameState {
-                    name: name.clone(),
-                    owners: iter::once(entry.owner())
-                        .chain(entry.waiting_list())
-                        .map(|owner| {
-                            let name = owner.unique_name().clone();
-
-                            (name, owner.allow_replacement(), owner.do_not_queue())
-                        })
-                        .collect(),
-                })
-                .collect()
-        };
-        let handing_over = clients.iter_mut().map(|client| client.hand_over(&runtime));
-        let handovers = join_all(handing_over).await;
-
-        let mut snapshot = Snapshot {
-            peers: Vec::new(),
-            monitors: Vec::new(),
-            names,
-        };
+    /// The connections of the clients are handed over all at once, each with the bytes that the bus
+    /// read from the client and didn't take, and what the bus sent the client and the client didn't
+    /// take, which nothing waits for the client to take. What a client sent and the bus didn't read
+    /// is still in its socket, which goes with its connection. That of a client that went since the
+    /// bus settled, as it closed its end, is handed over too, with what it sent, for the next
+    /// instance to pass that on and clean up after the client. A client whose connection fails to
+    /// be handed over, as when the bus is disconnecting it, or when its socket fails to be
+    /// duplicated, as the process has too many file descriptors open, gets disconnected: the bus
+    /// leaves it out, so that the next instance cleans up after it as after a client that went.
+    ///
+    /// The bus lets go of the other clients without disconnecting them: nothing more goes to them
+    /// from this instance of the bus.
+    pub(crate) async fn hand_over(&self) -> (Snapshot, Vec<ClientHandover>) {
+        let mut routing = self.routing_mut().await;
+        let routing = &mut *routing;
         let mut handed_over = Vec::new();
-        for (client, connection) in clients.into_iter().zip(handovers) {
-            if let Some(connection) = connection {
-                handed_over.push(ClientHandover {
-                    id: client.id,
-                    connection,
-                });
-            }
-            match client.state {
-                ClientState::Peer(state) => snapshot.peers.push(state),
-                ClientState::Monitor(state) => snapshot.monitors.push(state),
-            }
+        let mut peers = Vec::new();
+        for (_, peer) in routing.peers.drain() {
+            peers.push(PeerState {
+                id: peer.client().id() as u64,
+                greeted: peer.greeted(),
+                match_rules: peer.client().match_rules().clone(),
+                pending_calls: peer
+                    .pending_calls()
+                    .records()
+                    .map(|(caller_id, caller, serial)| (caller_id as u64, caller, serial.get()))
+                    .collect(),
+            });
+            handed_over.push(peer.into_client());
         }
+        let mut monitors = Vec::new();
+        for monitor in mem::take(&mut routing.monitors).into_values() {
+            let client = monitor.into_client();
+            monitors.push(MonitorState {
+                id: client.id() as u64,
+                match_rules: client.match_rules().clone(),
+            });
+            handed_over.push(client);
+        }
+        let names = routing
+            .name_registry
+            .all_names()
+            .iter()
+            .map(|(name, entry)| NameState {
+                name: name.clone(),
+                owners: iter::once(entry.owner())
+                    .chain(entry.waiting_list())
+                    .map(|owner| {
+                        let name = owner.unique_name().clone();
 
-        Ok((snapshot, handed_over))
-    }
-
-    /// Let go of the clients without disconnecting them, as the bus handed them over: nothing more
-    /// goes to them from this instance of the bus.
-    pub(crate) async fn retire(&self) {
+                        (name, owner.allow_replacement(), owner.do_not_queue())
+                    })
+                    .collect(),
+            })
+            .collect();
+        routing.name_registry = NameRegistry::default();
         // The bus takes no more calls.
         self.inner.itself.recipient.hand_over();
-        let mut routing = self.routing_mut().await;
-        for client in routing.clients_mut() {
-            client.recipient().hand_over();
-        }
-        routing.peers.clear();
-        routing.monitors.clear();
-        routing.name_registry = NameRegistry::default();
+        let clients = handed_over
+            .into_iter()
+            .filter_map(|client| {
+                let id = client.id();
+                let connection = client.hand_over()?;
+
+                Some(ClientHandover { id, connection })
+            })
+            .collect();
+        let snapshot = Snapshot {
+            peers,
+            monitors,
+            names,
+        };
+
+        (snapshot, clients)
     }
 
     /// Serve the peers and monitors of `snapshot` on the connections of `clients`, and give the
@@ -259,8 +239,8 @@ impl Peers {
             monitors,
             names,
         } = snapshot;
-        // The connections start reading as they are created, but the bus only forwards what comes
-        // in once all of its peers, monitors and names are back.
+        // The bus reads nothing of the clients, and so forwards nothing, until all of its peers,
+        // monitors and names are back.
         let mut restored = Vec::new();
         let mut gone = Vec::new();
         for state in peers {
@@ -347,14 +327,14 @@ impl Peers {
                             .add_handed_over(caller_id, caller, serial);
                     }
                 }
-                // zbus writes what is left ahead of anything else that the bus sends the client
-                // meanwhile.
+                // The connection writes what is left ahead of anything else that the bus sends the
+                // client meanwhile.
                 peer.client_mut().flush();
                 self.insert(&mut routing, peer, stream);
             }
-            for (mut monitor, stream) in restored_monitors {
+            for (mut monitor, reader) in restored_monitors {
                 monitor.client_mut().flush();
-                self.insert_monitor(&mut routing, monitor, stream);
+                self.insert_monitor(&mut routing, monitor, reader);
             }
         }
         // The bus serves its clients from here on, so it goes on whatever comes.
@@ -378,36 +358,37 @@ impl Peers {
         Ok(())
     }
 
-    /// Add `monitor`, whose messages come out of `stream`, to the monitors of `routing`, and serve
-    /// it until it goes.
-    fn insert_monitor(&self, routing: &mut Routing, monitor: Monitor, stream: MessageStream) {
+    /// Add `monitor`, whose messages `reader` reads, to the monitors of `routing`, and serve it
+    /// until it goes.
+    fn insert_monitor(&self, routing: &mut Routing, monitor: Monitor, reader: Reader) {
         let unique_name = monitor.client().unique_name().clone();
         let listener = monitor.client().listen_cancellation();
         routing.monitors.insert(unique_name.clone(), monitor);
-        spawn(self.clone().serve_monitor(stream, listener, unique_name)).detach();
+        spawn(self.clone().serve_monitor(reader, listener, unique_name)).detach();
     }
 
-    /// Serve on the clients, peers and monitors, whose connections ended while the bus paused,
-    /// once the tasks that served them gave the streams of their messages back, each as a chore of
-    /// its own, until its stream ends: the bus takes what zbus read of them, and cleans up after
-    /// them, as after any client that goes. Those are the clients that went, and those that the bus
-    /// disconnected meanwhile, once their connections are closed.
+    /// Serve on the clients, peers and monitors, that went while the bus paused, once the tasks
+    /// that served them have given the readers of their messages back.
     ///
-    /// zbus hands the connection of a client that closed its end over, with what it read of the
-    /// client, but not one that ended on an error, nor one that the bus closed, as it does once a
-    /// send to the client fails, and what zbus read of such a client would be lost otherwise. The
-    /// bus closes the connection of a client that went too, if it sends the client anything before
-    /// this finds it gone, as the send fails. So the bus serves the clients whose connections
-    /// ended here, while their recipients are still its clients, whatever their connections ended
-    /// on, and leaves only those that go after that to the hand-over.
+    /// Each client is served in its own chore, until its EOF. The bus reads and takes what the
+    /// client sent before it went, and cleans up after it, as after any client that goes. A client
+    /// went if it closed its end or shut its writes down, or if the bus disconnected it meanwhile,
+    /// as the bus does once a send to a client fails or times out. The client's socket reports that
+    /// the client closed its end or shut its writes down, whatever the socket still holds to read.
+    ///
+    /// The bus hands over no connection that it disconnects, and what it didn't read of such a
+    /// client would be lost otherwise. The bus disconnects a client that went too, if it sends the
+    /// client anything before this finds it gone, as the send fails. So the bus serves the clients
+    /// that went here, while their recipients are still its clients, and leaves only those that go
+    /// after that to the hand-over. The next instance serves those clients until their EOF.
     async fn serve_gone(&self) {
         let mut guard = self.routing_mut().await;
         let routing = &mut *guard;
         for peer in routing.peers.values_mut() {
-            let Some(stream) = gone(peer.client_mut()) else {
+            let Some(reader) = peer.client_mut().take_reader_if_gone() else {
                 continue;
             };
-            let stream = Stream::for_peer(peer, stream);
+            let stream = Stream::for_peer(peer, reader);
             let serving = self.clone().serve_peer(
                 stream,
                 peer.client().listen_cancellation(),
@@ -416,12 +397,12 @@ impl Peers {
             self.spawn_chore(serving);
         }
         for monitor in routing.monitors.values_mut() {
-            let Some(stream) = gone(monitor.client_mut()) else {
+            let Some(reader) = monitor.client_mut().take_reader_if_gone() else {
                 continue;
             };
             let client = monitor.client();
             let serving = self.clone().serve_monitor(
-                stream,
+                reader,
                 client.listen_cancellation(),
                 client.unique_name().clone(),
             );
@@ -452,9 +433,11 @@ impl Peers {
 pub struct ClientHandover {
     /// The number of the client, which its unique name carries.
     pub id: usize,
-    /// The hand-over of the connection of the client: its socket, with what zbus read of the
-    /// client and the bus didn't take, and the file descriptors that came with that, which the
-    /// next instance passes on.
+    /// The hand-over of the client's connection: its socket, the bytes that the bus read from the
+    /// client and didn't take, and what is left to write to the client, with the file descriptors
+    /// of both.
+    ///
+    /// The next instance passes those on.
     pub connection: Handover,
 }
 
@@ -496,7 +479,7 @@ pub(crate) struct NameState {
     pub(crate) owners: Vec<(OwnedUniqueName, bool, bool)>,
 }
 
-/// Whether the task that served each peer of `routing`, and each monitor, gave the stream of its
+/// Whether the task that served each peer of `routing`, and each monitor, gave the reader of its
 /// messages back, as the bus pauses.
 fn paused(routing: &mut Routing) -> bool {
     routing
@@ -504,93 +487,21 @@ fn paused(routing: &mut Routing) -> bool {
         .all(|client| client.paused().is_some())
 }
 
-/// The message stream of `client`, if the client's connection ended while the bus paused and the
-/// task that served the client gave the stream back.
-fn gone(client: &mut Client) -> Option<MessageStream> {
-    if !client.conn().is_closed() {
-        return None;
-    }
-
-    client.paused().take()
-}
-
-/// A client that the bus is handing over. See [`Peers::snapshot`].
-struct Outgoing {
-    /// The number of the client.
-    id: usize,
-    conn: Connection,
-    recipient: Recipient,
-    /// The stream of the messages of the client, which the task that served it gave back.
-    stream: Option<MessageStream>,
-    state: ClientState,
-}
-
-impl Outgoing {
-    /// `client` as the bus hands it over, with `state`, the part of the bus's state that concerns
-    /// the client.
-    fn new(client: &mut Client, state: ClientState) -> Self {
-        Self {
-            id: client.id(),
-            conn: client.conn().clone(),
-            recipient: client.recipient().clone(),
-            stream: client.paused().take(),
-            state,
-        }
-    }
-
-    /// Hand the connection of the client over, through the stream of its messages, within the time
-    /// that the client has to take a message: none if that fails, or takes longer.
+impl Client {
+    /// Take the reader of the client's messages, if the task that served the client gave it back
+    /// when the bus paused, and the client went meanwhile.
     ///
-    /// A client whose connection ended as the client closed its end, such as once it sent a last
-    /// message, is handed over all the same, with what zbus read of it, which the next instance
-    /// passes on before it cleans up after the client. A client that the bus is disconnecting
-    /// isn't handed over. One whose connection fails to be handed over gets closed, and so does one
-    /// whose hand-over takes too long.
-    async fn hand_over(&mut self, runtime: &SharedRuntime) -> Option<Handover> {
-        let name = self.recipient.unique_name()?;
-        if self.recipient.disconnecting() {
-            debug!("Leaving `{name}` out of the hand-over, as the bus is disconnecting it");
-
+    /// The client went if it closed its end of its socket or shut its writes down, or if the bus is
+    /// disconnecting it.
+    fn take_reader_if_gone(&mut self) -> Option<Reader> {
+        let gone = self.connection().is_disconnecting()
+            || self.paused().as_ref().is_some_and(Reader::is_closed);
+        if !gone {
             return None;
         }
-        let stream = self.stream.as_mut()?;
-        let timeout = self.recipient.send_timeout()?;
-        let error = match runtime.timeout(timeout, stream.hand_over()).await {
-            // A send to the client may have failed, or timed out, as the hand-over waited for its
-            // turn to write, and the hand-over may have got the connection before the closing of
-            // the connection did: dropping the hand-over closes what it holds.
-            Ok(Ok(_)) if self.recipient.disconnecting() => {
-                debug!("Leaving `{name}` out of the hand-over, as the bus is disconnecting it");
 
-                return None;
-            }
-            Ok(Ok(handover)) => return Some(handover),
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "it took too long".to_owned(),
-        };
-        warn!("Disconnecting `{name}`, as its connection failed to be handed over: {error}");
-        // The stream still has the messages that zbus read of the client and that the bus didn't
-        // take, such as those that zbus read before the connection ended on an error, but the bus
-        // can't forward them anymore: the connections of the clients are handed over all at once,
-        // so those that the messages are for may have been handed over already. They go with the
-        // stream. The connection reads nothing more, and all that is left is to close it.
-        let name = name.clone();
-        let conn = self.conn.clone();
-        spawn(async move {
-            if let Err(e) = conn.close().await {
-                debug!("Failed to close the connection of `{name}`: {e}");
-            }
-        })
-        .detach();
-
-        None
+        self.paused().take()
     }
-}
-
-/// What the state of the bus holds of a client, as the bus hands it over.
-enum ClientState {
-    Peer(PeerState),
-    Monitor(MonitorState),
 }
 
 /// The records of the calls that wait on a peer, as the bus hands them over, `records`: the number

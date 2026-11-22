@@ -92,14 +92,9 @@ impl TestBus {
     pub async fn connect_as(&self, id: usize, uid: u32) -> anyhow::Result<Connection> {
         let (ours, theirs) = UnixStream::pair()?;
         let credentials = ConnectionCredentials::from_socket(&theirs)?;
-        let adding = self.peers.add(
-            &self.guid,
-            id,
-            connection::Builder::unix_stream(theirs),
-            credentials,
-            SEND_TIMEOUT,
-            uid,
-        );
+        let adding = self
+            .peers
+            .add(&self.guid, id, theirs, credentials, SEND_TIMEOUT, uid);
         let connecting = connection::Builder::unix_stream(ours).build();
         let (added, conn) = join(adding, connecting).await;
         added?;

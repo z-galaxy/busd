@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use zbus::{connection, fdo::ConnectionCredentials, names::UniqueName, Message, OwnedGuid};
+use zbus::{fdo::ConnectionCredentials, names::UniqueName, Message, OwnedGuid};
 #[cfg(target_os = "linux")]
 use zruntime::Event;
 use zruntime::{
@@ -180,10 +180,10 @@ impl Peers {
         self.routing().await.policy.may_connect(uid, gids)
     }
 
-    /// Add a client, whose connection `builder` builds, as an object of the user of `uid`.
+    /// Add a client that connected on `socket`, as an object of the user of `uid`.
     ///
     /// The client has `credentials`, as its socket reports them. The bus gives the client
-    /// `send_timeout` to take each message.
+    /// `send_timeout` to take each message. The client authenticates by `credentials`.
     ///
     /// `uid` is the user of `credentials`, except for the clients of other users that the tests
     /// connect. The credentials of those clients are those of the user that runs the test.
@@ -198,7 +198,7 @@ impl Peers {
         &self,
         guid: &OwnedGuid,
         id: usize,
-        builder: connection::Builder<'_>,
+        socket: std::os::unix::net::UnixStream,
         credentials: ConnectionCredentials,
         send_timeout: Duration,
         uid: u32,
@@ -207,18 +207,9 @@ impl Peers {
         let charge = Charge::new(&user, &user)
             .ok_or_else(|| anyhow!("the bus keeps as many objects for the user {uid} as it may"))?;
         let _connecting = self.inner.chores.connecting();
-        // Perform the connection build and SASL handshake without holding the peers lock, as it
-        // involves async I/O and would otherwise block all other peer operations (Hello
-        // handling, etc.).
-        let handshake = Peer::new(
-            guid.clone(),
-            id,
-            builder,
-            credentials,
-            send_timeout,
-            user,
-            charge,
-        );
+        // The handshake goes without the lock of the routing, since it waits for the client.
+        // Otherwise, it would hold up all that takes the lock, such as the answer to `Hello`.
+        let handshake = Peer::new(guid, id, socket, credentials, send_timeout, user, charge);
         // Dropping the handshake closes the connection, and lets go of the charge.
         #[cfg(target_os = "linux")]
         let Some(handshake) = self.unless_sealed(handshake).await
@@ -384,7 +375,7 @@ struct Inner {
     /// Notified once the bus takes no more clients, as it is done pausing: see [`Peers::add`].
     #[cfg(target_os = "linux")]
     sealed: Event,
-    /// Notified as the task that serves a client gives the stream of its messages back, as the bus
+    /// Notified as the task that serves a client gives the reader of its messages back, as the bus
     /// pauses, and as a client goes, which a pause waits for: see [`Peers::pause`].
     #[cfg(target_os = "linux")]
     paused_changed: Event,
