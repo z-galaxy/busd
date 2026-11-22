@@ -52,9 +52,11 @@ cargo test
 # that share the helpers of `src/testing.rs` build only with the `testing` feature
 cargo test --features testing
 
-# Format (nightly rustfmt) and lint
+# Format (nightly rustfmt) and lint: the build that ships, then the tests and the `bus`
+# benchmark, whose dev-dependencies build the library and the binary with more features
 cargo +nightly fmt --all
 cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ## Architecture

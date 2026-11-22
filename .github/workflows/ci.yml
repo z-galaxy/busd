@@ -72,11 +72,20 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Check common mistakes
         run: cargo --locked clippy --all -- -D warnings
       - name: Check common mistakes (no default features)
         run: cargo --locked clippy --all --no-default-features -- -D warnings
+      - name: Check common mistakes (tests, which borrow the state of the bus too)
+        run: cargo --locked clippy --all --all-targets -- -D warnings
+      # Lint the build that ships, and then the build with the features that the dev-dependencies
+      # of busd's tests turn on.
+      - name: Check common mistakes (macOS)
+        run: |
+          cargo --locked clippy --target x86_64-apple-darwin -- -D warnings
+          cargo --locked clippy --target x86_64-apple-darwin --lib --bins --tests -- -D warnings
       # Named one by one, as `--benches` leaves out `compare`, which `cargo bench` runs only when
       # asked to.
       - name: Check common mistakes (benchmarks)

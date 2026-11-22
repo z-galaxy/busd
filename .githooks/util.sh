@@ -84,8 +84,11 @@ function check_formatting() {
 }
 
 function check_clippy() {
-    hook_info "🔍 Running 'cargo clippy -- -D warnings'"
+    # Lint the build that ships, and then the tests and the `bus` benchmark, whose dev-dependencies
+    # build the library and the binary with more features.
+    hook_info "🔍 Running 'cargo clippy -- -D warnings', then with '--all-targets'"
     cargo clippy -- -D warnings \
+        && cargo clippy --all-targets -- -D warnings \
         && hook_success "Clippy detected no issues" \
         || hook_failure "Cargo clippy detected errors."
 }
