@@ -65,7 +65,7 @@ use {
 fn stalled_client() {
     init_tracing();
 
-    zruntime::block_on(with_bus(SHORT_TIMEOUT, stalled_client_));
+    busd::testing::block_on(with_bus(SHORT_TIMEOUT, stalled_client_));
 }
 
 /// While a sender waits on a client that stops reading, it holds up no one else: the bus lets
@@ -76,7 +76,7 @@ fn stalled_client() {
 fn stall_holds_up_no_one_else() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, stall_holds_up_no_one_else_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, stall_holds_up_no_one_else_));
 }
 
 /// A client that stops reading for a while, but reads again before the time limit, holds up
@@ -87,7 +87,7 @@ fn stall_holds_up_no_one_else() {
 fn slow_client() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, slow_client_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, slow_client_));
 }
 
 /// The bus removes a client that it disconnects, as it does any client that goes: it releases
@@ -98,7 +98,7 @@ fn slow_client() {
 fn stalled_owner() {
     init_tracing();
 
-    zruntime::block_on(with_bus(SHORT_TIMEOUT, stalled_owner_));
+    busd::testing::block_on(with_bus(SHORT_TIMEOUT, stalled_owner_));
 }
 
 /// The bus disconnects a monitor that stops reading, as it does a peer, while the monitors that
@@ -109,7 +109,7 @@ fn stalled_owner() {
 fn stalled_monitor() {
     init_tracing();
 
-    zruntime::block_on(with_bus(SHORT_TIMEOUT, stalled_monitor_));
+    busd::testing::block_on(with_bus(SHORT_TIMEOUT, stalled_monitor_));
 }
 
 /// Sends to a client that stops reading, from several senders at once, time out together, and the
@@ -120,7 +120,7 @@ fn stalled_monitor() {
 fn concurrent_timeouts() {
     init_tracing();
 
-    zruntime::block_on(with_bus(SHORT_TIMEOUT, concurrent_timeouts_));
+    busd::testing::block_on(with_bus(SHORT_TIMEOUT, concurrent_timeouts_));
 }
 
 /// Clients that stop reading, which the same signals go to, hold those signals up for the time
@@ -132,7 +132,7 @@ fn concurrent_timeouts() {
 fn stalled_subscribers() {
     init_tracing();
 
-    zruntime::block_on(with_bus(SHORT_TIMEOUT, stalled_subscribers_));
+    busd::testing::block_on(with_bus(SHORT_TIMEOUT, stalled_subscribers_));
 }
 
 /// A client that goes while the bus waits for it to read is removed once, and the bus carries on.
@@ -142,7 +142,7 @@ fn stalled_subscribers() {
 fn leaving_client() {
     init_tracing();
 
-    zruntime::block_on(with_bus(SHORT_TIMEOUT, leaving_client_));
+    busd::testing::block_on(with_bus(SHORT_TIMEOUT, leaving_client_));
 }
 
 /// The messages of each sender get to each of their recipients in the order that the sender sent
@@ -154,7 +154,7 @@ fn leaving_client() {
 fn ordering() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, ordering_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, ordering_));
 }
 
 /// A message that a client can't take, as it has file descriptors and the client didn't negotiate
@@ -165,7 +165,7 @@ fn ordering() {
 fn client_without_fds() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, client_without_fds_));
 }
 
 /// A call that a client can't take, as it has a file descriptor and the client didn't negotiate
@@ -176,7 +176,7 @@ fn client_without_fds() {
 fn call_to_client_without_fds() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, call_to_client_without_fds_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, call_to_client_without_fds_));
 }
 
 /// Messages that a client can't take, as they have file descriptors and the client didn't
@@ -187,7 +187,7 @@ fn call_to_client_without_fds() {
 fn client_without_fds_in_a_batch() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, client_without_fds_in_a_batch_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, client_without_fds_in_a_batch_));
 }
 
 /// A client is an object of its user from the moment that it connects, as with dbus-broker, so
@@ -201,7 +201,7 @@ fn client_without_fds_in_a_batch() {
 fn stalled_handshake_counts() {
     init_tracing();
 
-    zruntime::block_on(with_bus_of(LONG_TIMEOUT, 1, stalled_handshake_counts_));
+    busd::testing::block_on(with_bus_of(LONG_TIMEOUT, 1, stalled_handshake_counts_));
 }
 
 /// A client that the bus can't write to anymore gets disconnected, even while the bus can still
@@ -213,7 +213,7 @@ fn stalled_handshake_counts() {
 fn unwritable_client() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, unwritable_client_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, unwritable_client_));
 }
 
 /// A client that sends a message with more file descriptors than the bus can pass on gets
@@ -227,7 +227,7 @@ fn unwritable_client() {
 fn too_many_fds() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, too_many_fds_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, too_many_fds_));
 }
 
 /// A message that brings more file descriptors than its header declares gets to its recipient with
@@ -242,7 +242,7 @@ fn too_many_fds() {
 fn undeclared_fds() {
     init_tracing();
 
-    zruntime::block_on(with_bus(LONG_TIMEOUT, undeclared_fds_));
+    busd::testing::block_on(with_bus(LONG_TIMEOUT, undeclared_fds_));
 }
 
 /// A client that the bus wrote part of a message to, when the time limit came, gets nothing more
@@ -254,7 +254,7 @@ fn undeclared_fds() {
 fn partial_write() {
     init_tracing();
 
-    zruntime::block_on(with_bus(PARTIAL_WRITE_TIMEOUT, partial_write_));
+    busd::testing::block_on(with_bus(PARTIAL_WRITE_TIMEOUT, partial_write_));
 }
 
 async fn stalled_client_(address: String) -> anyhow::Result<()> {

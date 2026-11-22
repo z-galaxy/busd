@@ -7,14 +7,13 @@ use std::{
         unix::{fs::MetadataExt, net},
     },
     process::Command,
-    sync::Arc,
+    rc::Rc,
     time::Duration,
 };
 
 use futures_util::future::join;
 use ntest::timeout;
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
-use zruntime::SharedRuntime;
 
 use super::*;
 use crate::{
@@ -26,6 +25,7 @@ use crate::{
         },
         Connection, Reader,
     },
+    runtime,
     testing::{within, WAIT},
 };
 
@@ -322,7 +322,7 @@ fn malformed_records_are_refused() {
 #[test]
 #[timeout(30000)]
 fn connections_of_clients_that_the_bus_disconnects_are_not_handed_over() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, _client) = pair();
         fill(&bus);
         let reader = Reader::new(bus.clone());
@@ -339,7 +339,7 @@ fn connections_of_clients_that_the_bus_disconnects_are_not_handed_over() {
 #[test]
 #[timeout(30000)]
 fn hand_overs_take_what_the_paused_sends_left() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, _client) = pair();
         fill(&bus);
         let reader = Reader::new(bus.clone());
@@ -367,7 +367,7 @@ fn clients_that_fail_to_be_handed_over_are_disconnected() {
     if !in_own_process("clients_that_fail_to_be_handed_over_are_disconnected") {
         return;
     }
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let filled = fill(&bus);
         let reader = Reader::new(bus.clone());
@@ -389,7 +389,7 @@ fn clients_that_fail_to_be_handed_over_are_disconnected() {
 #[test]
 #[timeout(30000)]
 fn closed_connections_disconnect_their_clients() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let filled = fill(&bus);
         let connection = connection(bus, LONG_TIMEOUT);
@@ -418,7 +418,7 @@ fn closed_connections_disconnect_their_clients() {
 #[timeout(30000)]
 fn connections_go_on_where_they_stopped() {
     for through_the_record in [true, false] {
-        zruntime::block_on(go_on_where_it_stopped(through_the_record));
+        crate::testing::block_on(go_on_where_it_stopped(through_the_record));
     }
 }
 
@@ -552,8 +552,8 @@ async fn go_on_where_it_stopped(through_the_record: bool) {
 }
 
 /// `connection` by value, as a hand-over takes it, now that nothing else holds it.
-fn alone(connection: Arc<Connection>) -> Connection {
-    Arc::into_inner(connection).expect("something else holds the connection")
+fn alone(connection: Rc<Connection>) -> Connection {
+    Rc::into_inner(connection).expect("something else holds the connection")
 }
 
 /// `handover`, as the next instance takes it over.
@@ -634,7 +634,7 @@ fn owned(fd: &impl AsFd) -> OwnedFd {
 
 /// Wait for `duration`.
 async fn sleep(duration: Duration) {
-    SharedRuntime::current().unwrap().sleep(duration).await;
+    runtime::local().unwrap().sleep(duration).await;
 }
 
 /// Whether `test`, a test of this module, runs in this process on its own.

@@ -33,7 +33,7 @@ use zbus::{
     wire::{DynamicDeserialize, DynamicType},
     DBusError, Message, ObjectPath, OwnedGuid,
 };
-use zruntime::{mpmc, spawn};
+use zruntime::{mpmc, spawn_local};
 
 use crate::{
     debug,
@@ -64,7 +64,7 @@ impl Peers {
             connection_stats_serial: 0,
         };
 
-        spawn(driver.run(queue)).detach();
+        spawn_local(driver.run(queue)).detach();
     }
 
     /// Fails unless the peer `name`, which sent a call, is privileged, as [`Peers::privileged`] has

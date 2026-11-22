@@ -32,7 +32,7 @@ const OBJECTS_PER_USER: usize = 16;
 fn forged_reply() {
     init_tracing();
 
-    zruntime::block_on(with_bus(forged_reply_));
+    busd::testing::block_on(with_bus(forged_reply_));
 }
 
 /// A call that waits on a peer that goes gets a `NoReply` error from the bus.
@@ -42,7 +42,7 @@ fn forged_reply() {
 fn callee_leaves() {
     init_tracing();
 
-    zruntime::block_on(with_bus(callee_leaves_));
+    busd::testing::block_on(with_bus(callee_leaves_));
 }
 
 /// A call that waits on a peer that becomes a monitor gets a `NoReply` error from the bus.
@@ -52,7 +52,7 @@ fn callee_leaves() {
 fn callee_becomes_monitor() {
     init_tracing();
 
-    zruntime::block_on(with_bus(callee_becomes_monitor_));
+    busd::testing::block_on(with_bus(callee_becomes_monitor_));
 }
 
 /// A call with the serial of another of its caller that waits on the same callee is refused, and
@@ -65,7 +65,7 @@ fn callee_becomes_monitor() {
 fn same_serial() {
     init_tracing();
 
-    zruntime::block_on(with_bus(same_serial_));
+    busd::testing::block_on(with_bus(same_serial_));
 }
 
 /// A call to a name that no peer has gets an error from the bus: `ServiceUnknown`, as the bus
@@ -77,7 +77,7 @@ fn same_serial() {
 fn absent_destination() {
     init_tracing();
 
-    zruntime::block_on(with_bus(absent_destination_));
+    busd::testing::block_on(with_bus(absent_destination_));
 }
 
 /// The bus keeps no more than [`OBJECTS_PER_USER`] objects for a user: its clients, and the calls
@@ -92,7 +92,7 @@ fn absent_destination() {
 fn quota_exceeded() {
     init_tracing();
 
-    zruntime::block_on(with_bus(quota_exceeded_));
+    busd::testing::block_on(with_bus(quota_exceeded_));
 }
 
 async fn forged_reply_(address: String) -> anyhow::Result<()> {

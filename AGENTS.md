@@ -16,10 +16,11 @@ library, which it builds on. Being pure Rust, it cross-builds far more easily th
 reference C broker. Status is alpha: only the essentials of the D-Bus specification are in
 place.
 
-busd runs on [zruntime], the runtime that zbus brings along with its `default-rt`
-feature: the binary drives the bus and all of its connections on the main thread, through
-`zruntime::block_on`. Dropping a zruntime `Task` cancels it, so a fire-and-forget task
-must call `.detach()`.
+busd runs on a [zruntime] `LocalRuntime`, which the binary drives on its main thread. The
+bus, its tasks and the connections of its clients all run there, and the bus spawns its
+tasks with `zruntime::spawn_local`. The tests run their buses the same way, through
+`busd::testing::block_on`, which returns only once the buses of the test are gone.
+Dropping a zruntime `Task` cancels it, so a fire-and-forget task must call `.detach()`.
 
 [zbus]: https://github.com/z-galaxy/zbus
 [zruntime]: https://github.com/z-galaxy/zruntime

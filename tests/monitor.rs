@@ -28,7 +28,7 @@ use zbus::{
 fn become_monitor() {
     init_tracing();
 
-    zruntime::block_on(with_bus(|address| async move {
+    busd::testing::block_on(with_bus(|address| async move {
         become_monitor_client(&address).await
     }));
 }
@@ -41,7 +41,7 @@ fn become_monitor() {
 fn name_of_a_monitor_passes_on() {
     init_tracing();
 
-    zruntime::block_on(with_bus(|address| async move {
+    busd::testing::block_on(with_bus(|address| async move {
         name_of_a_monitor_passes_on_client(&address).await
     }));
 }
@@ -54,7 +54,7 @@ fn name_of_a_monitor_passes_on() {
 fn unprivileged() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let bus = Bus::for_address(Some(&unix_address())).await.unwrap();
         with(bus, unprivileged_clients).await;
     });

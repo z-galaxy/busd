@@ -60,7 +60,7 @@ use zruntime::SharedRuntime;
 fn smoke() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
 
         let service = connection::Builder::address(address.as_str())
@@ -100,7 +100,7 @@ fn smoke() {
 fn credentials_of_a_client_that_was_handed_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let client = connect(&address).await;
         let name = BusName::from(client.unique_name().unwrap().clone());
@@ -130,7 +130,7 @@ fn credentials_of_a_client_that_was_handed_over() {
 fn credentials_of_a_stalled_client_that_was_handed_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let mut stalled = connect(&address).await;
         // Mind the queue of one signal: see `hand_over_does_not_wait_for_a_slow_receiver`.
@@ -167,7 +167,7 @@ fn credentials_of_a_stalled_client_that_was_handed_over() {
 fn pending_call_gets_its_reply() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let service = connect(&address).await;
         request_name(&service, SERVICE).await;
@@ -203,7 +203,7 @@ fn pending_call_gets_its_reply() {
 fn users_keep_their_objects() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let service = connect(&address).await;
         request_name(&service, SERVICE).await;
@@ -246,7 +246,7 @@ fn users_keep_their_objects() {
 fn policy_from_the_first_message() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let client = connect(&address).await;
         request_name(&client, "org.zbus.Handover.Before").await;
@@ -301,7 +301,7 @@ fn policy_from_the_first_message() {
 fn signals_follow_match_rules() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let receiver = connect(&address).await;
         let mut signals = listen(&receiver, signal_rule("Wanted")).await;
@@ -327,7 +327,7 @@ fn signals_follow_match_rules() {
 fn traffic_in_flight() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let receiver = connect(&address).await;
         let signals = listen(&receiver, signal_rule("Tick")).await;
@@ -366,7 +366,7 @@ fn traffic_in_flight() {
 fn calls_to_the_bus_get_their_replies() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let caller = connect(&address).await;
         // The caller watches the names that it asks for change owners, besides owning them.
@@ -413,7 +413,7 @@ fn calls_to_the_bus_get_their_replies() {
 fn hand_over_does_not_wait_for_a_slow_receiver() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         // A receiver that doesn't take signals for a while is not to be disconnected meanwhile.
         let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
         bus.set_send_timeout(LONG_SEND_TIMEOUT);
@@ -481,7 +481,7 @@ fn hand_over_does_not_wait_for_a_slow_receiver() {
 fn messages_that_the_bus_did_not_take_are_handed_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
         bus.set_send_timeout(LONG_SEND_TIMEOUT);
         let (bus, address) = serve(bus);
@@ -532,7 +532,7 @@ fn messages_that_the_bus_did_not_take_are_handed_over() {
 fn monitor_batch_is_forwarded_before_a_hand_over() {
     init_tracing();
 
-    zruntime::block_on(monitor_batches_are_forwarded(false));
+    busd::testing::block_on(monitor_batches_are_forwarded(false));
 }
 
 /// As with `monitor_batch_is_forwarded_before_a_hand_over`, but the monitors go before the bus
@@ -543,7 +543,7 @@ fn monitor_batch_is_forwarded_before_a_hand_over() {
 fn batch_of_a_monitor_that_went_is_forwarded_before_a_hand_over() {
     init_tracing();
 
-    zruntime::block_on(monitor_batches_are_forwarded(true));
+    busd::testing::block_on(monitor_batches_are_forwarded(true));
 }
 
 /// Have clients send signals and `BecomeMonitor` in one go, while a receiver of the signals doesn't
@@ -666,7 +666,7 @@ const BATCH_PADDING: usize = 1000;
 fn bus_on_a_given_socket_hands_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let path = socket_path(&unix_address());
         let listener = UnixListener::bind(&path).unwrap();
         let activator_copy = OwnedFd::from(listener.try_clone().unwrap());
@@ -707,7 +707,7 @@ fn bus_on_a_given_socket_hands_over() {
 fn stalled_receivers_are_handed_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         // The bus doesn't disconnect the receivers as it hands over: it doesn't wait for them.
         let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
         bus.set_send_timeout(LONG_SEND_TIMEOUT);
@@ -819,7 +819,7 @@ fn stalled_receivers_are_handed_over() {
 fn writing_what_was_left_unwritten_holds_no_hand_over_up() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         // A receiver that doesn't take signals for a while is not to be disconnected meanwhile.
         let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
         bus.set_send_timeout(LONG_SEND_TIMEOUT);
@@ -875,7 +875,7 @@ fn writing_what_was_left_unwritten_holds_no_hand_over_up() {
 fn closed_client_is_cleaned_up() {
     init_tracing();
 
-    zruntime::block_on(client_leaves(Leaves::Closes));
+    busd::testing::block_on(client_leaves(Leaves::Closes));
 }
 
 /// A client that sends a signal and goes while the bus pauses, once the bus takes no more of its
@@ -886,7 +886,7 @@ fn closed_client_is_cleaned_up() {
 fn signal_of_a_client_that_goes_while_the_bus_pauses_is_passed_on() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let path = socket_path(&address);
         let receiver = connect(&address).await;
@@ -940,7 +940,7 @@ fn signal_of_a_client_that_goes_while_the_bus_pauses_is_passed_on() {
 fn missing_client_is_cleaned_up() {
     init_tracing();
 
-    zruntime::block_on(client_leaves(Leaves::Missing));
+    busd::testing::block_on(client_leaves(Leaves::Missing));
 }
 
 /// The names of clients that went while the bus handed over pass on to the clients that queued for
@@ -951,7 +951,7 @@ fn missing_client_is_cleaned_up() {
 fn names_of_missing_clients_pass_on() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let names = [format!("{LEAVER}0"), format!("{LEAVER}1")];
         let mut leavers = Vec::new();
@@ -1007,7 +1007,7 @@ fn names_of_missing_clients_pass_on() {
 fn monitor_keeps_monitoring() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let monitor = connect(&address).await;
         let mut monitored = MessageStream::from(&monitor);
@@ -1053,7 +1053,7 @@ fn monitor_keeps_monitoring() {
 fn client_in_the_middle_of_a_message_is_handed_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let bystander = connect(&address).await;
         let path = socket_path(&address);
@@ -1087,7 +1087,7 @@ fn client_in_the_middle_of_a_message_is_handed_over() {
 fn fds_sent_ahead_are_handed_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let receiver = connect(&address).await;
         let mut messages = MessageStream::from(&receiver);
@@ -1134,7 +1134,7 @@ fn fds_sent_ahead_are_handed_over() {
 fn client_whose_handshake_ends_while_the_bus_pauses_is_handed_over() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let watcher = connect(&address).await;
         let path = socket_path(&address);
@@ -1191,7 +1191,7 @@ fn client_whose_handshake_ends_while_the_bus_pauses_is_handed_over() {
 fn client_whose_handshake_ends_too_late_is_disconnected() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (bus, address) = start().await;
         let watcher = connect(&address).await;
         let mut changes = listen(&watcher, owner_changes_rule()).await;

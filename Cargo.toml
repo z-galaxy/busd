@@ -75,7 +75,6 @@ futures-util = { version = "0.3.30", default-features = false, features = ["allo
 # `mpmc` is for the queue of the calls to the bus itself, which it answers one at a time.
 zruntime = { version = "0.2.4", features = [
     "fs",
-    "helper",
     "lock",
     "mpmc",
     "signal",
@@ -109,8 +108,9 @@ default-features = false
 default = ["tracing-subscriber"]
 tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing", "zoter/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
-# The helpers that busd's tests share build zbus clients.
-testing = ["zbus/default-rt"]
+# The helpers that busd's tests share build zbus clients. They time what the tests wait for on
+# zruntime's process-wide runtime, which zruntime's `helper` feature brings.
+testing = ["zbus/default-rt", "zruntime/helper"]
 
 [dev-dependencies]
 # The tests of `tests/` share helpers that the library has only with the `testing` feature. This
@@ -137,8 +137,10 @@ criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_bytes = "0.11.19"
 # The channels that stop the services and the bus of the benchmarks, and hand the replies on a
-# shared connection to their callers.
-zruntime = { version = "0.2.4", features = ["mpmc"], default-features = false }
+# shared connection to their callers. `helper` is for the `zruntime::block_on` of the tests and the
+# benchmarks whose clients run apart from any bus, and for zruntime's process-wide runtime, on which
+# the tests run their own tasks and timers.
+zruntime = { version = "0.2.4", features = ["helper", "mpmc"], default-features = false }
 # The comparison with other brokers writes its results as JSON, and reads them back: its runs keep
 # the order of their fields, and their numbers read back exactly as they were written.
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }

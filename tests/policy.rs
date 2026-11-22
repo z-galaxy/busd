@@ -42,7 +42,7 @@ fn own() {
             <allow own_prefix="org.busd.Policy.Prefix"/>
         </policy>"#
     );
-    zruntime::block_on(with_bus(&policies, own_));
+    busd::testing::block_on(with_bus(&policies, own_));
 }
 
 /// A call that the policy keeps its caller from sending to a name gets an error, whether it goes
@@ -61,7 +61,7 @@ fn send_to_a_name() {
             <deny send_destination="{SERVICE}" send_interface="org.busd.Denied"/>
         </policy>"#
     );
-    zruntime::block_on(with_bus(&policies, send_to_a_name_));
+    busd::testing::block_on(with_bus(&policies, send_to_a_name_));
 }
 
 /// The policy refuses a message by its member, its path and its type, and lets the others
@@ -80,7 +80,7 @@ fn send_attributes() {
             <deny send_type="signal"/>
         </policy>"#
     );
-    zruntime::block_on(with_bus(&policies, send_attributes_));
+    busd::testing::block_on(with_bus(&policies, send_attributes_));
 }
 
 /// A peer that the policy keeps from receiving a message from a sender doesn't get it: a call gets
@@ -101,7 +101,7 @@ fn receive() {
         </policy>"#,
         other_uid(),
     );
-    zruntime::block_on(with_bus(&policies, receive_));
+    busd::testing::block_on(with_bus(&policies, receive_));
 }
 
 /// The calls to the bus itself are subject to the policy too.
@@ -117,7 +117,7 @@ fn calls_to_the_bus() {
             <deny send_destination="{BUS_NAME}" send_interface="org.freedesktop.DBus.Debug.Stats"/>
         </policy>"#
     );
-    zruntime::block_on(with_bus(&policies, calls_to_the_bus_));
+    busd::testing::block_on(with_bus(&policies, calls_to_the_bus_));
 }
 
 /// A reply goes to the call that waits for it, though no rule lets its sender send it.
@@ -136,7 +136,7 @@ fn replies_are_not_checked() {
             <allow send_destination="{SERVICE}"/>
         </policy>"#
     );
-    zruntime::block_on(with_bus(&policies, replies_are_not_checked_));
+    busd::testing::block_on(with_bus(&policies, replies_are_not_checked_));
 }
 
 /// A rule of the mandatory context outranks one of a user, which outranks one of the default
@@ -161,7 +161,7 @@ fn contexts() {
         </policy>"#,
         other_uid(),
     );
-    zruntime::block_on(with_bus(&policies, contexts_));
+    busd::testing::block_on(with_bus(&policies, contexts_));
 }
 
 /// A client that the policy doesn't let connect can't, and one that it lets connect can.
@@ -185,7 +185,7 @@ fn connect() {
         </policy>"#,
         our_uid(),
     );
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         with_bus(&denied, |bus| async move {
             let result = connection::Builder::address(bus.address()).build().await;
             ensure!(result.is_err(), "the client connected: {result:?}");
@@ -210,7 +210,7 @@ fn connect() {
 fn set_policy_applies_to_connected_peers() {
     init_tracing();
 
-    zruntime::block_on(with_bus("", set_policy_applies_to_connected_peers_));
+    busd::testing::block_on(with_bus("", set_policy_applies_to_connected_peers_));
 }
 
 /// `ReloadConfig` has the bus read its policy again and go by it, the peers that it has included.
@@ -222,7 +222,7 @@ fn set_policy_applies_to_connected_peers() {
 fn reload() {
     init_tracing();
 
-    zruntime::block_on(with_bus("", reload_));
+    busd::testing::block_on(with_bus("", reload_));
 }
 
 /// The bus goes on forwarding the messages of its peers while it reads its policy again.
@@ -232,7 +232,7 @@ fn reload() {
 fn forwards_during_a_reload() {
     init_tracing();
 
-    zruntime::block_on(with_bus("", forwards_during_a_reload_));
+    busd::testing::block_on(with_bus("", forwards_during_a_reload_));
 }
 
 /// The signals of the bus are subject to the policy of their receivers.
@@ -252,7 +252,7 @@ fn bus_signals() {
         </policy>"#,
         other_uid(),
     );
-    zruntime::block_on(with_bus(&policies, bus_signals_));
+    busd::testing::block_on(with_bus(&policies, bus_signals_));
 }
 
 /// Under the stock system.conf, clients connect, say hello, get the signals of the bus and the
@@ -264,7 +264,7 @@ fn bus_signals() {
 fn stock_system_configuration() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let config = Config::read_file("tests/data/system.conf").unwrap();
         let ids = Ids::parse("root:x:0:0:::", "");
         let policy = Policy::new(&config, &ids, our_uid());
@@ -281,7 +281,7 @@ fn stock_system_configuration() {
 fn system_bus_without_a_policy() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let config = Config::parse(
             r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
             "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">

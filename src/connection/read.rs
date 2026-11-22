@@ -5,7 +5,7 @@ use std::{
     fmt, io, mem,
     os::fd::{AsFd, OwnedFd},
     pin::Pin,
-    sync::Arc,
+    rc::Rc,
     task::{ready, Context, Poll},
 };
 
@@ -16,7 +16,7 @@ use zbus::{
     message::{Header, PrimaryHeader},
     Message,
 };
-use zruntime::{net::unix::UnixStream, Shared};
+use zruntime::{net::unix::UnixStream, Local};
 
 use super::socket;
 
@@ -57,7 +57,7 @@ use super::socket;
 ///
 /// The error comes once, and the end of the stream after it.
 pub struct Reader {
-    socket: Arc<UnixStream<Shared>>,
+    socket: Rc<UnixStream<Local>>,
     /// The unread bytes, which were read and not taken yet: `buffer[start..end]`.
     buffer: Vec<u8>,
     start: usize,
@@ -97,7 +97,7 @@ impl Stream for Reader {
 
 impl Reader {
     /// The reader of the client at the other end of `socket`.
-    pub fn new(socket: Arc<UnixStream<Shared>>) -> Self {
+    pub fn new(socket: Rc<UnixStream<Local>>) -> Self {
         Self {
             socket,
             buffer: vec![0; BUFFER_SIZE],
@@ -124,7 +124,7 @@ impl Reader {
     /// own allocation, as any such message does. Any other bytes go into the buffer that the reader
     /// reads into.
     #[cfg(target_os = "linux")]
-    pub fn taken_over(socket: Arc<UnixStream<Shared>>, unread: Vec<u8>, fds: Vec<OwnedFd>) -> Self {
+    pub fn taken_over(socket: Rc<UnixStream<Local>>, unread: Vec<u8>, fds: Vec<OwnedFd>) -> Self {
         let fd_sets = match fds.len() {
             0 => VecDeque::new(),
             count => VecDeque::from([count]),
@@ -369,7 +369,7 @@ impl fmt::Debug for Reader {
 /// The file descriptors that came join those that wait in `fds`, as their own set in `fd_sets`. If
 /// [`MAX_FD_SETS`] sets wait already, that is an error.
 fn poll_recv(
-    stream: &UnixStream<Shared>,
+    stream: &UnixStream<Local>,
     cx: &mut Context<'_>,
     room: &mut [u8],
     fds: &mut Vec<OwnedFd>,

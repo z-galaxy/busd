@@ -5,12 +5,13 @@ use futures_util::StreamExt;
 use ntest::timeout;
 use serde::Deserialize;
 use zbus::{connection, Connection, MessageStream, OwnedVariant};
-use zruntime::{unblock, SharedRuntime};
+use zruntime::unblock;
 
 use super::*;
 use crate::{
     bus::Bus,
     policy::Policy,
+    runtime,
     testing::{connect, unix_address, with, with_bus},
 };
 
@@ -22,7 +23,7 @@ use crate::{
 #[test]
 #[timeout(30000)]
 fn introspection_lists_what_the_bus_answers() {
-    zruntime::block_on(with_bus(|address| async move {
+    crate::testing::block_on(with_bus(|address| async move {
         let conn = connect(&address).await?;
         let standard = [INTROSPECTABLE, PEER, PROPERTIES];
         let mut node = None;
@@ -132,7 +133,7 @@ fn introspection_lists_what_the_bus_answers() {
 #[test]
 #[timeout(30000)]
 fn properties_of_the_bus() {
-    zruntime::block_on(with_bus(|address| async move {
+    crate::testing::block_on(with_bus(|address| async move {
         let conn = connect(&address).await?;
 
         let reply = call(&conn, PATH, PROPERTIES, "Get", &(BUS_NAME, "Features")).await;
@@ -199,7 +200,7 @@ fn properties_of_the_bus() {
 #[test]
 #[timeout(30000)]
 fn peer_answers_on_any_path() {
-    zruntime::block_on(with_bus(|address| async move {
+    crate::testing::block_on(with_bus(|address| async move {
         let conn = connect(&address).await?;
         let expected = zbus::fdo::machine_id().map_err(|e| e.name().to_string());
 
@@ -239,7 +240,7 @@ fn peer_answers_on_any_path() {
 #[test]
 #[timeout(30000)]
 fn order_of_the_replies_and_the_signals_of_names() {
-    zruntime::block_on(with_bus(|address| async move {
+    crate::testing::block_on(with_bus(|address| async move {
         // A connection that says `Hello` itself.
         let conn = connection::Builder::address(address.as_str())
             .p2p()
@@ -297,7 +298,7 @@ fn order_of_the_replies_and_the_signals_of_names() {
 #[test]
 #[timeout(30000)]
 fn reload_holds_later_calls_back() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (reload, blocked) = BlockedReload::new();
         let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
         bus.set_reload(reload).await;
@@ -312,7 +313,7 @@ fn reload_holds_later_calls_back() {
             for call in &calls {
                 conn.send(call).await?;
             }
-            let runtime = SharedRuntime::current()?;
+            let runtime = runtime::local()?;
             let early = runtime
                 .timeout(QUIET, next_reply(&mut messages, &calls[0]))
                 .await;
@@ -342,7 +343,7 @@ fn reload_holds_later_calls_back() {
 #[test]
 #[timeout(30000)]
 fn calls_that_expect_no_reply_get_none() {
-    zruntime::block_on(with_bus(|address| async move {
+    crate::testing::block_on(with_bus(|address| async move {
         let conn = connect(&address).await?;
         let mut messages = MessageStream::from(&conn);
         let quiet =
@@ -396,7 +397,7 @@ fn calls_that_expect_no_reply_get_none() {
 #[test]
 #[timeout(30000)]
 fn calls_of_what_the_bus_has_not() {
-    zruntime::block_on(with_bus(|address| async move {
+    crate::testing::block_on(with_bus(|address| async move {
         let conn = connect(&address).await?;
         for (path, interface, member, error) in [
             ("/org/busd/NoSuch", Some(BUS_NAME), "GetId", "UnknownObject"),

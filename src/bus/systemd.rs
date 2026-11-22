@@ -93,10 +93,9 @@ use std::{os::fd::OwnedFd, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use zoter::{Passed, Restored, Save, Store};
-use zruntime::SharedRuntime;
 
 use super::{handover::State, Bus, ClientHandover, Handover};
-use crate::{connection, debug, error, info, peer::SEND_TIMEOUT, policy::Policy, warn};
+use crate::{connection, debug, error, info, peer::SEND_TIMEOUT, policy::Policy, runtime, warn};
 
 impl Bus {
     /// Create a bus that systemd runs, out of the FDs that systemd passed, `passed`, and the store
@@ -181,7 +180,7 @@ impl Bus {
             );
         }
         info!("Handing over to the next instance of the bus..");
-        let handover = SharedRuntime::current()?
+        let handover = runtime::local()?
             .timeout(HAND_OVER_TIMEOUT, self.hand_over())
             .await
             .context("The bus took too long to hand over")??;

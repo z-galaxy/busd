@@ -25,7 +25,7 @@ use zruntime::SharedRuntime;
 fn name_ownership_changes() {
     init_tracing();
 
-    zruntime::block_on(with_bus(name_ownership_changes_client));
+    busd::testing::block_on(with_bus(name_ownership_changes_client));
 }
 
 /// A client can neither ask for nor release the name of the bus itself: the bus refuses both with
@@ -36,7 +36,7 @@ fn name_ownership_changes() {
 fn reserved_name() {
     init_tracing();
 
-    zruntime::block_on(with_bus(reserved_name_client));
+    busd::testing::block_on(with_bus(reserved_name_client));
 }
 
 /// Every method of the bus, among many other calls to the bus that a client sends at once, gets its
@@ -50,7 +50,7 @@ fn reserved_name() {
 fn every_call_to_the_bus_among_calls() {
     init_tracing();
 
-    zruntime::block_on(with_bus(every_call_to_the_bus_among_calls_client));
+    busd::testing::block_on(with_bus(every_call_to_the_bus_among_calls_client));
 }
 
 /// The `Interfaces` property of the bus lists the `org.freedesktop.DBus.Monitoring` and
@@ -61,7 +61,7 @@ fn every_call_to_the_bus_among_calls() {
 fn properties() {
     init_tracing();
 
-    zruntime::block_on(with_bus(properties_client));
+    busd::testing::block_on(with_bus(properties_client));
 }
 
 #[instrument]

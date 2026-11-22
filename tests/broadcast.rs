@@ -21,7 +21,7 @@ use zbus::{
 fn broadcast_signals() {
     init_tracing();
 
-    zruntime::block_on(with_bus(|address| async move {
+    busd::testing::block_on(with_bus(|address| async move {
         broadcast_signals_(&address).await
     }));
 }

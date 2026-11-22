@@ -14,6 +14,7 @@ pub mod name_registry;
 pub mod peer;
 pub mod peers;
 pub mod policy;
+mod runtime;
 #[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
 pub mod testing;

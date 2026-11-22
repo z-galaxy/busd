@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use zbus::{address::Transport, fdo::ConnectionCredentials, Address, Guid, OwnedGuid};
-use zruntime::spawn;
+use zruntime::spawn_local;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod handover;
@@ -29,10 +29,12 @@ use crate::{peer::SEND_TIMEOUT, peers::Peers, policy::Policy};
 
 /// The bus.
 ///
-/// The bus, and every connection it serves, runs on [zruntime]. Create and run it from inside
-/// [`zruntime::block_on`], so that the calling thread runs all of them, on its own runtime.
+/// The bus runs on a [zruntime] `LocalRuntime`, with all of its tasks and the connections of its
+/// clients. Create and run it from inside [`LocalRuntime::block_on`], or from a task of that
+/// runtime. The thread that runs the runtime then runs all of them.
 ///
 /// [zruntime]: https://docs.rs/zruntime
+/// [`LocalRuntime::block_on`]: zruntime::Runtime::block_on
 #[derive(Debug)]
 pub struct Bus {
     listener: Listener,
@@ -179,7 +181,7 @@ impl Bus {
         let peers = self.peers.clone();
         let guid = self.guid.clone();
         let send_timeout = self.send_timeout;
-        spawn(async move {
+        spawn_local(async move {
             let res = async {
                 // The client is an object of its user from the start, before its handshake, so
                 // its user is the one that its socket tells, for a client in another PID namespace

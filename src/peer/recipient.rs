@@ -1,8 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{rc::Rc, time::Duration};
 
 use zbus::{names::OwnedUniqueName, Message};
 #[cfg(target_os = "linux")]
-use zruntime::{spawn, Shared, Task};
+use zruntime::{spawn_local, Local, Task};
 
 use crate::{connection::Connection, fdo::Calls};
 
@@ -34,7 +34,7 @@ pub struct Recipient(Kind);
 impl Recipient {
     /// A client on `connection`, which the bus gives the time limit of the connection to take each
     /// message.
-    pub fn client(connection: Arc<Connection>) -> Self {
+    pub fn client(connection: Rc<Connection>) -> Self {
         Self(Kind::Client(connection))
     }
 
@@ -69,7 +69,7 @@ impl Recipient {
     /// what it didn't write is left for the next send to the client to write first, or for the
     /// hand-over of the connection to hand over.
     #[cfg(target_os = "linux")]
-    pub(crate) fn flush(&self) -> Option<Task<(), Shared>> {
+    pub(crate) fn flush(&self) -> Option<Task<(), Local>> {
         let Kind::Client(connection) = &self.0 else {
             return None;
         };
@@ -78,7 +78,7 @@ impl Recipient {
         }
         let connection = connection.clone();
 
-        Some(spawn(async move { connection.flush().await }))
+        Some(spawn_local(async move { connection.flush().await }))
     }
 
     /// Send `msgs`, in order, in one go: with as few writes as the socket takes.
@@ -136,6 +136,6 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 enum Kind {
-    Client(Arc<Connection>),
+    Client(Rc<Connection>),
     Bus(Calls),
 }

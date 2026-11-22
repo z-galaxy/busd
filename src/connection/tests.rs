@@ -26,7 +26,7 @@ use crate::testing::within;
 #[test]
 #[timeout(30000)]
 fn messages_whole_in_one_read() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let mut reader = Reader::new(bus);
         let msgs = [signal(0, 0), signal(100, 1), signal(1000, 2)];
@@ -44,7 +44,7 @@ fn messages_whole_in_one_read() {
 #[test]
 #[timeout(30000)]
 fn message_across_reads() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let mut reader = Reader::new(bus);
         let msg = signal(100, 1);
@@ -64,7 +64,7 @@ fn message_across_reads() {
 #[test]
 #[timeout(30000)]
 fn messages_longer_than_the_buffer() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let mut reader = Reader::new(bus);
         let msgs = [
@@ -95,7 +95,7 @@ fn messages_longer_than_the_buffer() {
 #[test]
 #[timeout(30000)]
 fn fd_with_its_message() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let mut reader = Reader::new(bus);
         let (ours, theirs) = fd_pair();
@@ -116,7 +116,7 @@ fn fd_with_its_message() {
 #[test]
 #[timeout(30000)]
 fn fds_sent_ahead() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let mut reader = Reader::new(bus);
         let [(ours_1, theirs_1), (ours_2, theirs_2)] = [fd_pair(), fd_pair()];
@@ -147,7 +147,7 @@ fn fds_sent_ahead() {
 #[test]
 #[timeout(30000)]
 fn fourth_fd_set_is_refused() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         for sets in [3, 4] {
             let (bus, client) = pair();
             let mut reader = Reader::new(bus);
@@ -189,7 +189,7 @@ fn fourth_fd_set_is_refused() {
 #[test]
 #[timeout(30000)]
 fn fds_of_one_message_after_another() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let mut reader = Reader::new(bus);
         // Messages with an FD each, in their own writes, and then two in one write. That write
@@ -233,7 +233,7 @@ fn fds_of_one_message_after_another() {
 #[test]
 #[timeout(30000)]
 fn end_of_the_input() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let msg = signal(100, 1);
         let bytes = msg.data().bytes();
         for sent in [bytes.len(), 5, 50] {
@@ -259,7 +259,7 @@ fn end_of_the_input() {
 #[test]
 #[timeout(30000)]
 fn invalid_headers_end_the_input() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bytes = signal(0, 0).data().bytes()[..16].to_vec();
         let mut unknown_endian = bytes.clone();
         unknown_endian[0] = b'x';
@@ -289,7 +289,7 @@ fn invalid_headers_end_the_input() {
 #[test]
 #[timeout(30000)]
 fn missing_fds_end_the_input() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let mut reader = Reader::new(bus);
         let (_ours, theirs) = fd_pair();
@@ -310,7 +310,7 @@ fn missing_fds_end_the_input() {
 #[test]
 #[timeout(30000)]
 fn what_the_bus_reads_of_a_client_that_it_cut() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (msgs, read, ours) = cut().await;
 
         assert_eq!(read.len(), msgs.len(), "{read:?}");
@@ -330,7 +330,7 @@ fn what_the_bus_reads_of_a_client_that_it_cut() {
 #[test]
 #[timeout(30000)]
 fn what_the_bus_reads_of_a_client_that_it_cut() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (_, read, _) = cut().await;
 
         assert!(
@@ -449,10 +449,10 @@ fn messages_with_fds_go_alone() {
 #[test]
 #[timeout(30000)]
 fn messages_are_written_with_their_fds() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let connection = connection(bus, LONG_TIMEOUT);
-        let mut client = Reader::new(Arc::new(client));
+        let mut client = Reader::new(Rc::new(client));
         let pairs = [fd_pair(), fd_pair(), fd_pair()];
         let msgs = [
             signal(10, 1),
@@ -482,7 +482,7 @@ fn messages_are_written_with_their_fds() {
 #[test]
 #[timeout(30000)]
 fn fds_for_a_client_without_fd_passing() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let connection = Connection::new(bus, name(), false, LONG_TIMEOUT);
         let (_ours, theirs) = fd_pair();
@@ -503,7 +503,7 @@ fn fds_for_a_client_without_fd_passing() {
 #[test]
 #[timeout(30000)]
 fn sends_stay_apart_and_in_order() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let filled = fill(&bus);
         let connection = connection(bus, LONG_TIMEOUT);
@@ -530,7 +530,7 @@ fn sends_stay_apart_and_in_order() {
 #[test]
 #[timeout(30000)]
 fn timeout_disconnects() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let filled = fill(&bus);
         let connection = connection(bus, Duration::from_millis(200));
@@ -575,7 +575,7 @@ fn timeout_disconnects() {
 #[test]
 #[timeout(30000)]
 fn failed_send_disconnects() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let connection = {
             let (bus, _client) = pair();
 
@@ -606,7 +606,7 @@ fn failed_send_disconnects() {
 #[test]
 #[timeout(30000)]
 fn sends_whose_messages_another_send_wrote() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let filled = fill(&bus);
         let connection = connection(bus, LONG_TIMEOUT);
@@ -638,7 +638,7 @@ fn sends_whose_messages_another_send_wrote() {
 #[test]
 #[timeout(30000)]
 fn send_whose_message_another_waiting_send_wrote() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let filled = fill(&bus);
         let connection = connection(bus, LONG_TIMEOUT);
@@ -685,7 +685,7 @@ fn send_whose_message_another_waiting_send_wrote() {
 #[test]
 #[timeout(30000)]
 fn send_whose_message_a_later_send_wrote() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = pair();
         let filled = fill(&bus);
         let connection = connection(bus, LONG_TIMEOUT);
@@ -922,7 +922,7 @@ fn handshake_fails_on_what_is_no_command() {
     let ends_in_a_line = format!("\0AUTH EXTERNAL {me}");
     let not_utf8 = b"\0AUTH EXTERNAL \xff\r\n";
     for input in [ends_in_a_line.as_bytes(), not_utf8] {
-        let (answers, ends) = zruntime::block_on(handshake(input, uid()));
+        let (answers, ends) = crate::testing::block_on(handshake(input, uid()));
         assert_eq!((answers.as_str(), ends), ("", Ends::Failed), "{input:?}");
     }
 }
@@ -944,7 +944,7 @@ fn handshake_fails_on_lines_that_are_not_lines() {
         (lf_first, String::new()),
         (lf_line, ok()),
     ] {
-        let (answered, ends) = zruntime::block_on(handshake(input.as_bytes(), uid()));
+        let (answered, ends) = crate::testing::block_on(handshake(input.as_bytes(), uid()));
         assert_eq!((answered, ends), (answers, Ends::Failed), "{input:?}");
     }
 }
@@ -966,7 +966,7 @@ fn handshake_fails_on_lines_longer_than_4_kib() {
         (4 * 1024 + 1, ok(), Ends::Failed),
     ] {
         let input = format!("{auth}{}BEGIN\r\n", line(len));
-        let (answered, ended) = zruntime::block_on(handshake(input.as_bytes(), uid()));
+        let (answered, ended) = crate::testing::block_on(handshake(input.as_bytes(), uid()));
         assert_eq!((answered, ended), (answers, ends), "{len}");
     }
 }
@@ -976,7 +976,7 @@ fn handshake_fails_on_lines_longer_than_4_kib() {
 #[test]
 #[timeout(30000)]
 fn handshake_line_by_line() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = std_pair();
         let auth = format!("\0AUTH EXTERNAL {}\r\n", id(uid()));
         let talking = async {
@@ -1006,7 +1006,7 @@ fn handshake_line_by_line() {
 #[test]
 #[timeout(30000)]
 fn handshake_of_another_user() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = net::UnixStream::pair().unwrap();
         let (accepted, connected) = join(
             Connection::accept(bus, &guid(), uid() + 1, name(), LONG_TIMEOUT),
@@ -1025,7 +1025,7 @@ fn handshake_of_another_user() {
 #[test]
 #[timeout(30000)]
 fn bytes_and_fds_after_begin_start_the_first_message() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = std_pair();
         let (ours, theirs) = fd_pair();
         let first = signal_with_fds(&[&theirs]);
@@ -1064,7 +1064,7 @@ fn bytes_and_fds_after_begin_start_the_first_message() {
 #[test]
 #[timeout(30000)]
 fn fds_with_the_handshake() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         for sets in [3, 4] {
             let (bus, client) = std_pair();
             let pairs: Vec<_> = (0..sets).map(|_| fd_pair()).collect();
@@ -1119,7 +1119,7 @@ fn fds_with_the_handshake() {
 #[test]
 #[timeout(30000)]
 fn zbus_client() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let (bus, client) = net::UnixStream::pair().unwrap();
         let (accepted, connected) = join(
             Connection::accept(bus, &guid(), uid(), name(), LONG_TIMEOUT),
@@ -1162,7 +1162,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn client_that_closed_with_bytes_unread() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let msgs = [signal(10, 1), signal(20, 2)];
             let mut reader = {
                 let (bus, client) = pair();
@@ -1184,7 +1184,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn is_closed() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let (bus, client) = pair();
             let mut reader = Reader::new(bus);
             assert!(!reader.is_closed());
@@ -1217,7 +1217,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn pause_wakes_a_waiting_send() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let (bus, client) = pair();
             let filled = fill(&bus);
             let connection = connection(bus, LONG_TIMEOUT);
@@ -1249,7 +1249,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn flush_writes_what_a_dropped_send_left() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let (bus, client) = pair();
             let filled = fill(&bus);
             let connection = connection(bus, LONG_TIMEOUT);
@@ -1279,7 +1279,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn flush_that_times_out_disconnects() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let (bus, _client) = pair();
             fill(&bus);
             let connection = connection(bus, Duration::from_millis(100));
@@ -1301,7 +1301,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn taken_over_start_of_a_message() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let msg = signal(100, 1);
             let bytes = msg.data().bytes();
             for taken in [5, 30] {
@@ -1324,7 +1324,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn taken_over_long_message() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let long = signal(10_000, 7);
             let bytes = long.data().bytes();
             let (bus, client) = pair();
@@ -1360,7 +1360,7 @@ mod linux {
     #[test]
     #[timeout(30000)]
     fn taken_over_message_and_the_start_of_a_long_one() {
-        zruntime::block_on(async {
+        crate::testing::block_on(async {
             let (bus, client) = pair();
             let msg = signal(100, 1);
             let long = signal(10_000, 2);
@@ -1411,7 +1411,7 @@ fn check_conversations(conversations: &[(&[&str], &[&str], Ends)]) {
             input.extend_from_slice(line.as_bytes());
             input.extend_from_slice(b"\r\n");
         }
-        let (answered, ended) = zruntime::block_on(handshake(&input, uid()));
+        let (answered, ended) = crate::testing::block_on(handshake(&input, uid()));
         assert_eq!(
             (answered, &ended),
             (answers.concat(), ends),
@@ -1444,7 +1444,7 @@ async fn handshake(input: &[u8], uid: u32) -> (String, Ends) {
 }
 
 /// The answer of a line, read off `client` once it is whole, `\r\n` included.
-async fn read_line(client: &UnixStream<Shared>) -> String {
+async fn read_line(client: &UnixStream<Local>) -> String {
     let mut line = Vec::new();
     while !line.ends_with(b"\r\n") {
         line.extend(read_exact(client, 1).await);
@@ -1492,25 +1492,25 @@ fn uid() -> u32 {
 
 /// The bus's end of a pair of connected sockets, and the client's end, both on the runtime that
 /// runs the test.
-pub(super) fn pair() -> (Arc<UnixStream<Shared>>, UnixStream<Shared>) {
-    let (bus, client) = UnixStream::pair(&SharedRuntime::current().unwrap()).unwrap();
+pub(super) fn pair() -> (Rc<UnixStream<Local>>, UnixStream<Local>) {
+    let (bus, client) = UnixStream::pair(&runtime::local().unwrap()).unwrap();
 
-    (Arc::new(bus), client)
+    (Rc::new(bus), client)
 }
 
 /// The bus's end of a pair of connected sockets, as `Connection::accept` takes it, and the client's
 /// end, on the runtime that runs the test.
-fn std_pair() -> (net::UnixStream, UnixStream<Shared>) {
+fn std_pair() -> (net::UnixStream, UnixStream<Local>) {
     let (bus, client) = net::UnixStream::pair().unwrap();
-    let client = UnixStream::from_std(&SharedRuntime::current().unwrap(), client).unwrap();
+    let client = UnixStream::from_std(&runtime::local().unwrap(), client).unwrap();
 
     (bus, client)
 }
 
 /// A connection to the client at the other end of `bus`, which passes file descriptors, and has
 /// `timeout` to take each send.
-pub(super) fn connection(bus: Arc<UnixStream<Shared>>, timeout: Duration) -> Arc<Connection> {
-    Arc::new(Connection::new(bus, name(), true, timeout))
+pub(super) fn connection(bus: Rc<UnixStream<Local>>, timeout: Duration) -> Rc<Connection> {
+    Rc::new(Connection::new(bus, name(), true, timeout))
 }
 
 /// The unique name of the client of the tests.
@@ -1579,13 +1579,13 @@ pub(super) async fn poll_once(reader: &mut Reader) -> Poll<Option<zbus::Result<M
 ///
 /// The task gives back what the send gives back.
 pub(super) async fn start_send(
-    connection: &Arc<Connection>,
+    connection: &Rc<Connection>,
     msgs: Vec<Message>,
-) -> Task<Vec<Message>, Shared> {
+) -> Task<Vec<Message>, Local> {
     let connection = connection.clone();
     let mut send = Box::pin(async move { connection.send(&msgs).await });
     assert!(poll!(send.as_mut()).is_pending(), "the send didn't wait");
-    let task = zruntime::spawn(send);
+    let task = zruntime::spawn_local(send);
     // The task waits from its own first poll on, and this lets the runtime make that poll.
     yield_now().await;
 
@@ -1611,7 +1611,7 @@ async fn yield_now() {
 /// that took.
 ///
 /// The writes go through a non-blocking duplicate of the socket.
-pub(super) fn fill(bus: &UnixStream<Shared>) -> usize {
+pub(super) fn fill(bus: &UnixStream<Local>) -> usize {
     // The duplicate shares the mode of the socket, which the runtime set to non-blocking.
     let duplicate = net::UnixStream::from(bus.as_fd().try_clone_to_owned().unwrap());
     let chunk = vec![FILL; 64 * 1024];
@@ -1631,14 +1631,14 @@ pub(super) fn fill(bus: &UnixStream<Shared>) -> usize {
 }
 
 /// Read `len` bytes of what [`fill`] wrote off `client`, as they come.
-pub(super) async fn read_fill(client: &UnixStream<Shared>, len: usize) {
+pub(super) async fn read_fill(client: &UnixStream<Local>, len: usize) {
     let read = read_exact(client, len).await;
     assert!(read.iter().all(|&byte| byte == FILL));
 }
 
 /// Read `len` bytes of what [`fill`] wrote off `client`, which are there to read already, without
 /// letting the runtime run.
-fn read_fill_now(client: &UnixStream<Shared>, len: usize) {
+fn read_fill_now(client: &UnixStream<Local>, len: usize) {
     let mut read = vec![0; len];
     let mut got = 0;
     while got < len {
@@ -1661,7 +1661,7 @@ pub(super) fn send_raw(client: &impl AsFd, bytes: &[u8], fds: &[BorrowedFd<'_>])
 
 /// Write all of `bytes` to `client`, with `fds` along with the first byte, as the socket takes
 /// them.
-pub(super) async fn write_all(client: &UnixStream<Shared>, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
+pub(super) async fn write_all(client: &UnixStream<Local>, bytes: &[u8], fds: &[BorrowedFd<'_>]) {
     let mut written = 0;
     let mut fds = fds;
     while written < bytes.len() {
@@ -1676,12 +1676,12 @@ pub(super) async fn write_all(client: &UnixStream<Shared>, bytes: &[u8], fds: &[
 }
 
 /// Read `len` bytes off `client`, as they come.
-pub(super) async fn read_exact(client: &UnixStream<Shared>, len: usize) -> Vec<u8> {
+pub(super) async fn read_exact(client: &UnixStream<Local>, len: usize) -> Vec<u8> {
     recv_exact(client, len).await.0
 }
 
 /// Read `len` bytes off `client`, as they come, with the file descriptors that come along.
-pub(super) async fn recv_exact(client: &UnixStream<Shared>, len: usize) -> (Vec<u8>, Vec<OwnedFd>) {
+pub(super) async fn recv_exact(client: &UnixStream<Local>, len: usize) -> (Vec<u8>, Vec<OwnedFd>) {
     let mut bytes = vec![0; len];
     let mut fds = Vec::new();
     let mut read = 0;
@@ -1704,7 +1704,7 @@ pub(super) async fn recv_exact(client: &UnixStream<Shared>, len: usize) -> (Vec<
 /// bus whose handshake with the client failed does. On Linux, the client's read then fails with
 /// `ECONNRESET`, which [`socket::recv`] takes for EOF. This takes `ECONNRESET` for EOF on other
 /// platforms too.
-pub(super) async fn read_to_end(client: &UnixStream<Shared>) -> Vec<u8> {
+pub(super) async fn read_to_end(client: &UnixStream<Local>) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut buf = vec![0; 64 * 1024];
     loop {

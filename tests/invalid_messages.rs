@@ -18,7 +18,7 @@ const INTERFACE: &str = "org.zbus.InvalidMessages";
 fn invalid_body() {
     init_tracing();
 
-    zruntime::block_on(with_bus(invalid_body_));
+    busd::testing::block_on(with_bus(invalid_body_));
 }
 
 /// A client that sends a message without a field that its type requires gets disconnected.
@@ -28,7 +28,7 @@ fn invalid_body() {
 fn missing_field() {
     init_tracing();
 
-    zruntime::block_on(with_bus(missing_field_));
+    busd::testing::block_on(with_bus(missing_field_));
 }
 
 /// A client that sends a signal with the interface that the specification reserves for local use
@@ -39,7 +39,7 @@ fn missing_field() {
 fn local_interface() {
     init_tracing();
 
-    zruntime::block_on(with_bus(local_interface_));
+    busd::testing::block_on(with_bus(local_interface_));
 }
 
 /// A client that sends a signal with the path that the specification reserves for local use gets
@@ -50,7 +50,7 @@ fn local_interface() {
 fn local_path() {
     init_tracing();
 
-    zruntime::block_on(with_bus(local_path_));
+    busd::testing::block_on(with_bus(local_path_));
 }
 
 /// A client that sends a method call with the interface that the specification reserves for local
@@ -61,7 +61,7 @@ fn local_path() {
 fn local_method_call() {
     init_tracing();
 
-    zruntime::block_on(with_bus(local_method_call_));
+    busd::testing::block_on(with_bus(local_method_call_));
 }
 
 async fn invalid_body_(address: String) -> anyhow::Result<()> {

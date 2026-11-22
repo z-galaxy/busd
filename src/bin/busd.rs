@@ -23,7 +23,7 @@ use futures_util::future::{select, Either};
 use rustix::process::{getrlimit, setrlimit, Resource};
 use zruntime::{
     signal::{Signal, Signals},
-    SharedRuntime,
+    LocalRuntime,
 };
 
 /// A simple D-Bus broker.
@@ -83,13 +83,20 @@ fn main() -> Result<()> {
         warn!("Failed to raise the limit of open file descriptors: {e}");
     }
 
-    zruntime::block_on(run(
+    // The bus and all of its tasks run on this thread.
+    let runtime = LocalRuntime::new()?;
+
+    runtime.block_on(run(
+        &runtime,
         #[cfg(target_os = "linux")]
         passed,
     ))
 }
 
-async fn run(#[cfg(target_os = "linux")] passed: zoter::Passed) -> Result<()> {
+async fn run(
+    runtime: &LocalRuntime,
+    #[cfg(target_os = "linux")] passed: zoter::Passed,
+) -> Result<()> {
     let mut args = Args::parse();
     let config = read_config(&args, Path::new(SESSION_CONFIG))?;
 
@@ -104,10 +111,7 @@ async fn run(#[cfg(target_os = "linux")] passed: zoter::Passed) -> Result<()> {
     // SIGTERM is what service managers, such as systemd, and `kill` send to stop a service. Taking
     // the signals over before the bus listens, and so before anyone can tell that it's ready, has
     // the bus clean up however soon one of them comes.
-    let mut signals = Signals::new(
-        &SharedRuntime::current()?,
-        [Signal::Interrupt, Signal::Terminate],
-    )?;
+    let mut signals = Signals::new(runtime, [Signal::Interrupt, Signal::Terminate])?;
 
     // The store of systemd, which keeps what the bus hands over to its next instance, if systemd
     // keeps one. The next instance raises its limit of open file descriptors as this one did, and

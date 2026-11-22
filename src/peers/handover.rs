@@ -17,7 +17,7 @@ use zbus::{
     names::{OwnedUniqueName, OwnedWellKnownName},
     Type,
 };
-use zruntime::{spawn, SharedRuntime};
+use zruntime::spawn_local;
 
 use super::{Peers, Routing, Served};
 use crate::{
@@ -26,7 +26,7 @@ use crate::{
     match_rules::MatchRules,
     name_registry::{NameOwner, NameRegistry},
     peer::{unique_name, Caller, Client, HandedOver, Monitor, Peer, Stream},
-    warn,
+    runtime, warn,
 };
 
 impl Peers {
@@ -49,7 +49,7 @@ impl Peers {
     /// paused, it takes no more clients: if a client's handshake is still under way by then, the
     /// bus disconnects it at once, as [`Peers::add`] says.
     pub(crate) async fn pause(&self, timeout: Duration) -> Result<()> {
-        let runtime = SharedRuntime::current()?;
+        let runtime = runtime::local()?;
         let deadline = Instant::now() + timeout;
         {
             let mut routing = self.routing_mut().await;
@@ -364,7 +364,7 @@ impl Peers {
         let unique_name = monitor.client().unique_name().clone();
         let listener = monitor.client().listen_cancellation();
         routing.monitors.insert(unique_name.clone(), monitor);
-        spawn(self.clone().serve_monitor(reader, listener, unique_name)).detach();
+        spawn_local(self.clone().serve_monitor(reader, listener, unique_name)).detach();
     }
 
     /// Serve on the clients, peers and monitors, that went while the bus paused, once the tasks
@@ -414,11 +414,11 @@ impl Peers {
     #[track_caller]
     fn spawn_chore<F>(&self, future: F)
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        F: Future + 'static,
+        F::Output: 'static,
     {
         let chore = self.chore();
-        spawn(async move {
+        spawn_local(async move {
             let _chore = chore;
 
             future.await

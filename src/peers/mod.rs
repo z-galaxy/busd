@@ -1,7 +1,8 @@
 use std::{
     fmt, iter,
     ops::{Deref, DerefMut},
-    sync::{Arc, Weak},
+    rc::{self, Rc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,7 +12,7 @@ use zbus::{fdo::ConnectionCredentials, names::UniqueName, Message, OwnedGuid};
 use zruntime::Event;
 use zruntime::{
     lock::{self, RwLock},
-    spawn, unblock,
+    spawn_local, unblock,
 };
 
 #[cfg(target_os = "linux")]
@@ -62,17 +63,18 @@ pub use stats::{ConnectionCounts, Counts};
 /// others. The calls to the bus go to the queue of the task that answers them, as the messages for
 /// a peer go to its socket.
 ///
-/// A handle: cheap to clone, and all clones refer to the same peers.
+/// A handle: cheap to clone, and all clones refer to the same peers. It stays on the thread that
+/// runs the bus, whose `LocalRuntime` runs every task of the bus.
 #[derive(Clone, Debug)]
 pub struct Peers {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 /// A [`Peers`] that doesn't keep the peers alive. The task that answers the calls to the bus holds
 /// one, so that the task goes once the peers go.
 #[derive(Clone, Debug)]
 pub struct WeakPeers {
-    inner: Weak<Inner>,
+    inner: rc::Weak<Inner>,
 }
 
 impl Peers {
@@ -80,6 +82,11 @@ impl Peers {
     /// the bus.
     ///
     /// The task goes once the peers go.
+    ///
+    /// # Panics
+    ///
+    /// If the calling thread runs no `LocalRuntime`, which runs the task that answers the calls to
+    /// the bus.
     pub fn new(guid: OwnedGuid) -> Self {
         let users = Users::new(MAX_OBJECTS);
         let uid = rustix::process::getuid().as_raw();
@@ -92,7 +99,7 @@ impl Peers {
             policy: PeerPolicy::unrestricted(),
         };
         let peers = Self {
-            inner: Arc::new(Inner {
+            inner: Rc::new(Inner {
                 routing: RwLock::new(Routing::default()),
                 itself,
                 users,
@@ -108,6 +115,8 @@ impl Peers {
             }),
         };
         peers.answer_calls(guid, queue);
+        #[cfg(any(test, feature = "testing"))]
+        crate::testing::track(&peers);
 
         peers
     }
@@ -115,7 +124,7 @@ impl Peers {
     /// A handle that doesn't keep the peers alive.
     pub fn downgrade(&self) -> WeakPeers {
         WeakPeers {
-            inner: Arc::downgrade(&self.inner),
+            inner: Rc::downgrade(&self.inner),
         }
     }
 
@@ -341,10 +350,11 @@ impl Peers {
             return;
         }
         let served = Served::new(&peer);
-        spawn(
-            self.clone()
-                .serve_peer(peer_stream, peer.client().listen_cancellation(), served),
-        )
+        spawn_local(self.clone().serve_peer(
+            peer_stream,
+            peer.client().listen_cancellation(),
+            served,
+        ))
         .detach();
         routing.insert_peer(unique_name, peer);
     }

@@ -7,7 +7,7 @@ use zbus::{
     connection::handshake::{AuthMechanism, Command},
     OwnedGuid,
 };
-use zruntime::{net::unix::UnixStream, Shared};
+use zruntime::{net::unix::UnixStream, Local};
 
 use super::{socket, Reader};
 use crate::trace;
@@ -33,7 +33,7 @@ use crate::trace;
 /// - EOF.
 pub(super) async fn authenticate(
     reader: &mut Reader,
-    stream: &UnixStream<Shared>,
+    stream: &UnixStream<Local>,
     guid: &OwnedGuid,
     uid: u32,
 ) -> zbus::Result<bool> {
@@ -153,7 +153,7 @@ enum Awaiting {
 }
 
 /// Write `answer` to the client of `stream`, as a line.
-async fn write(stream: &UnixStream<Shared>, answer: &Command) -> zbus::Result<()> {
+async fn write(stream: &UnixStream<Local>, answer: &Command) -> zbus::Result<()> {
     let line = format!("{answer}\r\n");
     let mut written = 0;
     while written < line.len() {

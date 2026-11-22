@@ -60,7 +60,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use busd::bus::Bus;
+use busd::{bus::Bus, peers::WeakPeers};
 use calls::Caller;
 use cpus::{Cpu, Cpus};
 use crew::{AbortOnPanic, Crew, Member, Rounds};
@@ -73,7 +73,7 @@ use handover::{IdleClients, Restart, RestartingBus};
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 use shared::SharedConnection;
 use zbus::{connection, names::BusName};
-use zruntime::{mpmc, SharedRuntime};
+use zruntime::{mpmc, LocalRuntime, SharedRuntime};
 
 #[path = "common/calls.rs"]
 mod calls;
@@ -537,7 +537,8 @@ impl BusThread {
         let thread = thread::spawn(move || {
             let _abort = AbortOnPanic;
             let _pinned = cpu.map(Cpu::pin);
-            zruntime::block_on(async move {
+            let runtime = LocalRuntime::new().expect("the runtime of the bus");
+            runtime.block_on(async move {
                 let mut bus = Bus::for_address(Some(&bus_address)).await.expect("a bus");
                 listening
                     .send(())
@@ -550,9 +551,11 @@ impl BusThread {
                         panic!("the bus stopped before it was asked to: {ran:?}");
                     }
                 }
+                let peers = bus.peers().downgrade();
                 bus.cleanup()
                     .await
                     .expect("the socket of the bus is removed");
+                until_gone(peers).await;
             });
         });
         listens.recv().expect("the bus listens");
@@ -575,6 +578,39 @@ impl Drop for BusThread {
         }
     }
 }
+
+/// Waits until the bus of `peers`, which was stopped, is gone with all of its tasks, looking every
+/// `GONE_LOOK`.
+///
+/// The task that serves a client ends once it reads the client's EOF, and every id lets the
+/// connections of its clients and services go before it stops its bus. A task of the bus that is
+/// still there when the bus's thread leaves `LocalRuntime::block_on` would never run again. It
+/// would keep the bus's runtime, with the bus's end of each connection, open in the process for the
+/// ids that follow.
+///
+/// # Panics
+///
+/// If the bus is still there after `GONE_LIMIT`. A client that the id left connected, or a task of
+/// the bus that never ends, keeps it there. The panic ends the process.
+async fn until_gone(peers: WeakPeers) {
+    let runtime = LocalRuntime::running().expect("the runtime of the thread of the bus");
+    let gone = async {
+        while peers.upgrade().is_some() {
+            runtime.sleep(GONE_LOOK).await;
+        }
+    };
+
+    runtime
+        .timeout(GONE_LIMIT, gone)
+        .await
+        .expect("the bus goes once its clients did");
+}
+
+/// How often `until_gone` looks whether the bus is gone.
+const GONE_LOOK: Duration = Duration::from_millis(10);
+
+/// How long `until_gone` waits for the bus to be gone, far longer than that takes.
+const GONE_LIMIT: Duration = Duration::from_secs(60);
 
 /// The services of an id, on up to `THREADS` threads of their own, which serve their methods until
 /// this is dropped.

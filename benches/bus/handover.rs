@@ -28,9 +28,9 @@ use rustix::{
 };
 use zbus::connection;
 use zoter::{testing, Passed, Store};
-use zruntime::mpmc;
+use zruntime::{mpmc, LocalRuntime};
 
-use super::{socket_path, within_limit, AbortOnPanic, Cpu};
+use super::{socket_path, until_gone, within_limit, AbortOnPanic, Cpu};
 
 /// How the bus restarts in the ids of `handover/`.
 #[derive(Clone, Copy)]
@@ -71,7 +71,8 @@ impl RestartingBus {
                 Restart::InProcess => None,
                 Restart::FdStore => Some(FakeSystemd::start(systemd_cpu, &path)),
             };
-            zruntime::block_on(async move {
+            let runtime = LocalRuntime::new().expect("the runtime of the bus");
+            runtime.block_on(async move {
                 // The store that the bus hands over through, which a bus is given as it starts.
                 let mut store = systemd.as_ref().map(FakeSystemd::store);
                 let bus = match &systemd {
@@ -122,9 +123,11 @@ impl RestartingBus {
                 }
                 // A bus on the listening socket of the fake systemd leaves its file be, for the
                 // fake to remove.
+                let peers = bus.peers().downgrade();
                 bus.cleanup()
                     .await
                     .expect("the socket of the bus is removed");
+                until_gone(peers).await;
             });
         });
         listens.recv().expect("the bus listens");

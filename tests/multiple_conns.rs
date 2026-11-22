@@ -12,7 +12,7 @@ use zbus::connection;
 fn multi_connect() {
     init_tracing();
 
-    zruntime::block_on(with_bus(|address| async move {
+    busd::testing::block_on(with_bus(|address| async move {
         multi_clients_connect(&address).await
     }));
 }

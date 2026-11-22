@@ -26,7 +26,7 @@ use zbus::{connection, fdo::DBusProxy};
 #[test]
 #[timeout(30000)]
 fn socket_file() {
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let path = socket_path();
         let listener = UnixListener::bind(&path).unwrap();
 
@@ -46,7 +46,7 @@ fn socket_file() {
 #[test]
 #[timeout(30000)]
 fn abstract_socket() {
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let name = random_name();
         let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = UnixListener::bind_addr(&addr).unwrap();
@@ -65,7 +65,7 @@ fn abstract_socket() {
 #[test]
 #[timeout(30000)]
 fn tcp_socket_is_refused() {
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 
         let error = Bus::for_listener(OwnedFd::from(listener))
@@ -84,7 +84,7 @@ fn tcp_socket_is_refused() {
 #[test]
 #[timeout(30000)]
 fn socket_that_does_not_listen() {
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let (socket, _peer) = UnixStream::pair().unwrap();
 
         let error = Bus::for_listener(OwnedFd::from(socket)).await.unwrap_err();

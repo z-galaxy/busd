@@ -41,7 +41,7 @@ use crate::{
 #[test]
 #[timeout(30000)]
 fn last_signal_of_a_client_that_closes_its_end_is_handed_over() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         let (receiver, _) = connect(&bus, 1).await;
@@ -99,7 +99,7 @@ fn last_signal_of_a_client_that_closes_its_end_is_handed_over() {
 #[test]
 #[timeout(30000)]
 fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         let rule = MatchRule::builder()
@@ -176,7 +176,7 @@ fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
 #[test]
 #[timeout(30000)]
 fn bus_hands_over_once_the_calls_under_way_are_answered() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         let (caller, _socket) = connect(&bus, 1).await;
@@ -190,7 +190,7 @@ fn bus_hands_over_once_the_calls_under_way_are_answered() {
         caller.send(&pass).await.unwrap();
         peers.hook().gate.reached().await;
         peers.pause(STOP_TIMEOUT).await.unwrap();
-        let runtime = SharedRuntime::current().unwrap();
+        let runtime = runtime::local().unwrap();
         let mut settling = pin!(peers.settle());
         let settled = runtime
             .timeout(Duration::from_millis(200), settling.as_mut())
@@ -214,7 +214,7 @@ fn bus_hands_over_once_the_calls_under_way_are_answered() {
 #[test]
 #[timeout(30000)]
 fn signal_that_follows_a_reply_is_part_of_the_call() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         let (caller, _socket) = connect(&bus, 1).await;
@@ -230,7 +230,7 @@ fn signal_that_follows_a_reply_is_part_of_the_call() {
         // The bus sent the reply, and the signal waits at the gate.
         peers.hook().follow.reached().await;
         peers.pause(STOP_TIMEOUT).await.unwrap();
-        let runtime = SharedRuntime::current().unwrap();
+        let runtime = runtime::local().unwrap();
         let mut settling = pin!(peers.settle());
         let settled = runtime
             .timeout(Duration::from_millis(200), settling.as_mut())
@@ -287,7 +287,7 @@ fn signal_that_follows_a_reply_is_part_of_the_call() {
 #[timeout(30000)]
 fn calls_to_the_bus_get_one_reply_each_across_a_hand_over() {
     for carry in [Carry::AsItIs, Carry::Records] {
-        zruntime::block_on(one_reply_each_across_a_hand_over(carry));
+        crate::testing::block_on(one_reply_each_across_a_hand_over(carry));
     }
 }
 
@@ -377,7 +377,7 @@ async fn one_reply_each_across_a_hand_over(carry: Carry) {
 #[test]
 #[timeout(30000)]
 fn reload_under_way_holds_a_hand_over_up() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let mut bus = Bus::for_address(Some(&address())).await.unwrap();
         let (reload, blocked) = BlockedReload::new();
         bus.set_reload(reload).await;
@@ -391,7 +391,7 @@ fn reload_under_way_holds_a_hand_over_up() {
         caller.send(&get_id).await.unwrap();
         let reloading = blocked.started().await;
         peers.pause(STOP_TIMEOUT).await.unwrap();
-        let runtime = SharedRuntime::current().unwrap();
+        let runtime = runtime::local().unwrap();
         let mut settling = pin!(peers.settle());
         let settled = runtime
             .timeout(Duration::from_millis(200), settling.as_mut())
@@ -413,7 +413,7 @@ fn reload_under_way_holds_a_hand_over_up() {
 #[test]
 #[timeout(30000)]
 fn pause_ends_once_the_clients_paused() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         let _first = connect(&bus, 1).await;
@@ -447,14 +447,14 @@ fn pause_ends_once_the_clients_paused() {
 #[test]
 #[timeout(30000)]
 fn peer_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
-    zruntime::block_on(goes_while_the_bus_pauses(false));
+    crate::testing::block_on(goes_while_the_bus_pauses(false));
 }
 
 /// As with `peer_that_goes_while_the_bus_pauses_holds_it_up_no_longer`, for a monitor.
 #[test]
 #[timeout(30000)]
 fn monitor_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
-    zruntime::block_on(goes_while_the_bus_pauses(true));
+    crate::testing::block_on(goes_while_the_bus_pauses(true));
 }
 
 /// A client still in the middle of its handshake once the bus is done pausing, as it hands
@@ -463,7 +463,7 @@ fn monitor_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
 #[test]
 #[timeout(30000)]
 fn a_handshake_under_way_once_the_bus_paused_is_cut_off() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         // The client is the one object of its user.
@@ -534,7 +534,7 @@ fn a_handshake_under_way_once_the_bus_paused_is_cut_off() {
 #[test]
 #[timeout(30000)]
 fn client_that_the_bus_disconnects_once_it_paused_is_left_out() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         let (receiver, socket) = connect(&bus, 1).await;
@@ -578,7 +578,7 @@ fn client_that_the_bus_disconnects_once_it_paused_is_left_out() {
 #[test]
 #[timeout(30000)]
 fn client_whose_connection_is_still_held_is_disconnected() {
-    zruntime::block_on(async {
+    crate::testing::block_on(async {
         let bus = Bus::for_address(Some(&address())).await.unwrap();
         let peers = bus.peers().clone();
         let (receiver, mut socket) = connect(&bus, 1).await;

@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use zbus::names::OwnedUniqueName;
 use zruntime::{Event, EventListener};
 #[cfg(target_os = "linux")]
-use zruntime::{Shared, Task};
+use zruntime::{Local, Task};
 
 use crate::{connection::Connection, match_rules::MatchRules, user::Charge};
 #[cfg(target_os = "linux")]
@@ -18,7 +18,7 @@ use super::Recipient;
 /// connection and what the bus needs to serve the client and to hand it over.
 #[derive(Debug)]
 pub struct Client {
-    connection: Arc<Connection>,
+    connection: Rc<Connection>,
     recipient: Recipient,
     id: usize,
     unique_name: OwnedUniqueName,
@@ -36,7 +36,7 @@ pub struct Client {
     /// The task that writes to the client what the previous instance of the bus left unwritten,
     /// while that task runs. See [`Client::flush`].
     #[cfg(target_os = "linux")]
-    flushing: Option<Task<(), Shared>>,
+    flushing: Option<Task<(), Local>>,
 }
 
 impl Client {
@@ -131,7 +131,7 @@ impl Client {
 
             (connection, paused?)
         };
-        let connection = match Arc::try_unwrap(connection) {
+        let connection = match Rc::try_unwrap(connection) {
             Ok(connection) => connection,
             Err(connection) => {
                 warn!(
@@ -152,7 +152,7 @@ impl Client {
     /// connection, and the bus sends messages to the client through the connection. The client has
     /// `match_rules`, and `charge` counts the client as an object of its user.
     pub(super) fn new(
-        connection: Arc<Connection>,
+        connection: Rc<Connection>,
         id: usize,
         match_rules: MatchRules,
         charge: Charge,

@@ -11,7 +11,7 @@ pub use pending_calls::*;
 
 use crate::trace;
 use anyhow::{Context, Result};
-use std::{sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 use zbus::{fdo::ConnectionCredentials, names::BusName, OwnedGuid, OwnedMatchRule};
 
 #[cfg(target_os = "linux")]
@@ -50,8 +50,8 @@ impl Peer {
     /// `send_timeout` to take each message. The peer is of `user`, and `charge` counts it as an
     /// object of that user.
     ///
-    /// It fails if `credentials` tell no user, if the runtime can't watch the socket, or if the
-    /// handshake does.
+    /// It fails if `credentials` tell no user, if the socket can't go on the `LocalRuntime` that
+    /// the calling thread runs, or if the handshake does.
     pub async fn new(
         guid: &OwnedGuid,
         id: usize,
@@ -70,7 +70,7 @@ impl Peer {
         let (reader, connection) =
             Connection::accept(socket, guid, uid, unique_name(id), send_timeout).await?;
         trace!("created: {:?}", connection);
-        let client = Client::new(Arc::new(connection), id, MatchRules::default(), charge);
+        let client = Client::new(Rc::new(connection), id, MatchRules::default(), charge);
 
         // The bus gives the peer its policy as it adds the peer.
         Ok(Self::assemble(
@@ -197,7 +197,7 @@ impl Peer {
     ///
     /// The peer is an object of its user among `users`, as it was in the instance that handed it
     /// over, whatever the quota of the user. It fails if its credentials can't be looked up, which
-    /// tell its user, or if the runtime can't watch its socket.
+    /// tell its user, or if its socket can't go on the `LocalRuntime` that the calling thread runs.
     #[cfg(target_os = "linux")]
     pub(crate) async fn handed_over(
         client: HandedOver,
@@ -227,7 +227,7 @@ impl Peer {
         let (reader, connection) = Connection::taken_over(handover, unique_name(id), send_timeout)?;
         trace!("handed over: {:?}", connection);
         let charge = Charge::taken_over(&user, &user);
-        let client = Client::new(Arc::new(connection), id, match_rules, charge);
+        let client = Client::new(Rc::new(connection), id, match_rules, charge);
 
         // The bus gives the peer its policy as it adds the peer.
         Ok(Self::assemble(

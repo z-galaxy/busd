@@ -23,15 +23,16 @@ use std::{
     net::Shutdown,
     os::fd::AsFd,
     pin::pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    rc::Rc,
+    sync::{Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
 use futures_util::future::{select, Either};
 use zbus::{names::OwnedUniqueName, Message, OwnedGuid};
-use zruntime::{net::unix::UnixStream, Event, Shared, SharedRuntime};
+use zruntime::{net::unix::UnixStream, Event, Local};
 
-use crate::{debug, warn};
+use crate::{debug, runtime, warn};
 use write::Outgoing;
 #[cfg(target_os = "linux")]
 use write::State;
@@ -52,7 +53,7 @@ use write::State;
 /// it closes (`Connection::close`).
 #[derive(Debug)]
 pub struct Connection {
-    socket: Arc<UnixStream<Shared>>,
+    socket: Rc<UnixStream<Local>>,
     unique_name: OwnedUniqueName,
     fd_passing: bool,
     timeout: Duration,
@@ -72,12 +73,13 @@ impl Connection {
     /// the start of its first message, and the `Reader` yields that first. The `Connection` gives
     /// the client `timeout` to take each send. The client goes by `unique_name`.
     ///
-    /// The socket goes on the shared runtime of zruntime that runs the calling code.
+    /// The socket goes on the `LocalRuntime` that runs the calling code.
     ///
     /// # Errors
     ///
-    /// Fails if the runtime can't watch the socket, or if the handshake fails, such as on a line
-    /// that holds no command of the protocol, or on EOF before `BEGIN`.
+    /// Fails if the calling thread runs no `LocalRuntime`, if the runtime can't watch the socket,
+    /// or if the handshake fails, such as on a line that holds no command of the protocol, or on
+    /// EOF before `BEGIN`.
     pub async fn accept(
         socket: std::os::unix::net::UnixStream,
         guid: &OwnedGuid,
@@ -85,7 +87,7 @@ impl Connection {
         unique_name: OwnedUniqueName,
         timeout: Duration,
     ) -> zbus::Result<(Reader, Self)> {
-        let socket = Arc::new(UnixStream::from_std(&SharedRuntime::current()?, socket)?);
+        let socket = Rc::new(UnixStream::from_std(&runtime::local()?, socket)?);
         let mut reader = Reader::new(socket.clone());
         let fd_passing = handshake::authenticate(&mut reader, &socket, guid, uid).await?;
 
@@ -99,11 +101,12 @@ impl Connection {
     /// anything else, as part of the next send or flush. The client goes by `unique_name`, and the
     /// bus gives it `timeout` to take each send.
     ///
-    /// The socket goes on the shared runtime of zruntime that runs the calling code.
+    /// The socket goes on the `LocalRuntime` that runs the calling code.
     ///
     /// # Errors
     ///
-    /// Fails if the runtime can't watch the socket.
+    /// Fails if the calling thread runs no `LocalRuntime`, or if the runtime can't watch the
+    /// socket.
     #[cfg(target_os = "linux")]
     pub fn taken_over(
         handover: Handover,
@@ -119,7 +122,7 @@ impl Connection {
             kept,
         } = handover;
         let socket = std::os::unix::net::UnixStream::from(socket);
-        let socket = Arc::new(UnixStream::from_std(&SharedRuntime::current()?, socket)?);
+        let socket = Rc::new(UnixStream::from_std(&runtime::local()?, socket)?);
         let reader = Reader::taken_over(socket.clone(), unread, unread_fds);
         let outgoing = Outgoing::taken_over(rest, kept);
 
@@ -134,7 +137,7 @@ impl Connection {
     /// The client goes by `unique_name`, and takes file descriptors if `fd_passing`. The bus gives
     /// the client `timeout` to take each send.
     pub fn new(
-        socket: Arc<UnixStream<Shared>>,
+        socket: Rc<UnixStream<Local>>,
         unique_name: OwnedUniqueName,
         fd_passing: bool,
         timeout: Duration,
@@ -302,7 +305,7 @@ impl Connection {
     /// The connection of the client at the other end of `socket`, as [`Connection::new`] makes it,
     /// with `outgoing` to write.
     fn with_outgoing(
-        socket: Arc<UnixStream<Shared>>,
+        socket: Rc<UnixStream<Local>>,
         unique_name: OwnedUniqueName,
         fd_passing: bool,
         timeout: Duration,

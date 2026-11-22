@@ -32,7 +32,7 @@ use zruntime::SharedRuntime;
 fn greet() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         // Unix socket
         greet_(&unix_address()).await;
 
@@ -50,7 +50,7 @@ fn greet() {
 #[test]
 #[timeout(30000)]
 fn tcp_refused() {
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let address = "tcp:host=127.0.0.1,port=4248";
         let error = Bus::for_address(Some(address)).await.unwrap_err();
         assert_eq!(
