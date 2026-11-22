@@ -8,6 +8,12 @@ more — follow the guidelines in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - **Changelog-skip trailer**: end a commit message with a `Changelog: skip` git trailer to
   keep it out of the user-facing changelog (use for AI-workflow artifacts such as design docs
   and implementation plans).
+- **Hand-overs across versions**: until busd 1.0, a hand-over only has to work between two
+  instances of the same version of busd. Bump the version of the state that it stores whenever
+  its format changes, and let a take-over of a state of another version fail, which disconnects
+  the clients: keep no code to take over the states of earlier versions, and say so in one
+  sentence in the commit message and the pull request. zbus, at 6.x, is another matter: there,
+  backwards compatibility matters.
 
 ## Project Overview
 
