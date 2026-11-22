@@ -14,6 +14,10 @@ more — follow the guidelines in [`CONTRIBUTING.md`](CONTRIBUTING.md).
   the clients: keep no code to take over the states of earlier versions, and say so in one
   sentence in the commit message and the pull request. zbus, at 6.x, is another matter: there,
   backwards compatibility matters.
+- **Git revisions of z-galaxy projects**: busd's `main` may build on a git revision of another
+  z-galaxy project, such as zbus or zoter, through `[patch.crates-io]`, until a release of that
+  project has what busd needs. Only a release of busd waits for theirs, as `cargo package`
+  drops the patch.
 
 ## Project Overview
 
