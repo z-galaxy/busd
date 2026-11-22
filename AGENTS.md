@@ -22,6 +22,11 @@ tasks with `zruntime::spawn_local`. The tests run their buses the same way, thro
 `busd::testing::block_on`, which returns only once the buses of the test are gone.
 Dropping a zruntime `Task` cancels it, so a fire-and-forget task must call `.detach()`.
 
+The tasks share the state of the bus through `Rc`s and change it through `RefCell`s.
+Borrow those cells only in synchronous code, in the tests too. If a borrow is held across
+an `.await`, such as one of `Peers::routing()`, a task that borrows the same cell
+meanwhile panics, unless both borrows only read it.
+
 [zbus]: https://github.com/z-galaxy/zbus
 [zruntime]: https://github.com/z-galaxy/zruntime
 [zoter]: https://github.com/z-galaxy/zoter
@@ -75,8 +80,8 @@ argument parsing via clap). Key modules:
 - **`peer/`** — the state of one connection. A connection starts as a peer and can become a
   monitor (an eavesdropper); `client.rs` holds the state that both share.
 - **`peers/`** — the set of connected peers, as a handle that the bus and the task that answers
-  the calls to it share. `routing.rs` holds the peers, the monitors and the name registry behind
-  one lock.
+  the calls to it share. `routing.rs` holds the peers, the monitors and the name registry in one
+  `RefCell`.
   `serve.rs` is the task that reads a peer's messages, `forward.rs` picks the recipients of each
   message, and `outbox.rs` collects what a batch sends to each recipient. `chores.rs` counts the
   bus's own work, such as the calls to the bus that it has yet to answer, which a hand-over waits

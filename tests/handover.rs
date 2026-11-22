@@ -1321,10 +1321,10 @@ async fn emit_chunks(conn: Connection, member: String, count: u32) -> zbus::Resu
 async fn until_stalled(peers: &Peers, receivers: &[&Connection]) {
     let runtime = SharedRuntime::current().unwrap();
     within(async {
-        let mut before = unwritten_lens(peers, receivers).await;
+        let mut before = unwritten_lens(peers, receivers);
         loop {
             runtime.sleep(STALL_LOOK).await;
-            let now = unwritten_lens(peers, receivers).await;
+            let now = unwritten_lens(peers, receivers);
             if now == before && now.iter().all(|len| *len > 0) {
                 return;
             }
@@ -1335,8 +1335,8 @@ async fn until_stalled(peers: &Peers, receivers: &[&Connection]) {
 }
 
 /// How many bytes the bus of `peers` has left to write to each of `receivers`.
-async fn unwritten_lens(peers: &Peers, receivers: &[&Connection]) -> Vec<usize> {
-    let routing = peers.routing().await;
+fn unwritten_lens(peers: &Peers, receivers: &[&Connection]) -> Vec<usize> {
+    let routing = peers.routing();
 
     receivers
         .iter()

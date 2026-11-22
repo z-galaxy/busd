@@ -43,18 +43,14 @@ impl Peers {
         let Some(owner) = header.sender().map(|sender| sender.to_owned()) else {
             return Err(Error::Failed("The call has no sender".to_string()));
         };
-        self.ensure_privileged(&owner).await?;
+        self.ensure_privileged(&owner)?;
         if !self.make_monitor(&owner, match_rules).await {
             return Err(Error::NameHasNoOwner(format!("No such peer: {owner}")));
         }
         debug!("{} became a monitor", owner);
         let reply = super::reply(header, &())?;
         // The names pass on to the peers that queue for them, as when their owner goes.
-        let mut changes = self
-            .routing_mut()
-            .await
-            .names_mut()
-            .release_all(owner.clone());
+        let mut changes = self.routing_mut().names_mut().release_all(owner.clone());
         changes.push(NameOwnerChanged::vanished(owner.into()));
 
         Ok(Answer {

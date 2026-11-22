@@ -312,10 +312,10 @@ async fn stall_holds_up_no_one_else_(address: String) -> anyhow::Result<()> {
     SharedRuntime::current()?.sleep(SHORT_TIMEOUT).await;
     ensure!(!flooding.is_finished(), "the flood didn't wait");
 
-    // Meanwhile, which takes each lock of the bus to change what it holds: a client connects, asks
-    // for a name and releases it, and for the credentials of the stalled client, which a lookup
-    // through the connection of that client would wait for the flood to go on for, and gets a
-    // signal from another one, and a third one becomes a monitor.
+    // Meanwhile, which borrows each part of the state of the bus to change it: a client connects,
+    // asks for a name and releases it, and for the credentials of the stalled client, which a
+    // lookup through the connection of that client would wait for the flood to go on for, and gets
+    // a signal from another one, and a third one becomes a monitor.
     let stalled_name = BusName::from(stalled.unique_name().context("no unique name")?.clone());
     let runtime = SharedRuntime::current()?;
     runtime

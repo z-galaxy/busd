@@ -52,7 +52,7 @@ impl Peers {
         let runtime = runtime::local()?;
         let deadline = Instant::now() + timeout;
         {
-            let mut routing = self.routing_mut().await;
+            let mut routing = self.routing_mut();
             routing.handing_over = true;
             for client in routing.clients_mut() {
                 client.pause();
@@ -75,8 +75,9 @@ impl Peers {
             // check isn't missed.
             let paused_changed = self.inner.paused_changed.listen();
             {
-                // Under the lock that adding a client takes, so that none comes in between.
-                let mut routing = self.routing_mut().await;
+                // The look and the seal take one borrow of the routing, as adding a client does, so
+                // that no client comes in between.
+                let mut routing = self.routing_mut();
                 if paused(&mut routing) {
                     routing.sealed = true;
                     self.inner.sealed.notify(usize::MAX);
@@ -98,7 +99,7 @@ impl Peers {
             loop {
                 // The listener comes first, so that a seal right after the check isn't missed.
                 let listener = self.inner.sealed.listen();
-                if self.routing().await.sealed {
+                if self.routing().sealed {
                     return;
                 }
                 listener.await;
@@ -130,7 +131,7 @@ impl Peers {
         loop {
             let started = self.inner.chores.done().await;
             // Each client that went is served on as a chore, so the bus isn't settled until then.
-            self.serve_gone().await;
+            self.serve_gone();
             if self.inner.chores.settled_since(started) {
                 return;
             }
@@ -152,8 +153,8 @@ impl Peers {
     ///
     /// The bus lets go of the other clients without disconnecting them: nothing more goes to them
     /// from this instance of the bus.
-    pub(crate) async fn hand_over(&self) -> (Snapshot, Vec<ClientHandover>) {
-        let mut routing = self.routing_mut().await;
+    pub(crate) fn hand_over(&self) -> (Snapshot, Vec<ClientHandover>) {
+        let mut routing = self.routing_mut();
         let routing = &mut *routing;
         let mut handed_over = Vec::new();
         let mut peers = Vec::new();
@@ -291,7 +292,7 @@ impl Peers {
             }
         }
         {
-            let mut routing = self.routing_mut().await;
+            let mut routing = self.routing_mut();
             for NameState { name, owners } in names {
                 let mut owners = owners
                     .into_iter()
@@ -381,8 +382,8 @@ impl Peers {
     /// client anything before this finds it gone, as the send fails. So the bus serves the clients
     /// that went here, while their recipients are still its clients, and leaves only those that go
     /// after that to the hand-over. The next instance serves those clients until their EOF.
-    async fn serve_gone(&self) {
-        let mut guard = self.routing_mut().await;
+    fn serve_gone(&self) {
+        let mut guard = self.routing_mut();
         let routing = &mut *guard;
         for peer in routing.peers.values_mut() {
             let Some(reader) = peer.client_mut().take_reader_if_gone() else {

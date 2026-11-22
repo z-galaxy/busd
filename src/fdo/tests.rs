@@ -301,7 +301,7 @@ fn reload_holds_later_calls_back() {
     crate::testing::block_on(async {
         let (reload, blocked) = BlockedReload::new();
         let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
-        bus.set_reload(reload).await;
+        bus.set_reload(reload);
 
         with(bus, |bus| async move {
             let conn = connect(bus.address()).await?;

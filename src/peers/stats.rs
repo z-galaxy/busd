@@ -11,9 +11,9 @@ impl Peers {
     /// What the bus counts for the `GetStats` method of its `org.freedesktop.DBus.Debug.Stats`
     /// interface.
     ///
-    /// This goes over all the peers, once, under the read lock of the routing.
-    pub async fn counts(&self) -> Counts {
-        let routing = self.routing().await;
+    /// This goes over all the peers, once, in one borrow of the routing.
+    pub fn counts(&self) -> Counts {
+        let routing = self.routing();
         let mut greeted = 0;
         let mut not_greeted = 0;
         for peer in routing.peers.values() {
@@ -44,8 +44,8 @@ impl Peers {
     ///
     /// A monitor is no peer, so there is nothing for its name. A client that has yet to say
     /// `Hello` is a peer like any other for this, as it is for `GetNameOwner`.
-    pub async fn connection_counts(&self, name: &BusName<'_>) -> Option<ConnectionCounts> {
-        let routing = self.routing().await;
+    pub fn connection_counts(&self, name: &BusName<'_>) -> Option<ConnectionCounts> {
+        let routing = self.routing();
         let unique_name = match name {
             BusName::Unique(name) => name.as_str(),
             BusName::WellKnown(name) => routing.name_registry.lookup(name)?.as_str(),
@@ -67,9 +67,9 @@ impl Peers {
     ///
     /// A peer without match rules has an empty list, and a monitor has none, as it is no peer. A
     /// client that has yet to say `Hello` is listed like any other peer, as `ListNames` lists it.
-    /// This goes over all the peers and their rules, once, under the read lock of the routing.
-    pub async fn all_match_rules(&self) -> HashMap<OwnedUniqueName, Vec<OwnedMatchRule>> {
-        let routing = self.routing().await;
+    /// This goes over all the peers and their rules, once, in one borrow of the routing.
+    pub fn all_match_rules(&self) -> HashMap<OwnedUniqueName, Vec<OwnedMatchRule>> {
+        let routing = self.routing();
 
         routing
             .peers

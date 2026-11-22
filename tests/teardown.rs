@@ -104,10 +104,10 @@ async fn flood(sender: Connection) -> zbus::Result<()> {
 async fn until_stalled(peers: &Peers, receiver: &Connection) {
     let runtime = SharedRuntime::current().unwrap();
     within(async {
-        let mut before = unwritten_len(peers, receiver).await;
+        let mut before = unwritten_len(peers, receiver);
         loop {
             runtime.sleep(Duration::from_millis(10)).await;
-            let now = unwritten_len(peers, receiver).await;
+            let now = unwritten_len(peers, receiver);
             if now == before && now > 0 {
                 return;
             }
@@ -118,9 +118,9 @@ async fn until_stalled(peers: &Peers, receiver: &Connection) {
 }
 
 /// How many bytes the bus of `peers` has left to write to `receiver`.
-async fn unwritten_len(peers: &Peers, receiver: &Connection) -> usize {
+fn unwritten_len(peers: &Peers, receiver: &Connection) -> usize {
     let name = receiver.unique_name().unwrap();
-    let routing = peers.routing().await;
+    let routing = peers.routing();
 
     routing
         .peer(name.as_str())

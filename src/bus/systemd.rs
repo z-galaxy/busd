@@ -149,7 +149,7 @@ impl Bus {
             }
         };
         // A bus that took over goes by the policy already, and any other has no clients yet.
-        bus.set_policy(policy).await;
+        bus.set_policy(policy);
 
         Ok(bus)
     }

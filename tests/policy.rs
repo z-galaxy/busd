@@ -230,6 +230,16 @@ fn forwards_during_a_reload() {
     busd::testing::block_on(with_bus("", forwards_during_a_reload_));
 }
 
+/// If the bus is told how to read its policy during a reload, the next reload reads it that way.
+#[test]
+#[instrument]
+#[timeout(30000)]
+fn set_reload_during_a_reload() {
+    init_tracing();
+
+    busd::testing::block_on(with_bus("", set_reload_during_a_reload_));
+}
+
 /// The signals of the bus are subject to the policy of their receivers.
 #[test]
 #[instrument]
@@ -489,7 +499,7 @@ async fn set_policy_applies_to_connected_peers_(bus: TestBus) -> anyhow::Result<
             <deny own="*"/>
         </policy>"#
     );
-    bus.peers().set_policy(Rc::new(policy(&policies)?)).await;
+    bus.peers().set_policy(Rc::new(policy(&policies)?));
     let result = request_name(&dbus, "org.busd.Policy.After").await;
     ensure_denied(result, OWN_REFUSED)?;
 
@@ -511,13 +521,11 @@ async fn reload_(bus: TestBus) -> anyhow::Result<()> {
         </policy>"#
     );
     let mut read = VecDeque::from([policy(&policies)]);
-    bus.peers()
-        .set_reload(move || {
-            let next = read.pop_front();
+    bus.peers().set_reload(move || {
+        let next = read.pop_front();
 
-            next.unwrap_or_else(|| Err(anyhow!("No policy to read")))
-        })
-        .await;
+        next.unwrap_or_else(|| Err(anyhow!("No policy to read")))
+    });
     let reply = request_name(&dbus, "org.busd.Policy.Before").await?;
     ensure!(
         reply == RequestNameReply::PrimaryOwner,
@@ -553,14 +561,12 @@ async fn forwards_during_a_reload_(bus: TestBus) -> anyhow::Result<()> {
     // The bus reads its policy for as long as the test holds the read up.
     let (started, starts) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
-    bus.peers()
-        .set_reload(move || {
-            started.send(()).ok();
-            released.recv().ok();
+    bus.peers().set_reload(move || {
+        started.send(()).ok();
+        released.recv().ok();
 
-            Ok(Policy::default())
-        })
-        .await;
+        Ok(Policy::default())
+    });
     let reloading = zruntime::spawn({
         let conn = sender.clone();
         async move { call(&conn, BUS_NAME, BUS_PATH, BUS_NAME, "ReloadConfig").await }
@@ -574,6 +580,41 @@ async fn forwards_during_a_reload_(bus: TestBus) -> anyhow::Result<()> {
 
     release.send(()).ok();
     reloading.await.unwrap()?;
+
+    Ok(())
+}
+
+async fn set_reload_during_a_reload_(bus: TestBus) -> anyhow::Result<()> {
+    let conn = bus.connect().await?;
+    let dbus = dbus_proxy(&conn).await?;
+    // The bus reads its policy the first way for as long as the test holds the read up. The test
+    // lets the read go at the end of the block, and drops `release` there, so that reading the
+    // policy the first way again wouldn't wait.
+    let reloading = {
+        let (started, starts) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        bus.peers().set_reload(move || {
+            started.send(()).ok();
+            released.recv().ok();
+
+            Ok(Policy::default())
+        });
+        let reloading = zruntime::spawn({
+            let conn = conn.clone();
+            async move { call(&conn, BUS_NAME, BUS_PATH, BUS_NAME, "ReloadConfig").await }
+        });
+        zruntime::unblock(move || starts.recv()).await?;
+        // The second way, which the bus is told during the read, fails.
+        bus.peers().set_reload(|| Err(anyhow!("No policy to read")));
+        release.send(()).ok();
+
+        reloading
+    };
+    reloading.await.unwrap()?;
+
+    let result = dbus.reload_config().await;
+    ensure_error(result, FAILED, "Config invalid. Reload ignored.")?;
+    dbus.get_id().await?;
 
     Ok(())
 }
@@ -863,7 +904,7 @@ where
 {
     let mut bus = Bus::for_address(Some(&unix_address())).await.unwrap();
     // Before the bus serves anyone.
-    bus.set_policy(Rc::new(policy)).await;
+    bus.set_policy(Rc::new(policy));
 
     with(bus, test).await;
 }

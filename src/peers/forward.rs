@@ -84,9 +84,10 @@ impl Peers {
         outbox: &mut Outbox,
     ) -> Result<Vec<(Message, Rejection)>> {
         let mut rejected = Vec::new();
-        // The recipients are picked under the lock, and only sent their messages without it.
+        // The recipients are picked in a borrow of the routing, and sent their messages only once
+        // the borrow ends.
         {
-            let routing = self.routing().await;
+            let routing = self.routing();
             let router = Router::new(&routing, sender, &self.inner.itself);
             for (i, msg) in msgs.iter().enumerate() {
                 if msg.message_type() == message::Type::Signal {
@@ -103,7 +104,7 @@ impl Peers {
         }
 
         let dropped = outbox.send(msgs).await;
-        self.reject_dropped(sender, dropped, &mut rejected).await;
+        self.reject_dropped(sender, dropped, &mut rejected);
 
         Ok(rejected)
     }
@@ -114,7 +115,7 @@ impl Peers {
     ///
     /// A call that its callee can't take doesn't wait for a reply. Instead, the bus answers it with
     /// an error, as dbus-broker does.
-    async fn reject_dropped(
+    fn reject_dropped(
         &self,
         sender: &Served,
         dropped: Vec<(Recipient, Message)>,
@@ -123,7 +124,7 @@ impl Peers {
         if dropped.is_empty() {
             return;
         }
-        let routing = self.routing().await;
+        let routing = self.routing();
         for (recipient, msg) in dropped {
             let primary = msg.primary_header();
             if msg.message_type() != message::Type::MethodCall
@@ -215,7 +216,7 @@ impl From<Refusal> for Rejection {
     }
 }
 
-/// Picks the recipients of one sender's messages, while the routing lock is held.
+/// Picks the recipients of one sender's messages, while the routing is borrowed.
 struct Router<'r> {
     routing: &'r Routing,
     /// The sender's state, as kept by the task that serves the sender.

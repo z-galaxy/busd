@@ -101,7 +101,7 @@ impl Peers {
         // disconnected. Remove it from the list of peers, or from that of the monitors if it became
         // one meanwhile: that, and the end of its stream, close its connection.
         {
-            let mut routing = self.routing_mut().await;
+            let mut routing = self.routing_mut();
             if routing.remove_peer(served.unique_name.as_str()).is_none() {
                 // The bus cleaned up after the peer as it turned it into a monitor, and sent the
                 // signals then.
@@ -131,7 +131,7 @@ impl Peers {
     /// the task that served it was canceled: serve the monitor that it became, unless the bus
     /// pauses to hand over, which takes the reader back.
     async fn serve_on(self, reader: Reader, unique_name: OwnedUniqueName, id: usize) {
-        let Some((reader, listener)) = self.monitor_to_serve(reader, &unique_name, id).await else {
+        let Some((reader, listener)) = self.monitor_to_serve(reader, &unique_name, id) else {
             return;
         };
 
@@ -140,16 +140,17 @@ impl Peers {
 
     /// What the task that served the peer `unique_name`, numbered `id`, whose messages `reader`
     /// reads, serves the monitor that the peer became with: `reader`, and the listener of the
-    /// cancellation of the task, taken under the lock that a pause takes, so that the task hears of
-    /// any pause that it missed. Nothing if the peer is gone, or if the bus pauses to hand over,
-    /// which takes `reader` back, as it does if the peer is still one.
-    async fn monitor_to_serve(
+    /// cancellation of the task, taken in the same borrow of the routing as the look at whether the
+    /// bus pauses, so that the task hears of any pause that it missed. Nothing if the peer is gone,
+    /// or if the bus pauses to hand over, which takes `reader` back, as it does if the peer is
+    /// still one.
+    fn monitor_to_serve(
         &self,
         reader: Reader,
         unique_name: &OwnedUniqueName,
         id: usize,
     ) -> Option<(Reader, EventListener)> {
-        let mut guard = self.routing_mut().await;
+        let mut guard = self.routing_mut();
         let routing = &mut *guard;
         #[cfg(target_os = "linux")]
         if let Some(peer) = routing.peers.get_mut(unique_name) {
@@ -193,7 +194,7 @@ impl Peers {
             // The bus pauses to hand over, which takes the reader back, unless it let go of the
             // monitor.
             #[cfg(target_os = "linux")]
-            if let Some(monitor) = self.routing_mut().await.monitors.get_mut(&unique_name) {
+            if let Some(monitor) = self.routing_mut().monitors.get_mut(&unique_name) {
                 *monitor.client_mut().paused() = Some(reader);
                 self.inner.paused_changed.notify(usize::MAX);
             }
@@ -207,7 +208,7 @@ impl Peers {
             );
         }
         // Removing the monitor, and letting go of its reader, close its connection.
-        self.routing_mut().await.monitors.remove(&unique_name);
+        self.routing_mut().monitors.remove(&unique_name);
         // A pause waits for the monitor no more.
         #[cfg(target_os = "linux")]
         self.inner.paused_changed.notify(usize::MAX);
@@ -223,12 +224,11 @@ impl Peers {
         waiting: Vec<(OwnedUniqueName, NonZeroU32)>,
     ) -> Result<()> {
         // The calls that the peer made won't get their replies to it now.
-        for peer in self.routing().await.peers.values() {
+        for peer in self.routing().peers.values() {
             peer.pending_calls().forget(id);
         }
         let names_changes = self
             .routing_mut()
-            .await
             .name_registry
             .release_all(unique_name.inner().clone());
 

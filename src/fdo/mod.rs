@@ -70,8 +70,8 @@ impl Peers {
     /// Fails unless the peer `name`, which sent a call, is privileged, as [`Peers::privileged`] has
     /// it: dbus-broker only lets those peers call the methods that this guards, whatever the policy
     /// of the configuration says.
-    async fn ensure_privileged(&self, name: &UniqueName<'_>) -> Result<()> {
-        match self.privileged(name).await {
+    fn ensure_privileged(&self, name: &UniqueName<'_>) -> Result<()> {
+        match self.privileged(name) {
             Some(true) => Ok(()),
             Some(false) => Err(Error::AccessDenied(NOT_PRIVILEGED.to_string())),
             None => Err(Error::NameHasNoOwner(format!("No such peer: {name}"))),
@@ -241,7 +241,7 @@ impl Driver {
         match (interface.as_str(), object) {
             (BUS_NAME, Object::Bus) => self.answer_dbus(peers, call, header, member).await,
             (MONITORING, Object::Bus) => self.answer_monitoring(peers, call, header, member).await,
-            (STATS, Object::Bus) => self.answer_stats(peers, call, header, member).await,
+            (STATS, Object::Bus) => self.answer_stats(peers, call, header, member),
             (INTROSPECTABLE, _) => self.answer_introspectable(header, member, object),
             (PROPERTIES, _) => self.answer_properties(call, header, member, object),
             _ => Err(Error::UnknownInterface(format!(

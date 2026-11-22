@@ -1,7 +1,4 @@
 //! The `org.freedesktop.DBus.Debug.Stats` interface.
-//!
-//! What the methods ask the peers for only takes the lock of the routing, as the methods of the
-//! `org.freedesktop.DBus` interface do.
 
 use zbus::{
     fdo::{Error, Result},
@@ -16,7 +13,7 @@ use crate::peers::{ConnectionCounts, Counts, Peers};
 impl Driver {
     /// Answer the call of `member` of the `org.freedesktop.DBus.Debug.Stats` interface, `call`,
     /// whose header is `header`.
-    pub(super) async fn answer_stats(
+    pub(super) fn answer_stats(
         &mut self,
         peers: &Peers,
         call: &Message,
@@ -26,20 +23,20 @@ impl Driver {
         match member.as_str() {
             // Statistics about the message bus itself.
             "GetStats" => {
-                let counts = peers.counts().await;
+                let counts = peers.counts();
                 self.stats_serial = self.stats_serial.wrapping_add(1);
 
                 Answer::reply(header, &BusStats::new(self.stats_serial, counts))
             }
             "GetConnectionStats" => {
                 let body = call.body();
-                let stats = self.connection_stats(peers, args(&body)?).await?;
+                let stats = self.connection_stats(peers, args(&body)?)?;
 
                 Answer::reply(header, &stats)
             }
             // The match rules of all the peers, by their unique names. A peer without match rules
             // has an empty list. The bus itself is not listed, and neither are the monitors.
-            "GetAllMatchRules" => Answer::reply(header, &peers.all_match_rules().await),
+            "GetAllMatchRules" => Answer::reply(header, &peers.all_match_rules()),
             _ => Err(unknown_method(member)),
         }
     }
@@ -49,17 +46,13 @@ impl Driver {
     ///
     /// The bus itself and monitors cannot be queried. The reply omits the counts of queued
     /// messages, bytes and file descriptors, because the bus does not track them.
-    async fn connection_stats(
-        &mut self,
-        peers: &Peers,
-        name: BusName<'_>,
-    ) -> Result<ConnectionStats> {
+    fn connection_stats(&mut self, peers: &Peers, name: BusName<'_>) -> Result<ConnectionStats> {
         if name == BUS_NAME {
             return Err(Error::InvalidArgs(
                 "`GetConnectionStats` is not meaningful for the bus itself.".to_string(),
             ));
         }
-        let Some(counts) = peers.connection_counts(&name).await else {
+        let Some(counts) = peers.connection_counts(&name) else {
             return Err(Error::NameHasNoOwner(format!(
                 "Name `{name}` has no owner."
             )));

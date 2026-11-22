@@ -69,7 +69,7 @@ impl Bus {
         let peers = self.peers.clone();
         peers.pause(STOP_TIMEOUT).await?;
         peers.settle().await;
-        let (snapshot, clients) = peers.hand_over().await;
+        let (snapshot, clients) = peers.hand_over();
         let state = State {
             guid: self.guid.clone(),
             last_id: self.next_id as u64,
@@ -128,7 +128,7 @@ impl Bus {
         let last_id = usize::try_from(state.last_id)?;
         let peers = Peers::new(guid.clone());
         // Before the bus has the clients of the hand-over, which it serves as soon as it has them.
-        peers.set_policy(policy).await;
+        peers.set_policy(policy);
         let clients: HashMap<_, _> = handover
             .clients
             .into_iter()

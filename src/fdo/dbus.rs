@@ -25,27 +25,27 @@ impl Driver {
         let body = call.body();
         let sender = sender(header)?;
         match member.as_str() {
-            "Hello" => peers.hello(header, sender).await,
+            "Hello" => peers.hello(header, sender),
             "RequestName" => {
                 let (name, flags) = args(&body)?;
 
-                peers.request_name(header, sender, name, flags).await
+                peers.request_name(header, sender, name, flags)
             }
-            "ReleaseName" => peers.release_name(header, sender, args(&body)?).await,
+            "ReleaseName" => peers.release_name(header, sender, args(&body)?),
             "GetNameOwner" => {
-                let owner = peers.name_owner(args(&body)?).await?;
+                let owner = peers.name_owner(args(&body)?)?;
 
                 Answer::reply(header, &owner)
             }
             "AddMatch" => {
                 let rule: OwnedMatchRule = args(&body)?;
-                peers.routing_mut().await.add_match_rule(sender, rule)?;
+                peers.routing_mut().add_match_rule(sender, rule)?;
 
                 Answer::reply(header, &())
             }
             "RemoveMatch" => {
                 let rule: OwnedMatchRule = args(&body)?;
-                peers.routing_mut().await.remove_match_rule(sender, rule)?;
+                peers.routing_mut().remove_match_rule(sender, rule)?;
 
                 Answer::reply(header, &())
             }
@@ -55,12 +55,12 @@ impl Driver {
                 Err(Error::NotSupported("Solaris really?".to_string()))
             }
             "GetConnectionCredentials" => {
-                let creds = peers.credentials(args(&body)?).await?;
+                let creds = peers.credentials(args(&body)?)?;
 
                 Answer::reply(header, &*creds)
             }
             "GetConnectionSELinuxSecurityContext" => {
-                let creds = peers.credentials(args(&body)?).await?;
+                let creds = peers.credentials(args(&body)?)?;
                 let Some(label) = creds.linux_security_label() else {
                     return Err(Error::SELinuxSecurityContextUnknown(
                         "Unimplemented".to_string(),
@@ -71,7 +71,7 @@ impl Driver {
             }
             "GetConnectionUnixProcessID" => {
                 let name: BusName<'_> = args(&body)?;
-                let creds = peers.credentials(name.clone()).await?;
+                let creds = peers.credentials(name.clone())?;
                 let Some(pid) = creds.process_id() else {
                     return Err(Error::UnixProcessIdUnknown(format!(
                         "Could not determine Unix process ID of `{name}`"
@@ -82,7 +82,7 @@ impl Driver {
             }
             "GetConnectionUnixUser" => {
                 let name: BusName<'_> = args(&body)?;
-                let creds = peers.credentials(name.clone()).await?;
+                let creds = peers.credentials(name.clone())?;
                 let Some(uid) = creds.unix_user_id() else {
                     return Err(Error::Failed(format!(
                         "Could not determine Unix user ID of `{name}`"
@@ -94,20 +94,20 @@ impl Driver {
             "GetId" => Answer::reply(header, &self.guid),
             // The bus starts no services, so no name can be activated.
             "ListActivatableNames" => Answer::reply(header, &Vec::<OwnedBusName>::new()),
-            "ListNames" => Answer::reply(header, &peers.names().await),
+            "ListNames" => Answer::reply(header, &peers.names()),
             "ListQueuedOwners" => {
-                let owners = peers.queued_owners(args(&body)?).await?;
+                let owners = peers.queued_owners(args(&body)?)?;
 
                 Answer::reply(header, &owners)
             }
             "NameHasOwner" => {
-                let has_owner = peers.has_owner(args(&body)?).await?;
+                let has_owner = peers.has_owner(args(&body)?)?;
 
                 Answer::reply(header, &has_owner)
             }
             "StartServiceByName" => {
                 let (name, _flags): (WellKnownName<'_>, u32) = args(&body)?;
-                if peers.has_owner(name.into()).await? {
+                if peers.has_owner(name.into())? {
                     return Answer::reply(header, &StartServiceReply::AlreadyRunning);
                 }
 
@@ -117,7 +117,7 @@ impl Driver {
             }
             "UpdateActivationEnvironment" => {
                 let _: HashMap<&str, &str> = args(&body)?;
-                peers.ensure_privileged(sender).await?;
+                peers.ensure_privileged(sender)?;
 
                 Err(Error::Failed(
                     "Service activation not yet supported".to_string(),
@@ -182,9 +182,9 @@ impl Peers {
     ///
     /// The reply comes before the signals of the peer's unique name, so that the peer has its name
     /// by the time that it gets them, as with dbus-broker.
-    async fn hello(&self, header: &Header<'_>, sender: &UniqueName<'_>) -> Result<Answer> {
+    fn hello(&self, header: &Header<'_>, sender: &UniqueName<'_>) -> Result<Answer> {
         let unique_name = {
-            let mut routing = self.routing_mut().await;
+            let mut routing = self.routing_mut();
             let peer = routing.peer_mut(sender.as_str())?;
             peer.hello()?;
 
@@ -204,7 +204,7 @@ impl Peers {
     /// Answer `RequestName` of `sender`, whose header is `header`, for `name`, with `flags`.
     ///
     /// The signals of the change of the owner of the name come before the reply.
-    async fn request_name(
+    fn request_name(
         &self,
         header: &Header<'_>,
         sender: &UniqueName<'_>,
@@ -213,7 +213,7 @@ impl Peers {
     ) -> Result<Answer> {
         ensure_not_reserved(&name)?;
         let (reply, changed) = {
-            let mut routing = self.routing_mut().await;
+            let mut routing = self.routing_mut();
             let peer = routing.peer(sender.as_str())?;
             if !peer.policy().may_own(&name) {
                 warn!(
@@ -240,7 +240,7 @@ impl Peers {
     /// Answer `ReleaseName` of `sender`, whose header is `header`, for `name`.
     ///
     /// The signals of the change of the owner of the name come before the reply.
-    async fn release_name(
+    fn release_name(
         &self,
         header: &Header<'_>,
         sender: &UniqueName<'_>,
@@ -249,7 +249,6 @@ impl Peers {
         ensure_not_reserved(&name)?;
         let (reply, changed) = self
             .routing_mut()
-            .await
             .names_mut()
             .release_name(name, sender.clone());
 
@@ -261,8 +260,8 @@ impl Peers {
     }
 
     /// Whether `name` has an owner.
-    async fn has_owner(&self, name: BusName<'_>) -> Result<bool> {
-        match self.name_owner(name).await {
+    fn has_owner(&self, name: BusName<'_>) -> Result<bool> {
+        match self.name_owner(name) {
             Ok(_) => Ok(true),
             Err(Error::NameHasNoOwner(_)) => Ok(false),
             Err(e) => Err(e),
@@ -271,15 +270,14 @@ impl Peers {
 
     /// The credentials that the bus has of the owner of `name`: those of the peer's process, or
     /// those of the bus's own process.
-    async fn credentials(&self, name: BusName<'_>) -> Result<Rc<ConnectionCredentials>> {
-        let owner = self.name_owner(name.clone()).await?;
+    fn credentials(&self, name: BusName<'_>) -> Result<Rc<ConnectionCredentials>> {
+        let owner = self.name_owner(name.clone())?;
         if owner == BUS_NAME {
             return Ok(Rc::new(own_credentials()));
         }
         // Each peer has the credentials that the bus looked up when its client connected, or when
         // the bus took the client over.
         self.routing()
-            .await
             .peer(&owner)
             .map(|peer| peer.credentials().clone())
             .map_err(|_| Error::Failed(format!("Peer `{name}` not found")))
@@ -289,8 +287,8 @@ impl Peers {
     ///
     /// For a well-known name, the owner is its primary owner. For a unique name, it is the peer of
     /// that name, or the bus itself.
-    async fn name_owner(&self, name: BusName<'_>) -> Result<OwnedUniqueName> {
-        let routing = self.routing().await;
+    fn name_owner(&self, name: BusName<'_>) -> Result<OwnedUniqueName> {
+        let routing = self.routing();
         match name {
             BusName::WellKnown(name) => routing.names().lookup(&name).cloned().ok_or_else(|| {
                 Error::NameHasNoOwner("Name is not owned by anyone. Take it!".to_string())
@@ -304,8 +302,8 @@ impl Peers {
 
     /// The names that have an owner: the unique names of the bus and of its peers, and the
     /// well-known names that are owned.
-    async fn names(&self) -> Vec<OwnedBusName> {
-        let routing = self.routing().await;
+    fn names(&self) -> Vec<OwnedBusName> {
+        let routing = self.routing();
         let bus = BusName::Unique(UniqueName::from_static_str_unchecked(BUS_NAME));
         let unique_names = routing.peer_names().map(BusName::from);
         let well_known_names = routing.names().all_names().keys().map(BusName::from);
@@ -319,9 +317,8 @@ impl Peers {
     }
 
     /// The peers that queue for `name`, in order.
-    async fn queued_owners(&self, name: WellKnownName<'_>) -> Result<Vec<OwnedUniqueName>> {
+    fn queued_owners(&self, name: WellKnownName<'_>) -> Result<Vec<OwnedUniqueName>> {
         self.routing()
-            .await
             .names()
             .waiting_list(name)
             .ok_or_else(|| {

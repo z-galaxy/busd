@@ -62,7 +62,7 @@ fn last_signal_of_a_client_that_closes_its_end_is_handed_over() {
             .unwrap();
         sender.send(&bye).await.unwrap();
         socket.shutdown(Shutdown::Write).unwrap();
-        let handed_over = HandedOver::new(bus).await;
+        let handed_over = HandedOver::new(bus);
         assert!(
             handed_over.clients.iter().any(|client| client.id == 2),
             "the client that closed its end was left out"
@@ -129,12 +129,16 @@ fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
         // a time, and `join` polls this each time that it is polled, so this runs as soon as
         // the bus waits for that chore, before the chore runs.
         let x_goes = poll_fn(|_| {
-            let taken = peers.inner.routing.try_write().is_some_and(|mut routing| {
-                routing
-                    .peers
-                    .get_mut(y_name.as_str())
-                    .is_none_or(|y| y.client_mut().paused().is_none())
-            });
+            let taken = peers
+                .inner
+                .routing
+                .try_borrow_mut()
+                .is_ok_and(|mut routing| {
+                    routing
+                        .peers
+                        .get_mut(y_name.as_str())
+                        .is_none_or(|y| y.client_mut().paused().is_none())
+                });
             if !taken {
                 return Poll::Pending;
             }
@@ -143,7 +147,7 @@ fn last_signal_of_a_client_that_a_send_fails_to_is_passed_on() {
             Poll::Ready(())
         });
         join(peers.settle(), x_goes).await;
-        let handed_over = HandedOver::new(bus).await;
+        let handed_over = HandedOver::new(bus);
 
         let _next = handed_over.take_over(Carry::AsItIs).await;
         let mut passed_on = Vec::new();
@@ -198,7 +202,7 @@ fn bus_hands_over_once_the_calls_under_way_are_answered() {
         assert!(settled.is_err(), "the bus settled with a call under way");
         peers.hook().gate.open();
         settling.await;
-        let handed_over = HandedOver::new(bus).await;
+        let handed_over = HandedOver::new(bus);
 
         let _next = handed_over.take_over(Carry::AsItIs).await;
         let ping = call_bus("GetId").build(&()).unwrap();
@@ -241,7 +245,7 @@ fn signal_that_follows_a_reply_is_part_of_the_call() {
         );
         peers.hook().follow.open();
         settling.await;
-        let handed_over = HandedOver::new(bus).await;
+        let handed_over = HandedOver::new(bus);
 
         let _next = handed_over.take_over(Carry::AsItIs).await;
         let ping = call_bus("GetId").build(&()).unwrap();
@@ -325,7 +329,7 @@ async fn one_reply_each_across_a_hand_over(carry: Carry) {
     let (paused, ()) = join(peers.pause(STOP_TIMEOUT), opening).await;
     paused.unwrap();
     peers.settle().await;
-    let handed_over = HandedOver::new(bus).await;
+    let handed_over = HandedOver::new(bus);
     // The calls that the bus didn't take are in the unread bytes of the caller's connection, or
     // still in the caller's socket, which goes to the next instance with the connection.
     let connection = &handed_over.clients[0].connection;
@@ -380,7 +384,7 @@ fn reload_under_way_holds_a_hand_over_up() {
     crate::testing::block_on(async {
         let mut bus = Bus::for_address(Some(&address())).await.unwrap();
         let (reload, blocked) = BlockedReload::new();
-        bus.set_reload(reload).await;
+        bus.set_reload(reload);
         let peers = bus.peers().clone();
         let (caller, _socket) = connect(&bus, 1).await;
         let mut messages = MessageStream::from(&caller);
@@ -399,7 +403,7 @@ fn reload_under_way_holds_a_hand_over_up() {
         assert!(settled.is_err(), "the bus settled with a reload under way");
         reloading.let_go().await;
         settling.await;
-        let handed_over = HandedOver::new(bus).await;
+        let handed_over = HandedOver::new(bus);
 
         let _next = handed_over.take_over(Carry::AsItIs).await;
         let replies = replies_until(&mut messages, &reload, &get_id).await;
@@ -430,8 +434,8 @@ fn pause_ends_once_the_clients_paused() {
             peers
                 .inner
                 .routing
-                .try_write()
-                .is_some_and(|mut routing| paused(&mut routing))
+                .try_borrow_mut()
+                .is_ok_and(|mut routing| paused(&mut routing))
         })
         .await;
         assert!(
@@ -441,20 +445,149 @@ fn pause_ends_once_the_clients_paused() {
     });
 }
 
-/// A client that goes while the bus pauses, as the task that serves it removes it rather than
-/// give the reader of its messages back, holds the pause up no longer: the bus is done pausing
-/// as soon as the client is gone.
+/// A peer that goes while the bus pauses no longer holds up the pause once it is gone.
+///
+/// The task that serves the peer removes it, instead of giving the reader of its messages back. The
+/// bus finds every other client paused first, and is done pausing as soon as the peer is gone.
+/// Before the bus pauses, the peer's task takes a call to the bus and the peer's EOF in one batch.
+/// It then waits for room to queue the call: a call waits at the gate, and the queue behind it is
+/// full. So once the gate opens, the task goes on to the end of the batch, instead of seeing the
+/// pause first.
 #[test]
 #[timeout(30000)]
 fn peer_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
-    crate::testing::block_on(goes_while_the_bus_pauses(false));
+    crate::testing::block_on(async {
+        let bus = Bus::for_address(Some(&address())).await.unwrap();
+        let peers = bus.peers().clone();
+        let (caller, _caller_socket) = connect(&bus, 1).await;
+        let caller_name = caller.unique_name().unwrap().clone();
+        let (peer, mut socket) = connect(&bus, 2).await;
+        let name = peer.unique_name().unwrap().clone();
+        // The bus answers a call that waits at the gate, and the caller's calls fill the queue
+        // behind it, with none left to wait for room. So the task that serves the caller can pause.
+        let pass = Message::method_call(GATED_PATH, "Pass")
+            .interface(GATED_INTERFACE)
+            .destination(fdo::BUS_NAME)
+            .build(&0u32)
+            .unwrap();
+        caller.send(&pass).await.unwrap();
+        peers.hook().gate.reached().await;
+        let calls: Vec<_> = (0..QUEUED.get())
+            .map(|_| call_bus("GetId").build(&()).unwrap())
+            .collect();
+        caller.send_all(&calls).await.unwrap();
+        until(|| peers.inner.chores.running() == QUEUED.get() + 1).await;
+        // The peer calls the bus, and goes, before the task that serves it runs. The task takes
+        // the call and the peer's EOF in one batch, and waits for room in the queue.
+        let get_id = call_bus("GetId").build(&()).unwrap();
+        socket.write_all(get_id.data().bytes()).unwrap();
+        socket.shutdown(Shutdown::Both).unwrap();
+        until(|| peers.inner.chores.running() == QUEUED.get() + 2).await;
+
+        // The bus pauses its clients when it starts to pause. Each time that a client's task gives
+        // the client's reader back, or removes the client, the bus looks again at whether all of
+        // its clients paused.
+        let mut pausing = pin!(peers.pause(STOP_TIMEOUT));
+        assert!(
+            pausing.as_mut().now_or_never().is_none(),
+            "the bus was done pausing before the tasks that serve its clients ran"
+        );
+        until(|| {
+            peers
+                .inner
+                .routing
+                .try_borrow_mut()
+                .is_ok_and(|mut routing| {
+                    routing
+                        .peers
+                        .get_mut(caller_name.as_str())
+                        .is_some_and(|caller| caller.client_mut().paused().is_some())
+                })
+        })
+        .await;
+        // The look that follows the pause of the caller finds the peer still there, and unpaused.
+        assert!(
+            pausing.as_mut().now_or_never().is_none(),
+            "the bus was done pausing with the peer yet to go"
+        );
+        // Once the bus has answered the call at the gate and taken the next call out of the queue,
+        // the peer's task queues the peer's call, finishes the batch, and removes the peer.
+        peers.hook().gate.open();
+        until(|| {
+            peers
+                .inner
+                .routing
+                .try_borrow_mut()
+                .is_ok_and(|mut routing| {
+                    routing
+                        .peers
+                        .get_mut(name.as_str())
+                        .is_none_or(|peer| peer.client_mut().paused().is_some())
+                })
+        })
+        .await;
+        assert!(
+            !peers.routing().has_peer(name.as_str()),
+            "the task that served the peer gave the reader back, rather than remove the peer"
+        );
+        assert!(
+            matches!(pausing.now_or_never(), Some(Ok(()))),
+            "the bus went on pausing once the peer went"
+        );
+    });
 }
 
-/// As with `peer_that_goes_while_the_bus_pauses_holds_it_up_no_longer`, for a monitor.
+/// A monitor that goes while the bus pauses no longer holds up the pause.
+///
+/// The task that serves the monitor sees the pause before the monitor's EOF, and gives the reader
+/// of its messages back. While the bus settles, it serves the monitor up to that EOF.
 #[test]
 #[timeout(30000)]
 fn monitor_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
-    crate::testing::block_on(goes_while_the_bus_pauses(true));
+    crate::testing::block_on(async {
+        let bus = Bus::for_address(Some(&address())).await.unwrap();
+        let peers = bus.peers().clone();
+        let (client, socket) = connect(&bus, 1).await;
+        let name = client.unique_name().unwrap().clone();
+        assert!(peers.make_monitor(&name, MatchRules::default()).await);
+        // The bus is done with what it sent as the client connected, and became a monitor, and,
+        // once the runtime ran what was ready, the task that serves the monitor waits for it to
+        // send something.
+        peers.inner.chores.done().await;
+        let mut yielded = false;
+        until(|| mem::replace(&mut yielded, true)).await;
+
+        // The monitor goes, and the bus pauses, before the task runs.
+        socket.shutdown(Shutdown::Both).unwrap();
+        let mut pausing = pin!(peers.pause(STOP_TIMEOUT));
+        assert!(
+            pausing.as_mut().now_or_never().is_none(),
+            "the bus was done pausing before the task that serves the monitor ran"
+        );
+        until(|| {
+            peers
+                .inner
+                .routing
+                .try_borrow_mut()
+                .is_ok_and(|mut routing| paused(&mut routing))
+        })
+        .await;
+        assert!(
+            peers.routing().monitors.contains_key(&name),
+            "the task that served the monitor removed it, rather than give the reader back"
+        );
+        assert!(
+            matches!(pausing.now_or_never(), Some(Ok(()))),
+            "the bus went on pausing once the monitor gave the reader back"
+        );
+
+        // As it settles, the bus finds that the monitor went, and serves it to the end.
+        peers.settle().await;
+        assert!(
+            !peers.routing().monitors.contains_key(&name),
+            "the bus settled with the monitor that went"
+        );
+    });
 }
 
 /// A client still in the middle of its handshake once the bus is done pausing, as it hands
@@ -545,7 +678,6 @@ fn client_that_the_bus_disconnects_once_it_paused_is_left_out() {
             // The test lets go of the recipient once the send is done, as a send of the bus does.
             let recipient = peers
                 .routing()
-                .await
                 .peers
                 .get(name.as_str())
                 .map(|peer| peer.client().recipient().clone())
@@ -558,7 +690,7 @@ fn client_that_the_bus_disconnects_once_it_paused_is_left_out() {
                 .unwrap();
             recipient.send(&[signal]).await;
         }
-        let (snapshot, clients) = peers.hand_over().await;
+        let (snapshot, clients) = peers.hand_over();
         assert!(
             clients.iter().all(|client| client.id != 1),
             "the client was handed over, though the bus was disconnecting it"
@@ -588,13 +720,12 @@ fn client_whose_connection_is_still_held_is_disconnected() {
         // The clone holds the client's connection, as a send to the client does while it lasts.
         let _recipient = peers
             .routing()
-            .await
             .peers
             .get(name.as_str())
             .map(|peer| peer.client().recipient().clone())
             .unwrap();
 
-        let (snapshot, clients) = peers.hand_over().await;
+        let (snapshot, clients) = peers.hand_over();
         assert!(
             clients.iter().all(|client| client.id != 1),
             "the client was handed over, though something still held its connection"
@@ -608,50 +739,6 @@ fn client_whose_connection_is_still_held_is_disconnected() {
             panic!("the connection outlived the hand-over: {e}");
         }
     });
-}
-
-/// Have a client of a bus, a monitor if `monitor`, go while the bus pauses, once the pause took
-/// the lock of the routing ahead of the task that serves the client, which waits for the lock
-/// to remove the client, and check that the bus is done pausing as soon as the task removed it.
-async fn goes_while_the_bus_pauses(monitor: bool) {
-    let bus = Bus::for_address(Some(&address())).await.unwrap();
-    let peers = bus.peers().clone();
-    let (client, socket) = connect(&bus, 1).await;
-    let name = client.unique_name().unwrap().clone();
-    if monitor {
-        assert!(peers.make_monitor(&name, MatchRules::default()).await);
-    }
-    // The bus is done with what it sent as the client connected, and became a monitor, and,
-    // once the runtime ran what was ready, the task that serves the client waits for the client
-    // to send something.
-    peers.inner.chores.done().await;
-    let mut yielded = false;
-    until(|| mem::replace(&mut yielded, true)).await;
-
-    {
-        // The task that serves the client, which goes, waits for this to remove the client.
-        let _reading = peers.inner.routing.try_read().unwrap();
-        socket.shutdown(Shutdown::Both).unwrap();
-        // A writer that waits for the lock, the task, keeps new readers out.
-        until(|| peers.inner.routing.try_read().is_none()).await;
-    }
-    // The pause takes the lock, which is free, ahead of the task, which only runs again once
-    // this yields: the pause doesn't find the client gone.
-    let mut pausing = pin!(peers.pause(STOP_TIMEOUT));
-    assert!(
-        pausing.as_mut().now_or_never().is_none(),
-        "the bus was done pausing before the client went"
-    );
-    until(|| {
-        peers.inner.routing.try_write().is_some_and(|routing| {
-            !routing.peers.contains_key(&name) && !routing.monitors.contains_key(&name)
-        })
-    })
-    .await;
-    assert!(
-        matches!(pausing.now_or_never(), Some(Ok(()))),
-        "the bus went on pausing once the client went"
-    );
 }
 
 /// What a bus hands over, as [`HandedOver::new`] takes it out of the bus.
@@ -674,9 +761,9 @@ impl HandedOver {
     /// Have `bus`, which is paused and settled, hand over, as [`Bus::hand_over`] does once it is:
     /// the connections of its clients. It lets go of its clients without disconnecting them, and
     /// of `bus` itself, as its process does as it exits.
-    async fn new(bus: Bus) -> Self {
+    fn new(bus: Bus) -> Self {
         let peers = bus.peers().clone();
-        let (snapshot, clients) = peers.hand_over().await;
+        let (snapshot, clients) = peers.hand_over();
         let guid = bus.guid().clone();
 
         Self {

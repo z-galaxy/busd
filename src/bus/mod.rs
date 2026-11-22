@@ -108,8 +108,8 @@ impl Bus {
     /// It is the open policy of [`Policy::default`] unless set otherwise, or given to
     /// `Bus::take_over`, and applies to the clients that connect from then on, and to those that
     /// the bus has.
-    pub async fn set_policy(&mut self, policy: Rc<Policy>) {
-        self.peers.set_policy(policy).await;
+    pub fn set_policy(&mut self, policy: Rc<Policy>) {
+        self.peers.set_policy(policy);
     }
 
     /// Have `ReloadConfig` set the policy that `read` returns, as [`Bus::set_policy`] does.
@@ -119,11 +119,11 @@ impl Bus {
     /// itself wait for the reload, as the bus answers them one at a time. If `read` fails, so does
     /// the call, and the bus goes on by the policy that it has. Until the bus is told how to read
     /// its policy again, it has nothing to reload, and the call fails.
-    pub async fn set_reload<F>(&mut self, read: F)
+    pub fn set_reload<F>(&mut self, read: F)
     where
         F: FnMut() -> Result<Policy> + Send + 'static,
     {
-        self.peers.set_reload(read).await;
+        self.peers.set_reload(read);
     }
 
     /// Accept new connections, and serve each client in its own task, until the listening socket
@@ -192,7 +192,7 @@ impl Bus {
                     .context("The client has no user")?;
                 let gids = credentials.unix_group_ids().map_or(&[][..], Vec::as_slice);
                 // Dropping the stream closes the connection.
-                if !peers.may_connect(uid, gids).await {
+                if !peers.may_connect(uid, gids) {
                     warn!(
                         "Refusing a client of the user {uid}, as the policy does not let it \
                          connect"

@@ -127,7 +127,7 @@ async fn run(
     let mut bus = bus::Bus::for_address(address.as_deref()).await?;
     // The bus has no clients yet.
     #[cfg(not(target_os = "linux"))]
-    bus.set_policy(policy).await;
+    bus.set_policy(policy);
 
     if let Some(fd) = args.ready_fd {
         // SAFETY: We don't have any way to know if the fd is valid or not. The parent process is
@@ -145,8 +145,7 @@ async fn run(
         let config = read_config(&args, Path::new(SESSION_CONFIG))?;
 
         Ok(policy_of(&config))
-    })
-    .await;
+    });
 
     {
         let signaled = pin!(signals.recv());

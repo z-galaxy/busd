@@ -1,6 +1,6 @@
 use std::{
+    cell::{Ref, RefCell, RefMut},
     fmt, iter,
-    ops::{Deref, DerefMut},
     rc::{self, Rc},
     time::Duration,
 };
@@ -9,10 +9,7 @@ use anyhow::{anyhow, Result};
 use zbus::{fdo::ConnectionCredentials, names::UniqueName, Message, OwnedGuid};
 #[cfg(target_os = "linux")]
 use zruntime::Event;
-use zruntime::{
-    lock::{self, RwLock},
-    spawn_local, unblock,
-};
+use zruntime::{spawn_local, unblock};
 
 #[cfg(target_os = "linux")]
 use crate::debug;
@@ -48,12 +45,12 @@ pub use stats::{ConnectionCounts, Counts};
 /// other: each batch is the messages that the peer sent by the time the bus gets to them, up to
 /// [`MAX_BATCH`] of them and [`MAX_BATCH_BYTES`]. Each recipient gets its messages of a batch in
 /// one go, so that its socket takes them with as few writes as it can, in the order that the peer
-/// sent them, monitors included. The bus picks the recipients of the messages of a batch while it
-/// holds the lock of its [`Routing`], and only sends the messages once it has let go of it, as a
-/// send may wait for its recipient to read. It sends the batch to all of its recipients at once, so
-/// that those that don't read hold it up for as long as the slowest of them, rather than for as
-/// long as all of them together, and goes on to the next batch once each recipient has taken its
-/// messages or been disconnected.
+/// sent them, monitors included. The bus picks the recipients of the messages of a batch in one
+/// borrow of its [`Routing`], and only sends the messages once it has let go of it, as a send may
+/// wait for its recipient to read. It sends the batch to all of its recipients at once, so that
+/// those that don't read hold it up for as long as the slowest of them, rather than for as long as
+/// all of them together, and goes on to the next batch once each recipient has taken its messages
+/// or been disconnected.
 ///
 /// The bus isn't among its peers, but it forwards its own messages, its replies, errors and
 /// signals, in the same way, in batches of the same bounds. It forwards each of them from the task
@@ -99,11 +96,11 @@ impl Peers {
         };
         let peers = Self {
             inner: Rc::new(Inner {
-                routing: RwLock::new(Routing::default()),
+                routing: RefCell::new(Routing::default()),
                 itself,
                 users,
                 uid,
-                reload: lock::Mutex::new(None),
+                reload: RefCell::new(None),
                 chores,
                 #[cfg(target_os = "linux")]
                 sealed: Event::new(),
@@ -140,8 +137,8 @@ impl Peers {
 
     /// Have the bus go by `policy` from now on: for the clients that connect, and for the peers
     /// that it has, each of which gets what `policy` has for it.
-    pub async fn set_policy(&self, policy: Rc<Policy>) {
-        let mut routing = self.routing_mut().await;
+    pub fn set_policy(&self, policy: Rc<Policy>) {
+        let mut routing = self.routing_mut();
         for peer in routing.peers.values_mut() {
             peer.set_policy(policy.for_peer(peer.user().uid(), peer.groups()));
         }
@@ -150,42 +147,45 @@ impl Peers {
 
     /// Have [`Peers::reload`] set the policy that `read` returns: `read` reads the configuration of
     /// the bus again, and may block, as it runs on a thread of its own.
-    pub async fn set_reload<F>(&self, read: F)
+    pub fn set_reload<F>(&self, read: F)
     where
         F: FnMut() -> Result<Policy> + Send + 'static,
     {
-        *self.inner.reload.lock().await = Some(Reload(Box::new(read)));
+        *self.inner.reload.borrow_mut() = Some(Reload(Box::new(read)));
     }
 
     /// Read the policy of the bus again, as [`Peers::set_reload`] told how to, and have the bus go
     /// by it, as [`Peers::set_policy`] does: nothing if the bus was not told how to.
     ///
     /// The policy is read on a thread of its own, so the bus goes on forwarding the messages of
-    /// its peers meanwhile, and a reload waits for the one before it. If reading fails, the bus
-    /// goes on by the policy that it has.
+    /// its peers meanwhile. If reading fails, the bus goes on by the policy that it has. The bus
+    /// reloads when it answers `ReloadConfig`. It answers that call as any call to it, one at a
+    /// time, so a reload waits for the one before it. The next reload reads the policy the same
+    /// way, whatever the result of the read, unless [`Peers::set_reload`] is called first, even
+    /// during the read.
     pub async fn reload(&self) -> Option<Result<()>> {
-        // Held until the bus goes by what was read, so that reloads take turns.
-        let mut reload = self.inner.reload.lock().await;
-        let Reload(mut read) = reload.take()?;
+        let Reload(mut read) = self.inner.reload.borrow_mut().take()?;
         let (read, policy) = unblock(move || {
             let policy = read();
 
             (read, policy)
         })
         .await;
-        *reload = Some(Reload(read));
+        // The closure goes back to its cell, unless `set_reload` gave the bus another closure
+        // during the read.
+        self.inner.reload.borrow_mut().get_or_insert(Reload(read));
         let policy = match policy {
             Ok(policy) => policy,
             Err(e) => return Some(Err(e)),
         };
-        self.set_policy(Rc::new(policy)).await;
+        self.set_policy(Rc::new(policy));
 
         Some(Ok(()))
     }
 
     /// Whether the policy of the bus lets a client of `uid`, in the groups `gids`, connect.
-    pub async fn may_connect(&self, uid: u32, gids: &[u32]) -> bool {
-        self.routing().await.policy.may_connect(uid, gids)
+    pub fn may_connect(&self, uid: u32, gids: &[u32]) -> bool {
+        self.routing().policy.may_connect(uid, gids)
     }
 
     /// Add a client that connected on `socket`, as an object of the user of `uid`.
@@ -215,8 +215,9 @@ impl Peers {
         let charge = Charge::new(&user, &user)
             .ok_or_else(|| anyhow!("the bus keeps as many objects for the user {uid} as it may"))?;
         let _connecting = self.inner.chores.connecting();
-        // The handshake goes without the lock of the routing, since it waits for the client.
-        // Otherwise, it would hold up all that takes the lock, such as the answer to `Hello`.
+        // The handshake goes without a borrow of the routing, since it waits for the client.
+        // Otherwise, every other borrow of the routing meanwhile would panic, such as the borrow
+        // that the answer to `Hello` takes.
         let handshake = Peer::new(guid, id, socket, credentials, send_timeout, user, charge);
         // Dropping the handshake closes the connection, and lets go of the charge.
         #[cfg(target_os = "linux")]
@@ -230,7 +231,7 @@ impl Peers {
         let handshake = handshake.await;
         let (peer, peer_stream) = handshake?;
 
-        let mut routing = self.routing_mut().await;
+        let mut routing = self.routing_mut();
         // The bus takes no more clients once it is done pausing, as it hands over. Dropping this
         // one closes its connection.
         #[cfg(target_os = "linux")]
@@ -248,44 +249,55 @@ impl Peers {
     }
 
     /// What the bus routes messages by, to read.
-    pub async fn routing(&self) -> impl Deref<Target = Routing> + '_ {
-        self.inner.routing.read().await
+    ///
+    /// # Panics
+    ///
+    /// If the routing is borrowed to change.
+    pub fn routing(&self) -> Ref<'_, Routing> {
+        self.inner.routing.borrow()
     }
 
     /// What the bus routes messages by, to change.
-    pub async fn routing_mut(&self) -> impl DerefMut<Target = Routing> + '_ {
-        self.inner.routing.write().await
+    ///
+    /// # Panics
+    ///
+    /// If the routing is borrowed.
+    pub fn routing_mut(&self) -> RefMut<'_, Routing> {
+        self.inner.routing.borrow_mut()
     }
 
     /// Whether the peer `name` is privileged: of root, or of the user that the bus itself runs as,
     /// as dbus-broker has it. Nothing if the bus has no such peer.
-    pub async fn privileged(&self, name: &UniqueName<'_>) -> Option<bool> {
-        let routing = self.routing().await;
+    pub fn privileged(&self, name: &UniqueName<'_>) -> Option<bool> {
+        let routing = self.routing();
         let uid = routing.peers.get(name.as_str())?.user().uid();
 
         Some(uid == 0 || uid == self.inner.uid)
     }
 
     pub async fn make_monitor(&self, peer_name: &UniqueName<'_>, match_rules: MatchRules) -> bool {
-        let mut routing = self.routing_mut().await;
-        let Some(peer) = routing.remove_peer(peer_name.as_str()) else {
-            return false;
+        let waiting = {
+            let mut routing = self.routing_mut();
+            let Some(peer) = routing.remove_peer(peer_name.as_str()) else {
+                return false;
+            };
+            // A monitor makes no calls and answers none, as with a peer that goes. This is done
+            // here, as the bus answers the call that makes the monitor, rather than by the task
+            // that served the peer, which only gets to it later, so that the bus has sent all that
+            // the peer's change of role takes by the time it answered.
+            for other in routing.peers.values() {
+                other.pending_calls().forget(peer.client().id());
+            }
+            let waiting = peer.pending_calls().take();
+            // From now on, the task that served the peer serves the monitor, once it is done with
+            // the peer's messages that it took. Turning the peer into a monitor tells the task so.
+            let monitor = peer.become_monitor(match_rules);
+            routing
+                .monitors
+                .insert(monitor.client().unique_name().clone(), monitor);
+
+            waiting
         };
-        // A monitor makes no calls and answers none, as with a peer that goes. This is done here,
-        // as the bus answers the call that makes the monitor, rather than by the task that served
-        // the peer, which only gets to it later, so that the bus has sent all that the peer's
-        // change of role takes by the time it answered.
-        for other in routing.peers.values() {
-            other.pending_calls().forget(peer.client().id());
-        }
-        let waiting = peer.pending_calls().take();
-        // From now on, the task that served the peer serves the monitor, once it is done with the
-        // peer's messages that it took. Turning the peer into a monitor tells the task so.
-        let monitor = peer.become_monitor(match_rules);
-        routing
-            .monitors
-            .insert(monitor.client().unique_name().clone(), monitor);
-        drop(routing);
         let errors: Vec<_> = waiting
             .filter_map(|(caller, serial)| match no_reply(&caller, serial) {
                 Ok(error) => Some(error),
@@ -369,16 +381,15 @@ impl WeakPeers {
 /// The state that the [`Peers`] handles share.
 #[derive(Debug)]
 struct Inner {
-    routing: RwLock<Routing>,
+    routing: RefCell<Routing>,
     /// The bus itself, as forwarding has it.
     itself: Itself,
     /// The users of the peers, and of the bus itself.
     users: Users,
     /// The uid of the user that the bus itself runs as.
     uid: u32,
-    /// How the bus reads its policy again, if it was told how: see [`Peers::set_reload`]. A reload
-    /// holds it until the bus goes by what it read, so that reloads take turns.
-    reload: lock::Mutex<Option<Reload>>,
+    /// How the bus reads its policy again, if it was told how: see [`Peers::set_reload`].
+    reload: RefCell<Option<Reload>>,
     /// What the bus does on its own, besides forwarding the messages of its peers.
     chores: Chores,
     /// Notified once the bus takes no more clients, as it is done pausing: see [`Peers::add`].

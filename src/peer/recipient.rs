@@ -10,8 +10,8 @@ use crate::{connection::Connection, fdo::Calls};
 ///
 /// The calls to the bus go to the queue of the task that answers them.
 ///
-/// It is cheap to clone, so that the bus can pick the recipients of messages while it holds its
-/// locks, and send the messages to them once it has let go of those. The clones share the
+/// It is cheap to clone, so that the bus can pick the recipients of messages in one borrow of its
+/// routing, and send the messages to them once it has let go of it. The clones share the
 /// connection of the client, which a peer hands on to the monitor that it becomes.
 ///
 /// The bus keeps no messages for a client except those of the sends that its socket hasn't taken

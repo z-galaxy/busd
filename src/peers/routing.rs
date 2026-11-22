@@ -17,8 +17,6 @@ use crate::{
 };
 
 /// What the bus routes messages by: its peers, its monitors and the owners of its names.
-///
-/// They are all behind one lock, so that the bus takes one lock to pick the recipients of a batch.
 #[derive(Debug, Default)]
 pub struct Routing {
     /// The peers, by their unique names.

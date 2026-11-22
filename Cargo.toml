@@ -75,7 +75,6 @@ futures-util = { version = "0.3.30", default-features = false, features = ["allo
 # `mpmc` is for the queue of the calls to the bus itself, which it answers one at a time.
 zruntime = { version = "0.2.4", features = [
     "fs",
-    "lock",
     "mpmc",
     "signal",
     "unblock",
@@ -139,8 +138,9 @@ serde_bytes = "0.11.19"
 # The channels that stop the services and the bus of the benchmarks, and hand the replies on a
 # shared connection to their callers. `helper` is for the `zruntime::block_on` of the tests and the
 # benchmarks whose clients run apart from any bus, and for zruntime's process-wide runtime, on which
-# the tests run their own tasks and timers.
-zruntime = { version = "0.2.4", features = ["helper", "mpmc"], default-features = false }
+# the tests run their own tasks and timers. The clients of the comparison with other brokers start
+# their calls together at a zruntime barrier.
+zruntime = { version = "0.2.4", features = ["helper", "lock", "mpmc"], default-features = false }
 # The comparison with other brokers writes its results as JSON, and reads them back: its runs keep
 # the order of their fields, and their numbers read back exactly as they were written.
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
