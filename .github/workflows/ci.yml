@@ -83,3 +83,36 @@ jobs:
         run: cargo --locked clippy --bench bus --bench compare -- -D warnings
       - name: Check the statistics of the comparison with other brokers
         run: cargo --locked test --bench compare -- pairs --self-test
+
+  # The plain binary, built without zbus's connections, against clients other than zbus's:
+  # `dbus-send` of libdbus and `busctl` of sd-bus, which each shake hands with the bus in their own
+  # way. The binary that the tests run is built with the features of the dev-dependencies, and the
+  # PGO workflow runs the plain binary only on some changes, and only with zbus's clients.
+  smoke:
+    runs-on: ubuntu-latest
+    # The job takes a few minutes, so a run that takes longer than 15 is stuck, for example on a
+    # busd that doesn't exit on `SIGTERM`. Without this limit, `wait` would wait for that busd until
+    # GitHub's own limit of 6 hours.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dbus-send
+        run: sudo apt-get update && sudo apt-get install -y dbus-bin
+      # busd exits with 0 on `SIGTERM`, so `wait` fails the step if it exits otherwise.
+      - name: Serve clients of libdbus and sd-bus with the plain binary
+        run: |
+          cargo --locked build
+          address="unix:path=$RUNNER_TEMP/busd-smoke"
+          target/debug/busd --address "$address" --print-address > "$RUNNER_TEMP/address" &
+          busd=$!
+          timeout 10 sh -c "until [ -s '$RUNNER_TEMP/address' ]; do sleep 0.1; done"
+          dbus-send --bus="$address" --print-reply --dest=org.freedesktop.DBus \
+            /org/freedesktop/DBus org.freedesktop.DBus.GetId
+          busctl --address="$address" call org.freedesktop.DBus /org/freedesktop/DBus \
+            org.freedesktop.DBus GetId
+          kill "$busd"
+          wait "$busd"
