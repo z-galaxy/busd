@@ -79,19 +79,29 @@ impl TestBus {
         &self.peers
     }
 
-    /// The GUID of the bus.
-    pub fn guid(&self) -> &OwnedGuid {
-        &self.guid
-    }
-
     /// Connect a client through the bus's listening socket.
     pub async fn connect(&self) -> zbus::Result<Connection> {
         connect(&self.address).await
     }
 
-    /// Connect a client to this bus with [`connect_as`].
+    /// Connect a client of `uid`, numbered `id`, to this bus. The client connects over a pair of
+    /// sockets, not through the bus's listening socket.
+    ///
+    /// The client belongs to that user, whichever user runs the test.
     pub async fn connect_as(&self, id: usize, uid: u32) -> anyhow::Result<Connection> {
-        connect_as(&self.peers, &self.guid, id, uid).await
+        let (ours, theirs) = UnixStream::pair()?;
+        let adding = self.peers.add(
+            &self.guid,
+            id,
+            connection::Builder::unix_stream(theirs),
+            SEND_TIMEOUT,
+            uid,
+        );
+        let connecting = connection::Builder::unix_stream(ours).build();
+        let (added, conn) = join(adding, connecting).await;
+        added?;
+
+        Ok(conn?)
     }
 }
 
@@ -145,31 +155,6 @@ impl Running {
 /// Connect a client to the bus at `address`.
 pub async fn connect(address: &str) -> zbus::Result<Connection> {
     connection::Builder::address(address).build().await
-}
-
-/// Connect a client of `uid`, numbered `id`, to the bus that has `peers` and `guid`. The client
-/// connects over a pair of sockets, not through the bus's listening socket.
-///
-/// The client belongs to that user, whichever user runs the test.
-pub async fn connect_as(
-    peers: &Peers,
-    guid: &OwnedGuid,
-    id: usize,
-    uid: u32,
-) -> anyhow::Result<Connection> {
-    let (ours, theirs) = UnixStream::pair()?;
-    let adding = peers.add(
-        guid,
-        id,
-        connection::Builder::unix_stream(theirs),
-        SEND_TIMEOUT,
-        uid,
-    );
-    let connecting = connection::Builder::unix_stream(ours).build();
-    let (added, conn) = join(adding, connecting).await;
-    added?;
-
-    Ok(conn?)
 }
 
 /// Await `future` for at most [`WAIT`].

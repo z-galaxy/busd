@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use anyhow::{ensure, Context};
 use busd::{
     bus::Bus,
-    peers::Peers,
-    testing::{connect_as, init_tracing, unix_address, with, with_bus},
+    testing::{init_tracing, unix_address, with, with_bus, TestBus},
 };
 use futures_util::{StreamExt, TryStreamExt};
 use ntest::timeout;
@@ -20,7 +19,7 @@ use zbus::{
     message,
     names::BusName,
     proxy::CacheProperties,
-    MessageStream, OwnedGuid,
+    MessageStream,
 };
 
 #[test]
@@ -57,22 +56,15 @@ fn unprivileged() {
 
     zruntime::block_on(async {
         let bus = Bus::for_address(Some(&unix_address())).await.unwrap();
-        with(bus, |bus| async move {
-            unprivileged_clients(bus.address(), bus.peers(), bus.guid()).await
-        })
-        .await;
+        with(bus, unprivileged_clients).await;
     });
 }
 
-#[instrument(skip(peers, guid))]
-async fn unprivileged_clients(
-    address: &str,
-    peers: &Peers,
-    guid: &OwnedGuid,
-) -> anyhow::Result<()> {
+#[instrument(skip(bus), fields(address = bus.address()))]
+async fn unprivileged_clients(bus: TestBus) -> anyhow::Result<()> {
     // A client of a user that is neither root nor the user of the bus.
     let our_uid = rustix::process::getuid().as_raw();
-    let conn = connect_as(peers, guid, 1_000_001, our_uid + 1).await?;
+    let conn = bus.connect_as(1_000_001, our_uid + 1).await?;
     let monitoring = MonitoringProxy::builder(&conn)
         .cache_properties(CacheProperties::No)
         .build()
@@ -105,7 +97,7 @@ async fn unprivileged_clients(
     );
 
     // A client of root may become a monitor.
-    let conn = connect_as(peers, guid, 1_000_002, 0).await?;
+    let conn = bus.connect_as(1_000_002, 0).await?;
     let result = MonitoringProxy::builder(&conn)
         .cache_properties(CacheProperties::No)
         .build()
@@ -118,7 +110,7 @@ async fn unprivileged_clients(
     );
 
     // A client of the user of the bus passes the check, and fails for want of service activation.
-    let conn = connection::Builder::address(address).build().await?;
+    let conn = connection::Builder::address(bus.address()).build().await?;
     let result = DBusProxy::builder(&conn)
         .cache_properties(CacheProperties::No)
         .build()
