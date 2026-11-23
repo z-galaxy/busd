@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     future::Future,
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc},
 };
 
 use anyhow::{anyhow, bail, ensure, Context};
@@ -505,10 +505,10 @@ async fn reload_(bus: TestBus) -> anyhow::Result<()> {
             <deny own="*"/>
         </policy>"#
     );
-    let read = Mutex::new(VecDeque::from([policy(&policies)]));
+    let mut read = VecDeque::from([policy(&policies)]);
     bus.peers()
         .set_reload(move || {
-            let next = read.lock().unwrap().pop_front();
+            let next = read.pop_front();
 
             next.unwrap_or_else(|| Err(anyhow!("No policy to read")))
         })
@@ -523,6 +523,9 @@ async fn reload_(bus: TestBus) -> anyhow::Result<()> {
     let result = request_name(&dbus, "org.busd.Policy.After").await;
     ensure_denied(result, OWN_REFUSED)?;
 
+    let result = dbus.reload_config().await;
+    ensure_error(result, FAILED, "Config invalid. Reload ignored.")?;
+    // The reload that failed put back the way to read the policy: the next one reads again.
     let result = dbus.reload_config().await;
     ensure_error(result, FAILED, "Config invalid. Reload ignored.")?;
     let result = request_name(&dbus, "org.busd.Policy.Still").await;
@@ -545,11 +548,10 @@ async fn forwards_during_a_reload_(bus: TestBus) -> anyhow::Result<()> {
     // The bus reads its policy for as long as the test holds the read up.
     let (started, starts) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
-    let released = Mutex::new(released);
     bus.peers()
         .set_reload(move || {
             started.send(()).ok();
-            released.lock().unwrap().recv().ok();
+            released.recv().ok();
 
             Ok(Policy::default())
         })

@@ -132,7 +132,7 @@ impl Bus {
     /// its policy again, it has nothing to reload, and the call fails.
     pub async fn set_reload<F>(&mut self, read: F)
     where
-        F: Fn() -> Result<Policy> + Send + Sync + 'static,
+        F: FnMut() -> Result<Policy> + Send + 'static,
     {
         self.peers.set_reload(read).await;
     }

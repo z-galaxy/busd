@@ -123,9 +123,9 @@ impl Peers {
     /// the bus again, and may block, as it runs on a thread of its own.
     pub async fn set_reload<F>(&self, read: F)
     where
-        F: Fn() -> Result<Policy> + Send + Sync + 'static,
+        F: FnMut() -> Result<Policy> + Send + 'static,
     {
-        *self.inner.reload.lock().await = Some(Reload(Arc::new(read)));
+        *self.inner.reload.lock().await = Some(Reload(Box::new(read)));
     }
 
     /// Read the policy of the bus again, as [`Peers::set_reload`] told how to, and have the bus go
@@ -136,9 +136,16 @@ impl Peers {
     /// goes on by the policy that it has.
     pub async fn reload(&self) -> Option<Result<()>> {
         // Held until the bus goes by what was read, so that reloads take turns.
-        let reload = self.inner.reload.lock().await;
-        let Reload(read) = reload.clone()?;
-        let policy = match unblock(move || read()).await {
+        let mut reload = self.inner.reload.lock().await;
+        let Reload(mut read) = reload.take()?;
+        let (read, policy) = unblock(move || {
+            let policy = read();
+
+            (read, policy)
+        })
+        .await;
+        *reload = Some(Reload(read));
+        let policy = match policy {
             Ok(policy) => policy,
             Err(e) => return Some(Err(e)),
         };
@@ -432,8 +439,7 @@ struct Inner {
 }
 
 /// How the bus reads its policy again: see [`Peers::set_reload`].
-#[derive(Clone)]
-struct Reload(Arc<dyn Fn() -> Result<Policy> + Send + Sync>);
+struct Reload(Box<dyn FnMut() -> Result<Policy> + Send>);
 
 impl fmt::Debug for Reload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
