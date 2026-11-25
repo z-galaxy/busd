@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use anyhow::ensure;
 use busd::testing::{connect, init_tracing, with_bus};
 use futures_util::TryStreamExt;
@@ -17,7 +19,7 @@ const INTERFACE: &str = "org.zbus.Sender";
 fn sender_left_out() {
     init_tracing();
 
-    zruntime::block_on(with_bus(sender_left_out_));
+    busd::testing::block_on(with_bus(sender_left_out_));
 }
 
 async fn sender_left_out_(address: String) -> anyhow::Result<()> {

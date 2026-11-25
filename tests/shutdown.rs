@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::time::Duration;
 
 use busd::{
@@ -17,7 +19,7 @@ use zruntime::SharedRuntime;
 fn shutdown() {
     init_tracing();
 
-    zruntime::block_on(async {
+    busd::testing::block_on(async {
         let address = unix_address();
         let bus = Bus::for_address(Some(&address)).await.unwrap();
         let peers = bus.peers().downgrade();

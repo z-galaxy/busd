@@ -5,7 +5,7 @@
 //! the stored FDs, those that busd stores in the manager, and passes them to the next instance of
 //! busd, with the listening socket, among the passed FDs, as `$LISTEN_FDS` does. The FDs of a
 //! hand-over go by the names that the docs of `src/bus/systemd.rs` give them.
-#![cfg(target_os = "linux")]
+#![cfg(all(feature = "testing", target_os = "linux"))]
 
 use std::{
     env::temp_dir,
@@ -93,10 +93,10 @@ fn restart() {
 }
 
 /// The calls to the bus that are on their way as systemd stops it get their replies, each once, in
-/// the order of the calls: the instance that stops answers those that it took, and stores the
-/// others, with the replies that it didn't pass on, along with its state, as it hands over the
-/// connection on which it serves the D-Bus API. The next instance answers those calls, and passes
-/// those replies on, as it does what the client sent and the instance that stopped didn't read.
+/// the order of the calls: the instance that stops answers those that it took, and leaves the
+/// others in the client's connection. It hands the connection over with what the client sent and
+/// it didn't read. The next instance answers those calls, as it does anything else that the client
+/// sent and the instance that stopped didn't read.
 #[test]
 #[timeout(60000)]
 fn restart_with_calls_to_the_bus_on_their_way() {
@@ -124,14 +124,25 @@ fn restart_with_calls_to_the_bus_on_their_way() {
     let (last, on_their_way) = calls.split_last().unwrap();
     // The client takes the replies as they come, so that the bus never waits for it.
     let replies = calls.len();
+    let first_call = calls[0].primary_header().serial_num();
     let answering = SharedRuntime::current()
         .unwrap()
         .spawn("replies", async move {
             let mut answered = Vec::new();
             while answered.len() < replies {
                 let msg = messages.next().await.unwrap().unwrap();
-                if msg.message_type() == message::Type::MethodReturn {
-                    answered.push(msg.header().reply_serial().unwrap());
+                if msg.message_type() != message::Type::MethodReturn {
+                    continue;
+                }
+                // Not the reply to the `Hello` that the client sent as it connected. That reply may
+                // still come out of the stream. zbus hands a reply to its caller before it hands it
+                // to the streams. When the connection reads its socket on another thread, the
+                // client can go on and make the stream in between. zbus numbers the messages of a
+                // process in the order that they are built, so that reply answers a lower serial
+                // than the calls of the test.
+                let replied = msg.header().reply_serial().unwrap();
+                if replied >= first_call {
+                    answered.push(replied);
                 }
             }
 
@@ -368,11 +379,18 @@ fn hand_over_at_the_hard_fd_limit() {
 
     let mut first = Busd::spawn_limited(&mut systemd, &address, FDSTORE_MAX, Some(HARD_NOFILE));
     systemd.until_ready();
-    // Clients connect until busd has hardly a file descriptor left.
+    // Clients connect until busd has hardly a file descriptor left. They stop once one more client
+    // could take the last FD, which busd needs to duplicate the client sockets as it hands over.
     let mut clients = Vec::new();
-    while HARD_NOFILE - first.open_fds() > FREE_FDS {
+    let mut open = first.open_fds();
+    // The most file descriptors that busd opened for a client.
+    let mut per_client = 0;
+    while HARD_NOFILE - open > per_client {
         let name = format!("{NAME}{}", clients.len());
         clients.push((Client::connect(&address, Some(&name)), name));
+        let before = open;
+        open = first.open_fds();
+        per_client = per_client.max(open.saturating_sub(before));
     }
     hand_over(&mut first, &mut systemd, &socket);
     let stored = systemd.check_stored();
@@ -1017,7 +1035,6 @@ const LOW_NOFILE: libc::rlim_t = 64;
 /// each, as many as that limit takes, so that they can't all fit, while many of them would.
 const CLIENTS: usize = LOW_NOFILE as usize;
 const HARD_NOFILE: libc::rlim_t = 64;
-const FREE_FDS: libc::rlim_t = 2;
 /// A limit of open FDs that what a bus under `HARD_NOFILE` hands over fits under, with the process
 /// FD of each client.
 const HIGH_NOFILE: libc::rlim_t = 4 * HARD_NOFILE;

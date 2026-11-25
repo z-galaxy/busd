@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::Arc,
+    rc::Rc,
 };
 
 use zbus::{
@@ -17,8 +17,6 @@ use crate::{
 };
 
 /// What the bus routes messages by: its peers, its monitors and the owners of its names.
-///
-/// They are all behind one lock, so that the bus takes one lock to pick the recipients of a batch.
 #[derive(Debug, Default)]
 pub struct Routing {
     /// The peers, by their unique names.
@@ -43,8 +41,8 @@ pub struct Routing {
     /// How many match rules the peers have, kept up to date by the methods that change them, so
     /// that counting them takes no pass over the peers.
     pub(super) match_rule_counts: MatchRuleCounts,
-    /// The policy of the bus, which each peer but the bus itself gets its part of as it is added.
-    pub(super) policy: Arc<Policy>,
+    /// The policy of the bus, which each peer gets its part of as it is added.
+    pub(super) policy: Rc<Policy>,
 }
 
 impl Routing {
@@ -64,7 +62,7 @@ impl Routing {
         self.peers.contains_key(name)
     }
 
-    /// The unique names of the peers, the bus itself among them.
+    /// The unique names of the peers.
     pub fn peer_names(&self) -> impl Iterator<Item = &OwnedUniqueName> {
         self.peers.keys()
     }
@@ -107,7 +105,7 @@ impl Routing {
         Ok(())
     }
 
-    /// The clients of the bus: its peers, the bus itself among them, and its monitors.
+    /// The clients of the bus: its peers and its monitors.
     #[cfg(target_os = "linux")]
     pub(super) fn clients_mut(&mut self) -> impl Iterator<Item = &mut Client> {
         let peers = self.peers.values_mut().map(Peer::client_mut);
@@ -116,11 +114,9 @@ impl Routing {
     }
 
     /// Add `peer` under `name`, along with the match rules that it has already, and give it what
-    /// the policy has for it, unless it is the bus itself.
+    /// the policy has for it.
     pub(super) fn insert_peer(&mut self, name: OwnedUniqueName, mut peer: Peer) {
-        if !peer.is_bus() {
-            peer.set_policy(self.policy.for_peer(peer.user().uid(), peer.groups()));
-        }
+        peer.set_policy(self.policy.for_peer(peer.user().uid(), peer.groups()));
         let rules = peer.client().match_rules().len();
         self.match_rule_counts.add(rules, rules);
         self.peers.insert(name, peer);

@@ -12,7 +12,8 @@ use std::{
     },
     path::{Path, PathBuf},
     pin::pin,
-    sync::{mpsc, Arc},
+    rc::Rc,
+    sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -28,9 +29,9 @@ use rustix::{
 };
 use zbus::connection;
 use zoter::{testing, Passed, Store};
-use zruntime::mpmc;
+use zruntime::{mpmc, LocalRuntime};
 
-use super::{socket_path, within_limit, AbortOnPanic, Cpu};
+use super::{socket_path, until_gone, within_limit, AbortOnPanic, Cpu};
 
 /// How the bus restarts in the ids of `handover/`.
 #[derive(Clone, Copy)]
@@ -71,7 +72,8 @@ impl RestartingBus {
                 Restart::InProcess => None,
                 Restart::FdStore => Some(FakeSystemd::start(systemd_cpu, &path)),
             };
-            zruntime::block_on(async move {
+            let runtime = LocalRuntime::new().expect("the runtime of the bus");
+            runtime.block_on(async move {
                 // The store that the bus hands over through, which a bus is given as it starts.
                 let mut store = systemd.as_ref().map(FakeSystemd::store);
                 let bus = match &systemd {
@@ -80,7 +82,7 @@ impl RestartingBus {
                     // activation.
                     Some(systemd) => {
                         let passed = Passed::new(systemd.passed(Vec::new()));
-                        Bus::for_systemd(passed, store.as_mut(), Some(&bus_address), Arc::default())
+                        Bus::for_systemd(passed, store.as_mut(), Some(&bus_address), Rc::default())
                             .await
                     }
                 };
@@ -122,9 +124,11 @@ impl RestartingBus {
                 }
                 // A bus on the listening socket of the fake systemd leaves its file be, for the
                 // fake to remove.
+                let peers = bus.peers().downgrade();
                 bus.cleanup()
                     .await
                     .expect("the socket of the bus is removed");
+                until_gone(peers).await;
             });
         });
         listens.recv().expect("the bus listens");
@@ -171,7 +175,7 @@ impl Drop for RestartingBus {
 async fn restart_in_process(bus: Bus) -> Bus {
     let handover = bus.hand_over().await.expect("the bus hands over");
 
-    Bus::take_over(handover, None, SEND_TIMEOUT, Arc::default())
+    Bus::take_over(handover, None, SEND_TIMEOUT, Rc::default())
         .await
         .expect("the next instance takes over")
 }
@@ -190,7 +194,7 @@ async fn restart_through(
         .expect("the bus hands over");
     let passed = Passed::new(systemd.passed(systemd.stored()));
     let mut store = systemd.store();
-    let bus = Bus::for_systemd(passed, Some(&mut store), Some(address), Arc::default())
+    let bus = Bus::for_systemd(passed, Some(&mut store), Some(address), Rc::default())
         .await
         .expect("the next instance starts");
 

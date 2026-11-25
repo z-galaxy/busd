@@ -49,12 +49,11 @@ harness = false
 bench = false
 
 [dependencies]
-zbus = { version = "6.4.0", features = [
-    "default-rt",
-    "bus-impl",
-    "service",
-    "handover",
-], default-features = false }
+# The bus reads and writes the messages of its clients itself, so it builds on zbus through its
+# `core` and `core-p2p` features alone, without zbus's connections. `core-p2p` is for the GUID that
+# the bus generates for its end of each client's connection, where the bus is the server. It is also
+# for the credentials that the bus looks up from each client's socket.
+zbus = { version = "6.4.0", features = ["core", "core-p2p"], default-features = false }
 clap = { version = "4.5.4", features = [
     "derive",
     "std",
@@ -71,10 +70,10 @@ anyhow = "1.0.82"
 # Explicitly depend on serde to enable `rc` feature.
 serde = { version = "1.0.200", features = ["rc"] }
 futures-util = { version = "0.3.30", default-features = false, features = ["alloc"] }
+# `mpmc` is for the queue of the calls to the bus itself, which it answers one at a time.
 zruntime = { version = "0.2.4", features = [
     "fs",
-    "helper",
-    "lock",
+    "mpmc",
     "signal",
     "unblock",
     "unix",
@@ -82,16 +81,21 @@ zruntime = { version = "0.2.4", features = [
 fastrand = "2.2.0"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
-# `net` is for the sockets of the bus, and `process` for its limit of open file descriptors. `std`
-# makes rustix share the types of std with its callers (`OwnedFd`, `io::Error`).
-rustix = { version = "1.1.2", default-features = false, features = ["net", "process", "std"] }
+# `net` is for the sockets of the bus, `event` for telling whether a client closed its end of the
+# socket, and `process` for the bus's limit of open file descriptors. `std` makes rustix share the
+# types of std with its callers (`OwnedFd`, `io::Error`).
+rustix = { version = "1.1.2", default-features = false, features = [
+    "event",
+    "net",
+    "process",
+    "std",
+] }
 foldhash = "0.2.0"
 # Draws the diagrams of the docs, which are in mermaid, in the HTML that `cargo doc` builds.
 simple-mermaid = "0.2.0"
 
 # Restarts through the file descriptor store of systemd, with the clients connected throughout.
-# zbus builds on it too, and Cargo builds one zoter for both, so the hand-overs of zbus are items
-# of its hand-overs.
+# busd's record of each client's connection is an item of zoter's hand-over.
 [target.'cfg(target_os = "linux")'.dependencies.zoter]
 version = "0.2.0"
 default-features = false
@@ -100,13 +104,26 @@ default-features = false
 default = ["tracing-subscriber"]
 tracing = ["dep:tracing", "zbus/tracing", "zruntime/tracing", "zoter/tracing"]
 tracing-subscriber = ["tracing", "dep:tracing-subscriber"]
+# The helpers that busd's tests share build zbus clients. They time what the tests wait for on
+# zruntime's process-wide runtime, which zruntime's `helper` feature brings.
+testing = ["zbus/default-rt", "zruntime/helper"]
 
 [dev-dependencies]
-# The tests drive the bus through proxies, which the binary itself does not need. The benchmarks
-# send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte by byte.
+# The tests of `tests/` share helpers that the library has only with the `testing` feature. This
+# dependency turns on that feature alone, so that the tests build without the default features
+# too, with `--no-default-features`. Cargo leaves it out of the packaged crate, whose tests take
+# `--features testing` instead.
+busd = { path = ".", default-features = false, features = ["testing"] }
+# The tests drive the bus through zbus connections and proxies, peer-to-peer ones among them, and
+# serve their own interfaces on its clients, none of which the binary itself needs. The
+# benchmarks send byte arrays with `serde_bytes`, which (de)serializes them whole rather than byte
+# by byte.
 zbus = { version = "6.4.0", features = [
+    "default-rt",
+    "p2p",
     "proxy",
     "serde_bytes",
+    "service",
 ], default-features = false }
 ntest = "0.10.0"
 rand = "0.10.0"
@@ -119,8 +136,11 @@ criterion = { version = "6.0.0", package = "codspeed-criterion-compat" }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_bytes = "0.11.19"
 # The channels that stop the services and the bus of the benchmarks, and hand the replies on a
-# shared connection to their callers.
-zruntime = { version = "0.2.4", features = ["mpmc"], default-features = false }
+# shared connection to their callers. `helper` is for the `zruntime::block_on` of the tests and the
+# benchmarks whose clients run apart from any bus, and for zruntime's process-wide runtime, on which
+# the tests run their own tasks and timers. The clients of the comparison with other brokers start
+# their calls together at a zruntime barrier.
+zruntime = { version = "0.2.4", features = ["helper", "lock", "mpmc"], default-features = false }
 # The comparison with other brokers writes its results as JSON, and reads them back: its runs keep
 # the order of their fields, and their numbers read back exactly as they were written.
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
@@ -136,6 +156,11 @@ libc = "0.2.191"
 version = "0.2.0"
 default-features = false
 features = ["testing"]
+
+# zbus 6.6 adds API that busd needs. Until it is out, busd builds on a commit of zbus's main.
+[patch.crates-io.zbus]
+git = "https://github.com/z-galaxy/zbus"
+rev = "308526ae305923e9ab1b9a2cf883d94ac5b7587f"
 
 [profile.release]
 lto = "fat"

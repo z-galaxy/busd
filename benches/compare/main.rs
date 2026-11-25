@@ -55,7 +55,7 @@
 //! busd's own. The clients are those of dbus-bench, but on busd's own zbus and zruntime, the
 //! versions that its Cargo.lock has. They are built as the bench build has them: with busd's
 //! release profile, opt-level "s", fat LTO and 1 codegen unit, and with the features of zbus
-//! unified with those of busd and of its dev-dependencies, which add tracing, bus-impl, service and
+//! unified with those of busd and of its dev-dependencies, which add tracing, p2p, service and
 //! proxy to those of dbus-bench's clients. They took 3.5% longer than clients built with opt-level
 //! 3 on the calls of 20 clients through dbus-broker, on a VM with 4 vCPUs. So the numbers compare
 //! within one run, whose brokers all share one client, and only roughly with the results of

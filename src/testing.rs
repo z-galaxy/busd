@@ -1,9 +1,14 @@
 //! What the busd tests share to run a bus and to connect clients to it.
 //!
+//! A test runs its buses on a `LocalRuntime` of its own thread, through [`block_on`], which waits
+//! for them to be gone before it returns. It runs its zbus clients on zruntime's process-wide
+//! runtime, which a helper thread runs.
+//!
 //! [`with`] and [`with_bus`] stop the bus and remove its socket file before they look at the
 //! outcome of the test. A test that panics skips this clean-up and leaves the socket file behind.
 
 use std::{
+    cell::RefCell,
     env::temp_dir,
     future::{Future, IntoFuture},
     os::unix::net::UnixStream,
@@ -14,10 +19,44 @@ use std::{
 };
 
 use futures_util::future::{join, select, Either};
-use zbus::{connection, Address, Connection, OwnedGuid};
-use zruntime::{Event, SharedRuntime, Task};
+use zbus::{connection, fdo::ConnectionCredentials, Address, Connection, OwnedGuid};
+use zruntime::{Event, Local, LocalRuntime, SharedRuntime, Task};
 
-use crate::{bus::Bus, peer::SEND_TIMEOUT, peers::Peers};
+use crate::{
+    bus::Bus,
+    peer::SEND_TIMEOUT,
+    peers::{Peers, WeakPeers},
+};
+
+/// Run `future` to completion on a `LocalRuntime` of the calling thread.
+///
+/// The runtime runs the buses that `future` creates, with all of their tasks. The zbus clients that
+/// `future` builds run on zruntime's process-wide runtime, on its helper thread: zbus picks that
+/// runtime for a connection built from inside a `LocalRuntime`.
+///
+/// Once `future` is done, this waits until every bus that it created is gone, with all of its
+/// tasks, and only then returns. It holds the output of `future` meanwhile, so an output that holds
+/// a client or a bus keeps that bus there, and the wait fails.
+///
+/// # Panics
+///
+/// If the runtime can't be created, if the calling thread runs a runtime already, or if a bus
+/// outlives `future` by more than [`WAIT`]. A client that `future` leaves connected, or a task of
+/// the bus that never ends, makes a bus outlive `future`.
+pub fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    let runtime = LocalRuntime::new().expect("Failed to create the runtime of the buses");
+    let _tracking = Tracking::start();
+
+    runtime.block_on(async {
+        let output = future.await;
+        until_gone(&runtime).await;
+
+        output
+    })
+}
 
 /// Set up the tracing subscriber, once per process.
 ///
@@ -79,19 +118,27 @@ impl TestBus {
         &self.peers
     }
 
-    /// The GUID of the bus.
-    pub fn guid(&self) -> &OwnedGuid {
-        &self.guid
-    }
-
     /// Connect a client through the bus's listening socket.
     pub async fn connect(&self) -> zbus::Result<Connection> {
         connect(&self.address).await
     }
 
-    /// Connect a client to this bus with [`connect_as`].
+    /// Connect a client of `uid`, numbered `id`, to this bus. The client connects over a pair of
+    /// sockets, not through the bus's listening socket.
+    ///
+    /// The client belongs to that user, whichever user runs the test. Its credentials, as its
+    /// socket reports them, are those of the user that runs the test.
     pub async fn connect_as(&self, id: usize, uid: u32) -> anyhow::Result<Connection> {
-        connect_as(&self.peers, &self.guid, id, uid).await
+        let (ours, theirs) = UnixStream::pair()?;
+        let credentials = ConnectionCredentials::from_socket(&theirs)?;
+        let adding = self
+            .peers
+            .add(&self.guid, id, theirs, credentials, SEND_TIMEOUT, uid);
+        let connecting = connection::Builder::unix_stream(ours).build();
+        let (added, conn) = join(adding, connecting).await;
+        added?;
+
+        Ok(conn?)
     }
 }
 
@@ -100,19 +147,20 @@ pub struct Running {
     /// The event that stops the bus when it is notified.
     stop: Event,
     /// The task that runs the bus, and gives it back once it is stopped.
-    task: Task<Bus, zruntime::Shared>,
+    task: Task<Bus, Local>,
 }
 
 impl Running {
-    /// Run `bus` until [`Running::stop`].
+    /// Run `bus` until [`Running::stop`], in a task of the `LocalRuntime` that the calling thread
+    /// runs, as in [`block_on`].
     ///
     /// # Panics
     ///
-    /// The task panics if the bus stops on its own.
+    /// If the calling thread runs no `LocalRuntime`. The task panics if the bus stops on its own.
     pub fn new(mut bus: Bus) -> Self {
         let stop = Event::new();
         let stopped = stop.listen();
-        let task = zruntime::spawn(async move {
+        let task = zruntime::spawn_local(async move {
             {
                 let running = pin!(bus.run());
                 match select(stopped, running).await {
@@ -147,31 +195,6 @@ pub async fn connect(address: &str) -> zbus::Result<Connection> {
     connection::Builder::address(address).build().await
 }
 
-/// Connect a client of `uid`, numbered `id`, to the bus that has `peers` and `guid`. The client
-/// connects over a pair of sockets, not through the bus's listening socket.
-///
-/// The client belongs to that user, whichever user runs the test.
-pub async fn connect_as(
-    peers: &Peers,
-    guid: &OwnedGuid,
-    id: usize,
-    uid: u32,
-) -> anyhow::Result<Connection> {
-    let (ours, theirs) = UnixStream::pair()?;
-    let adding = peers.add(
-        guid,
-        id,
-        connection::Builder::unix_stream(theirs),
-        SEND_TIMEOUT,
-        uid,
-    );
-    let connecting = connection::Builder::unix_stream(ours).build();
-    let (added, conn) = join(adding, connecting).await;
-    added?;
-
-    Ok(conn?)
-}
-
 /// Await `future` for at most [`WAIT`].
 ///
 /// # Panics
@@ -203,6 +226,67 @@ pub fn socket_path() -> PathBuf {
         .collect();
 
     temp_dir().join(name)
+}
+
+/// Note the bus of `peers` for [`block_on`] to wait for, if `block_on` runs on this thread.
+pub(crate) fn track(peers: &Peers) {
+    BUSES.with_borrow_mut(|buses| {
+        if let Some(buses) = buses {
+            buses.push(peers.downgrade());
+        }
+    });
+}
+
+/// While this lives, the buses that the thread creates are noted in [`BUSES`]. Once it is dropped,
+/// including when a panic unwinds, they no longer are.
+struct Tracking;
+
+impl Tracking {
+    /// Note the buses that the thread creates from now on, none so far.
+    fn start() -> Self {
+        BUSES.set(Some(Vec::new()));
+
+        Self
+    }
+}
+
+impl Drop for Tracking {
+    fn drop(&mut self) {
+        BUSES.set(None);
+    }
+}
+
+/// Wait until the buses that the thread created while [`block_on`] runs on it are gone, with all
+/// of their tasks.
+///
+/// This looks every [`LOOK`], on `runtime`, which runs the buses.
+///
+/// # Panics
+///
+/// If a bus is still there after [`WAIT`].
+async fn until_gone(runtime: &LocalRuntime) {
+    let gone = async {
+        while BUSES.with_borrow(|buses| buses.iter().flatten().any(|bus| bus.upgrade().is_some())) {
+            runtime.sleep(LOOK).await;
+        }
+    };
+    if runtime.timeout(WAIT, gone).await.is_err() {
+        panic!(
+            "A bus outlived the test by more than {WAIT:?}: a client that the test left connected, \
+             or a task of the bus that never ends, holds it"
+        );
+    }
+}
+
+/// How often [`until_gone`] looks whether the buses are gone.
+const LOOK: Duration = Duration::from_millis(10);
+
+thread_local! {
+    /// The buses that the thread created while [`block_on`] runs on it.
+    ///
+    /// It is `None` while no `block_on` runs on the thread, as in the benchmarks or in the busd
+    /// binary that the tests run. Those note nothing.
+    static BUSES: RefCell<Option<Vec<WeakPeers>>> = const { RefCell::new(None) };
 }
 
 /// Run `bus` while `test` runs against it at `address`, then stop the bus and clean up after it.

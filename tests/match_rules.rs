@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use anyhow::ensure;
 use busd::testing::{init_tracing, with_bus};
 use futures_util::TryStreamExt;
@@ -20,7 +22,7 @@ const INTERFACE: &str = "org.zbus.MatchRules";
 fn signals_to_well_known_names() {
     init_tracing();
 
-    zruntime::block_on(with_bus(signals_to_well_known_names_));
+    busd::testing::block_on(with_bus(signals_to_well_known_names_));
 }
 
 async fn signals_to_well_known_names_(address: String) -> anyhow::Result<()> {
@@ -72,7 +74,7 @@ async fn signals_to_well_known_names_(address: String) -> anyhow::Result<()> {
 fn signals_to_others() {
     init_tracing();
 
-    zruntime::block_on(with_bus(signals_to_others_));
+    busd::testing::block_on(with_bus(signals_to_others_));
 }
 
 async fn signals_to_others_(address: String) -> anyhow::Result<()> {

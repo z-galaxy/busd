@@ -394,8 +394,10 @@ impl NameRegistry {
     }
 }
 
-/// A change of a name's owner, which the bus signals. See
-/// [`crate::peers::Peers::notify_name_changes`].
+/// A change of a name's owner, which the bus signals.
+///
+/// The bus sends `NameOwnerChanged` to all, `NameLost` to the old owner, if any, and
+/// `NameAcquired` to the new owner, if any.
 #[derive(Debug)]
 pub struct NameOwnerChanged {
     name: OwnedBusName,

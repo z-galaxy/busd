@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::{
+    cell::{RefCell, RefMut},
+    rc::Rc,
+};
 
 use zruntime::Event;
 #[cfg(target_os = "linux")]
@@ -10,17 +13,18 @@ use zruntime::EventListener;
 ///
 /// A handle: cheap to clone, and the clones share the counts.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Chores {
-    inner: Arc<Inner>,
+pub(crate) struct Chores {
+    inner: Rc<Inner>,
 }
 
 impl Chores {
     /// Note a chore of the bus, under way until the returned guard goes.
     ///
-    /// A chore is work that the bus does on its own, besides forwarding the messages of its peers
-    /// and answering the calls to it, and that sends messages, such as its clean-up after a peer
-    /// that goes. A hand-over waits for them.
-    pub(super) fn start(&self) -> Chore {
+    /// A chore is work that the bus does on its own, besides forwarding the messages of its peers,
+    /// and that sends messages, such as its clean-up after a peer that goes. A call to the bus is a
+    /// chore too, from the moment its caller's task queues it for the bus until the bus has
+    /// answered it. A hand-over waits for them.
+    pub(crate) fn start(&self) -> Chore {
         {
             let mut counts = self.inner.counts();
             counts.running += 1;
@@ -40,6 +44,12 @@ impl Chores {
     /// The number of clients whose connections the bus is setting up.
     pub(super) fn handshakes(&self) -> usize {
         self.inner.counts().connecting
+    }
+
+    /// The number of chores under way.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn running(&self) -> usize {
+        self.inner.counts().running
     }
 
     /// A listener that is notified when the next chore or handshake ends. A chore or a handshake
@@ -102,16 +112,15 @@ impl Drop for Connecting {
 
 #[derive(Debug, Default)]
 struct Inner {
-    counts: Mutex<Counts>,
+    counts: RefCell<Counts>,
     /// Notified when a chore or a handshake ends, that is when a [`Chore`] or a [`Connecting`]
     /// guard is dropped. Starting a chore or a handshake changes `counts` without notifying.
     changed: Event,
 }
 
 impl Inner {
-    fn counts(&self) -> MutexGuard<'_, Counts> {
-        // Nothing can panic while the lock is held.
-        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    fn counts(&self) -> RefMut<'_, Counts> {
+        self.counts.borrow_mut()
     }
 }
 

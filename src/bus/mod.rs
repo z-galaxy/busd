@@ -1,27 +1,22 @@
-use crate::{debug, trace, warn};
+use crate::{debug, warn};
 use anyhow::{bail, Context, Ok, Result};
 #[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::{
     env,
     path::{Path, PathBuf},
+    rc::Rc,
     str::FromStr,
-    sync::Arc,
     time::Duration,
 };
-use zbus::{
-    address::Transport,
-    connection::{self, socket::Channel},
-    fdo::ConnectionCredentials,
-    Address, Connection, Guid, OwnedGuid,
-};
-use zruntime::spawn;
+use zbus::{address::Transport, fdo::ConnectionCredentials, Address, Guid, OwnedGuid};
+use zruntime::spawn_local;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod handover;
 mod listener;
 #[cfg(target_os = "linux")]
-pub use crate::peers::handover::{ClientHandover, OwnHandover};
+pub use crate::peers::handover::ClientHandover;
 #[cfg(target_os = "linux")]
 pub use handover::{Handover, STOP_TIMEOUT};
 use listener::Listener;
@@ -30,19 +25,16 @@ mod systemd;
 #[cfg(target_os = "linux")]
 pub use systemd::STORE_KEY;
 
-use crate::{
-    fdo::{self, DBus, Monitoring, Stats},
-    peer::SEND_TIMEOUT,
-    peers::{Peers, Us},
-    policy::Policy,
-};
+use crate::{peer::SEND_TIMEOUT, peers::Peers, policy::Policy};
 
 /// The bus.
 ///
-/// The bus, and every connection it serves, runs on [zruntime]. Create and run it from inside
-/// [`zruntime::block_on`], so that the calling thread runs all of them, on its own runtime.
+/// The bus runs on a [zruntime] `LocalRuntime`, with all of its tasks and the connections of its
+/// clients. Create and run it from inside [`LocalRuntime::block_on`], or from a task of that
+/// runtime. The thread that runs the runtime then runs all of them.
 ///
 /// [zruntime]: https://docs.rs/zruntime
+/// [`LocalRuntime::block_on`]: zruntime::Runtime::block_on
 #[derive(Debug)]
 pub struct Bus {
     listener: Listener,
@@ -52,9 +44,6 @@ pub struct Bus {
     /// The number of the last client that connected.
     next_id: usize,
     send_timeout: Duration,
-    /// The end of the bus's own connection on which the bus answers the calls to it. The bus
-    /// keeps this end for as long as it lives.
-    _self_conn: Connection,
 }
 
 impl Bus {
@@ -72,7 +61,7 @@ impl Bus {
         };
         let listener = Listener::bind(unix).await?;
 
-        Self::new(listener, guid).await
+        Self::new(listener, guid)
     }
 
     /// Create a bus that listens on `listener`, a socket that listens already, such as the one that
@@ -84,7 +73,7 @@ impl Bus {
     pub async fn for_listener(listener: OwnedFd) -> Result<Self> {
         let listener = Listener::from_fd(listener, false)?;
 
-        Self::new(listener, Guid::generate().into()).await
+        Self::new(listener, Guid::generate().into())
     }
 
     pub fn address(&self) -> &Address {
@@ -119,8 +108,8 @@ impl Bus {
     /// It is the open policy of [`Policy::default`] unless set otherwise, or given to
     /// `Bus::take_over`, and applies to the clients that connect from then on, and to those that
     /// the bus has.
-    pub async fn set_policy(&mut self, policy: Arc<Policy>) {
-        self.peers.set_policy(policy).await;
+    pub fn set_policy(&mut self, policy: Rc<Policy>) {
+        self.peers.set_policy(policy);
     }
 
     /// Have `ReloadConfig` set the policy that `read` returns, as [`Bus::set_policy`] does.
@@ -130,11 +119,11 @@ impl Bus {
     /// itself wait for the reload, as the bus answers them one at a time. If `read` fails, so does
     /// the call, and the bus goes on by the policy that it has. Until the bus is told how to read
     /// its policy again, it has nothing to reload, and the call fails.
-    pub async fn set_reload<F>(&mut self, read: F)
+    pub fn set_reload<F>(&mut self, read: F)
     where
-        F: Fn() -> Result<Policy> + Send + Sync + 'static,
+        F: FnMut() -> Result<Policy> + Send + 'static,
     {
-        self.peers.set_reload(read).await;
+        self.peers.set_reload(read);
     }
 
     /// Accept new connections, and serve each client in its own task, until the listening socket
@@ -164,38 +153,16 @@ impl Bus {
     }
 
     /// Create a bus with `guid` that listens on `listener`.
-    async fn new(listener: Listener, guid: OwnedGuid) -> Result<Self> {
+    fn new(listener: Listener, guid: OwnedGuid) -> Result<Self> {
         let address = listener.address(&guid)?;
-        let peers = Peers::new();
-        let us = Self::us(
-            &peers,
-            &guid,
-            #[cfg(target_os = "linux")]
-            None,
-        )
-        .await?;
-        let service_conn = peers.add_us(us).await?;
-        trace!("Self-dial connection created.");
+        let peers = Peers::new(guid.clone());
 
-        Ok(Self::with_peers(
-            listener,
-            address,
-            guid,
-            peers,
-            service_conn,
-        ))
+        Ok(Self::with_peers(listener, address, guid, peers))
     }
 
-    /// Create a bus with `guid` that listens on `listener` at `address`. `peers` are its peers,
-    /// the bus itself among them, and `service_conn` is the connection on which it serves the
-    /// D-Bus API.
-    fn with_peers(
-        listener: Listener,
-        address: Address,
-        guid: OwnedGuid,
-        peers: Peers,
-        service_conn: Connection,
-    ) -> Self {
+    /// Create a bus with `guid` that listens on `listener` at `address`, and whose peers are
+    /// `peers`.
+    fn with_peers(listener: Listener, address: Address, guid: OwnedGuid, peers: Peers) -> Self {
         Self {
             listener,
             address,
@@ -203,47 +170,7 @@ impl Bus {
             guid,
             next_id: 0,
             send_timeout: SEND_TIMEOUT,
-            _self_conn: service_conn,
         }
-    }
-
-    /// The connection on which a bus of `guid` serves the D-Bus API to `peers`, as a peer of its
-    /// own, for the bus to be added to them: a new one, or the one that `own` hands over, with the
-    /// calls to the bus that the instance before this one didn't answer, and what it sent and
-    /// didn't pass on.
-    ///
-    /// The bus talks to itself over a channel, which is in this process alone.
-    pub(crate) async fn us(
-        peers: &Peers,
-        guid: &OwnedGuid,
-        #[cfg(target_os = "linux")] own: Option<OwnHandover>,
-    ) -> Result<Us> {
-        trace!("Creating self-dial connection.");
-        #[cfg(target_os = "linux")]
-        let handed_over = own.map(|OwnHandover { service, peer }| {
-            let take_over = connection::Builder::take_over;
-
-            (take_over(service), take_over(peer))
-        });
-        #[cfg(not(target_os = "linux"))]
-        let handed_over = None;
-        let (service, peer) = handed_over.unwrap_or_else(|| {
-            let (service, peer) = Channel::pair();
-            let end = |socket| connection::Builder::authenticated_socket(socket, guid.clone());
-
-            (
-                end(service).p2p().unique_name(fdo::BUS_NAME),
-                end(peer).p2p(),
-            )
-        });
-        let stream = peer.build_message_stream().await?;
-        let service = service
-            .name(fdo::BUS_NAME)
-            .serve_at(fdo::DBus::PATH, DBus::new(peers, guid.clone()))
-            .serve_at(fdo::Monitoring::PATH, Monitoring::new(peers))
-            .serve_at(fdo::Stats::PATH, Stats::new(peers));
-
-        Ok(Us { service, stream })
     }
 
     async fn accept_next(&mut self) -> Result<()> {
@@ -254,16 +181,18 @@ impl Bus {
         let peers = self.peers.clone();
         let guid = self.guid.clone();
         let send_timeout = self.send_timeout;
-        spawn(async move {
+        spawn_local(async move {
             let res = async {
                 // The client is an object of its user from the start, before its handshake, so
-                // its user is the one that its socket tells, as zbus looks it up for a connection
-                // over the socket, for a client in another PID namespace too.
-                let creds = ConnectionCredentials::of_peer(&stream).await?;
-                let uid = creds.unix_user_id().context("The client has no user")?;
-                let gids = creds.unix_group_ids().map_or(&[][..], Vec::as_slice);
+                // its user is the one that its socket tells, for a client in another PID namespace
+                // too. The peer keeps these credentials.
+                let credentials = ConnectionCredentials::from_socket(&stream)?;
+                let uid = credentials
+                    .unix_user_id()
+                    .context("The client has no user")?;
+                let gids = credentials.unix_group_ids().map_or(&[][..], Vec::as_slice);
                 // Dropping the stream closes the connection.
-                if !peers.may_connect(uid, gids).await {
+                if !peers.may_connect(uid, gids) {
                     warn!(
                         "Refusing a client of the user {uid}, as the policy does not let it \
                          connect"
@@ -271,9 +200,9 @@ impl Bus {
 
                     return Ok(());
                 }
-                let builder = connection::Builder::unix_stream(stream);
-
-                peers.add(&guid, id, builder, send_timeout, uid).await
+                peers
+                    .add(&guid, id, stream, credentials, send_timeout, uid)
+                    .await
             };
             if let Err(e) = res.await {
                 warn!("Failed to establish connection: {}", e);
@@ -288,12 +217,6 @@ impl Bus {
         self.next_id += 1;
 
         self.next_id
-    }
-}
-
-impl Drop for Bus {
-    fn drop(&mut self) {
-        self.peers.remove_us();
     }
 }
 

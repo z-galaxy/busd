@@ -73,10 +73,11 @@ Also please ensure that code is formatted correctly by running:
 cargo +nightly fmt --all
 ```
 
-and clippy doesn't see anything wrong with the code:
+and clippy doesn't see anything wrong with the code, both as it ships and as the tests build it:
 
 ```sh
 cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 Please note that there are times when clippy is wrong and you know what you are doing. In such

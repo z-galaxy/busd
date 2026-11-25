@@ -21,14 +21,14 @@ use zbus::{
     },
     Address, OwnedGuid,
 };
-use zruntime::{fs::remove_file, Shared, SharedRuntime};
+use zruntime::{fs::remove_file, Local};
 
-use crate::{debug, info, warn};
+use crate::{debug, info, runtime, warn};
 
 /// The socket on which the bus accepts its clients.
 #[derive(Debug)]
 pub(super) struct Listener {
-    socket: zruntime::net::unix::UnixListener<Shared>,
+    socket: zruntime::net::unix::UnixListener<Local>,
     /// When the listener last logged a warning that accepting a connection failed.
     warned: Option<Instant>,
     /// The socket to which clients connect to reach the bus.
@@ -80,8 +80,7 @@ impl Listener {
         let socket = std::os::unix::net::UnixListener::from(socket);
         let unix = unix_socket(&socket.local_addr()?)?;
         info!("Listening on the UNIX socket `{unix}` that was passed.");
-        let runtime = SharedRuntime::current()?;
-        let socket = zruntime::net::unix::UnixListener::from_std(&runtime, socket)?;
+        let socket = zruntime::net::unix::UnixListener::from_std(&runtime::local()?, socket)?;
 
         Ok(Self {
             socket,
@@ -124,8 +123,9 @@ impl Listener {
                         info!("Accepting new connections again.");
                     }
 
-                    // zbus is given the standard library stream that the zruntime one wraps, and
-                    // the connection then drives it on the runtime it is built on.
+                    // The client's connection is given the standard library stream that the
+                    // zruntime one wraps, and drives that stream on the runtime that serves the
+                    // client.
                     return Ok(stream.into_std());
                 }
                 Err(e) => e,
@@ -228,8 +228,8 @@ fn unix_addr(unix: &Unix) -> Result<(SocketAddr, UnixSocket)> {
     })
 }
 
-async fn unix_stream(addr: SocketAddr) -> Result<zruntime::net::unix::UnixListener<Shared>> {
-    let runtime = SharedRuntime::current()?;
+async fn unix_stream(addr: SocketAddr) -> Result<zruntime::net::unix::UnixListener<Local>> {
+    let runtime = runtime::local()?;
     let std_listener = zruntime::unblock(move || bind(&addr)).await?;
 
     zruntime::net::unix::UnixListener::from_std(&runtime, std_listener).map_err(Into::into)

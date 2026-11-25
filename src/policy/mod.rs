@@ -252,7 +252,7 @@ pub struct PeerPolicy {
 }
 
 impl PeerPolicy {
-    /// The policy of the bus itself, as a peer: it may own, send and receive everything.
+    /// The policy of the bus itself: it may own, send and receive everything.
     pub fn unrestricted() -> Self {
         Self::new(vec![Arc::new(RuleSet::unrestricted())])
     }

@@ -1,6 +1,7 @@
 use std::{
+    cell::{RefCell, RefMut},
     collections::{hash_map::Entry, HashMap},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    rc::{Rc, Weak},
 };
 
 /// The users of the bus, by uid.
@@ -9,43 +10,43 @@ use std::{
 /// user, as dbus-broker does, so that a uid can't have the bus keep more of them by opening more
 /// connections.
 #[derive(Debug)]
-pub struct Users(Arc<Mutex<Registry>>);
+pub struct Users(Rc<RefCell<Registry>>);
 
 impl Users {
     /// No users yet, each of which the bus may keep `max_objects` objects for.
     pub fn new(max_objects: usize) -> Self {
-        Self(Arc::new(Mutex::new(Registry {
+        Self(Rc::new(RefCell::new(Registry {
             users: HashMap::default(),
             max_objects,
         })))
     }
 
     /// The user of `uid`.
-    pub fn user(&self, uid: u32) -> Arc<User> {
-        let mut registry = lock(&self.0);
+    pub fn user(&self, uid: u32) -> Rc<User> {
+        let mut registry = self.0.borrow_mut();
         if let Some(user) = registry.users.get(&uid).and_then(Weak::upgrade) {
             return user;
         }
-        let user = Arc::new(User {
+        let user = Rc::new(User {
             uid,
-            objects: Mutex::new(Objects {
+            objects: RefCell::new(Objects {
                 max: registry.max_objects,
                 used: 0,
                 shares: HashMap::default(),
             }),
-            users: Arc::downgrade(&self.0),
+            users: Rc::downgrade(&self.0),
         });
-        registry.users.insert(uid, Arc::downgrade(&user));
+        registry.users.insert(uid, Rc::downgrade(&user));
 
         user
     }
 
     /// Let the bus keep `max` objects for each user, from now on.
     pub fn set_max_objects(&self, max: usize) {
-        // The users are updated once the lock of the registry is let go of, as the last reference
-        // to one of them may be among these, and a user takes the lock as it goes.
+        // The users are updated once the registry is no longer borrowed, as the last reference to
+        // one of them may be among these, and a user borrows the registry as it goes.
         let users: Vec<_> = {
-            let mut registry = lock(&self.0);
+            let mut registry = self.0.borrow_mut();
             registry.max_objects = max;
 
             registry.users.values().filter_map(Weak::upgrade).collect()
@@ -60,9 +61,9 @@ impl Users {
 #[derive(Debug)]
 pub struct User {
     uid: u32,
-    objects: Mutex<Objects>,
+    objects: RefCell<Objects>,
     /// The registry of the user, which it leaves as it goes.
-    users: Weak<Mutex<Registry>>,
+    users: Weak<RefCell<Registry>>,
 }
 
 impl User {
@@ -71,8 +72,8 @@ impl User {
         self.uid
     }
 
-    fn objects(&self) -> MutexGuard<'_, Objects> {
-        lock(&self.objects)
+    fn objects(&self) -> RefMut<'_, Objects> {
+        self.objects.borrow_mut()
     }
 }
 
@@ -81,7 +82,7 @@ impl Drop for User {
         let Some(registry) = self.users.upgrade() else {
             return;
         };
-        let mut registry = lock(&registry);
+        let mut registry = registry.borrow_mut();
         // Another user of the same uid may have taken the place of this one already.
         if let Entry::Occupied(user) = registry.users.entry(self.uid) {
             if user.get().strong_count() == 0 {
@@ -95,7 +96,7 @@ impl Drop for User {
 /// against the objects of the first user for as long as it is kept.
 #[derive(Debug)]
 pub struct Charge {
-    user: Arc<User>,
+    user: Rc<User>,
     actor: u32,
 }
 
@@ -109,7 +110,7 @@ impl Charge {
     /// left, where `n` is the number of users that have any objects of `user`, counting `actor` in.
     /// So, once charged, `actor` has at most 1/(n + 1) of the objects of `user` that no other user
     /// has: those left and its own.
-    pub fn new(user: &Arc<User>, actor: &User) -> Option<Self> {
+    pub fn new(user: &Rc<User>, actor: &User) -> Option<Self> {
         let objects = user.objects();
         let left = objects.max.saturating_sub(objects.used);
         let share = objects.shares.get(&actor.uid).copied().unwrap_or(0);
@@ -135,12 +136,12 @@ impl Charge {
     /// another order, and with others that went meanwhile, which the share that [`Charge::new`]
     /// allows `actor` depends on.
     #[cfg(target_os = "linux")]
-    pub(crate) fn taken_over(user: &Arc<User>, actor: &User) -> Self {
+    pub(crate) fn taken_over(user: &Rc<User>, actor: &User) -> Self {
         Self::kept(user, actor, user.objects())
     }
 
     /// Charge an object to `user`, on behalf of `actor`, in `objects`, the account of `user`.
-    fn kept(user: &Arc<User>, actor: &User, mut objects: MutexGuard<'_, Objects>) -> Self {
+    fn kept(user: &Rc<User>, actor: &User, mut objects: RefMut<'_, Objects>) -> Self {
         objects.used += 1;
         *objects.shares.entry(actor.uid).or_default() += 1;
         drop(objects);
@@ -192,11 +193,6 @@ struct Objects {
     ///
     /// Only the users that have any are in here, so that its length counts them.
     shares: HashMap<u32, usize, foldhash::fast::RandomState>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // Nothing can panic while one of the locks is held.
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -284,8 +280,8 @@ mod tests {
     fn registry() {
         let users = Users::new(1);
         let user = users.user(1);
-        assert!(Arc::ptr_eq(&user, &users.user(1)));
-        assert!(!Arc::ptr_eq(&user, &users.user(2)));
+        assert!(Rc::ptr_eq(&user, &users.user(1)));
+        assert!(!Rc::ptr_eq(&user, &users.user(2)));
 
         // The maximum applies to the users that there are already, and to those after them.
         users.set_max_objects(2);
@@ -296,11 +292,11 @@ mod tests {
 
         // A user that goes leaves the registry.
         drop(user);
-        assert!(lock(&users.0).users.is_empty());
+        assert!(users.0.borrow().users.is_empty());
     }
 
     /// Charge objects to `user` on behalf of `actor` until it may have no more.
-    fn charge_all(user: &Arc<User>, actor: &User) -> Vec<Charge> {
+    fn charge_all(user: &Rc<User>, actor: &User) -> Vec<Charge> {
         std::iter::from_fn(|| Charge::new(user, actor)).collect()
     }
 }

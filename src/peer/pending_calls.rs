@@ -1,8 +1,9 @@
 use std::{
+    cell::{RefCell, RefMut},
     collections::{hash_map::Entry, HashMap},
     mem,
     num::NonZeroU32,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    rc::Rc,
 };
 
 use zbus::names::OwnedUniqueName;
@@ -27,16 +28,16 @@ use crate::user::{Charge, User};
 /// goes, when it becomes a monitor, before its task does.
 #[derive(Debug)]
 pub struct PendingCalls {
-    calls: Mutex<Calls>,
+    calls: RefCell<Calls>,
     /// The user of the peer, which the records are objects of.
-    user: Arc<User>,
+    user: Rc<User>,
 }
 
 impl PendingCalls {
     /// No calls yet, to a peer of `user`.
-    pub fn new(user: Arc<User>) -> Self {
+    pub fn new(user: Rc<User>) -> Self {
         Self {
-            calls: Mutex::default(),
+            calls: RefCell::default(),
             user,
         }
     }
@@ -47,7 +48,7 @@ impl PendingCalls {
     pub fn add(
         &self,
         caller_id: usize,
-        caller: &Arc<Caller>,
+        caller: &Rc<Caller>,
         serial: NonZeroU32,
     ) -> Result<(), Refusal> {
         match self.calls().entry((caller_id, serial)) {
@@ -82,7 +83,7 @@ impl PendingCalls {
     pub(crate) fn add_handed_over(
         &self,
         caller_id: usize,
-        caller: &Arc<Caller>,
+        caller: &Rc<Caller>,
         serial: NonZeroU32,
     ) {
         let charge = Charge::taken_over(&self.user, &caller.user);
@@ -116,9 +117,8 @@ impl PendingCalls {
             .map(|((_, serial), call)| (call.caller.unique_name.clone(), serial))
     }
 
-    fn calls(&self) -> MutexGuard<'_, Calls> {
-        // Nothing can panic while the lock is held.
-        self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    fn calls(&self) -> RefMut<'_, Calls> {
+        self.calls.borrow_mut()
     }
 }
 
@@ -126,13 +126,13 @@ impl PendingCalls {
 #[derive(Debug)]
 pub struct Caller {
     unique_name: OwnedUniqueName,
-    user: Arc<User>,
+    user: Rc<User>,
 }
 
 impl Caller {
     /// The peer of `unique_name`, of `user`.
-    pub fn new(unique_name: OwnedUniqueName, user: Arc<User>) -> Arc<Self> {
-        Arc::new(Self { unique_name, user })
+    pub fn new(unique_name: OwnedUniqueName, user: Rc<User>) -> Rc<Self> {
+        Rc::new(Self { unique_name, user })
     }
 
     /// The user of the peer.
@@ -163,7 +163,7 @@ type Calls = HashMap<(usize, NonZeroU32), Call, foldhash::fast::RandomState>;
 /// The record of a call that waits for its reply.
 #[derive(Debug)]
 struct Call {
-    caller: Arc<Caller>,
+    caller: Rc<Caller>,
     /// The record, as an object that the bus keeps for the user of the callee.
     _charge: Charge,
 }

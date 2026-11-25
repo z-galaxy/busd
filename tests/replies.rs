@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::{
     future::Future,
     num::{NonZeroU32, NonZeroUsize},
@@ -30,7 +32,7 @@ const OBJECTS_PER_USER: usize = 16;
 fn forged_reply() {
     init_tracing();
 
-    zruntime::block_on(with_bus(forged_reply_));
+    busd::testing::block_on(with_bus(forged_reply_));
 }
 
 /// A call that waits on a peer that goes gets a `NoReply` error from the bus.
@@ -40,7 +42,7 @@ fn forged_reply() {
 fn callee_leaves() {
     init_tracing();
 
-    zruntime::block_on(with_bus(callee_leaves_));
+    busd::testing::block_on(with_bus(callee_leaves_));
 }
 
 /// A call that waits on a peer that becomes a monitor gets a `NoReply` error from the bus.
@@ -50,7 +52,7 @@ fn callee_leaves() {
 fn callee_becomes_monitor() {
     init_tracing();
 
-    zruntime::block_on(with_bus(callee_becomes_monitor_));
+    busd::testing::block_on(with_bus(callee_becomes_monitor_));
 }
 
 /// A call with the serial of another of its caller that waits on the same callee is refused, and
@@ -63,7 +65,7 @@ fn callee_becomes_monitor() {
 fn same_serial() {
     init_tracing();
 
-    zruntime::block_on(with_bus(same_serial_));
+    busd::testing::block_on(with_bus(same_serial_));
 }
 
 /// A call to a name that no peer has gets an error from the bus: `ServiceUnknown`, as the bus
@@ -75,7 +77,7 @@ fn same_serial() {
 fn absent_destination() {
     init_tracing();
 
-    zruntime::block_on(with_bus(absent_destination_));
+    busd::testing::block_on(with_bus(absent_destination_));
 }
 
 /// The bus keeps no more than [`OBJECTS_PER_USER`] objects for a user: its clients, and the calls
@@ -90,7 +92,7 @@ fn absent_destination() {
 fn quota_exceeded() {
     init_tracing();
 
-    zruntime::block_on(with_bus(quota_exceeded_));
+    busd::testing::block_on(with_bus(quota_exceeded_));
 }
 
 async fn forged_reply_(address: String) -> anyhow::Result<()> {
@@ -177,7 +179,9 @@ async fn same_serial_(address: String) -> anyhow::Result<()> {
     let mut replies = MessageStream::from(&caller);
     let (callee, mut calls) = callee(&address).await?;
     let callee_name = callee.unique_name().unwrap();
-    let serial = NonZeroU32::new(7).unwrap();
+    // A serial above the serial of the caller's `Hello`, so that `next_reply` leaves out the reply
+    // to the `Hello`.
+    let serial = serial_now()?;
     let call = |member| {
         Message::method_call(PATH, member)
             .destination(callee_name)
@@ -206,7 +210,7 @@ async fn same_serial_(address: String) -> anyhow::Result<()> {
             "the callee got `{got}` rather than `{member}`"
         );
     }
-    let refused = next_reply(&mut replies).await?;
+    let refused = next_reply(&mut replies, serial).await?;
     let header = refused.header();
     ensure!(
         header.message_type() == message::Type::Error
@@ -253,7 +257,7 @@ async fn same_serial_(address: String) -> anyhow::Result<()> {
         let reply = Message::method_return(&third.header()).build(&answer)?;
         callee.send(&reply).await?;
     }
-    let reply = next_reply(&mut replies).await?;
+    let reply = next_reply(&mut replies, serial).await?;
     let answer: String = reply.body().deserialize()?;
     ensure!(answer == "first", "the caller got the `{answer}` reply");
     for answer in ["first", "second"] {
@@ -275,7 +279,7 @@ async fn same_serial_(address: String) -> anyhow::Result<()> {
     // all, and the caller gets the reply of the bus to its own call after it.
     DBusProxy::new(&callee).await?.get_id().await?;
     DBusProxy::new(&caller).await?.get_id().await?;
-    let reply = next_reply(&mut replies).await?;
+    let reply = next_reply(&mut replies, serial).await?;
     let header = reply.header();
     ensure!(
         header.sender().unwrap() == busd::fdo::BUS_NAME,
@@ -294,6 +298,8 @@ async fn absent_destination_(address: String) -> anyhow::Result<()> {
         .await?;
     let caller = connect(&address).await?;
     let mut replies = MessageStream::from(&caller);
+    // `since` picks the replies to the calls from here on, among those that come out of the stream.
+    let since = serial_now()?;
     // No client of the bus ever gets this unique name, and no one owns the well-known one.
     let destinations = [":busd.4294967295", "org.zbus.Replies.Absent"];
     let call = |destination, flags| {
@@ -321,7 +327,7 @@ async fn absent_destination_(address: String) -> anyhow::Result<()> {
         ] {
             let msg = call(destination, flags)?;
             caller.send(&msg).await?;
-            let error = next_reply(&mut replies).await?;
+            let error = next_reply(&mut replies, since).await?;
             let header = error.header();
             ensure!(
                 header.message_type() == message::Type::Error
@@ -361,6 +367,9 @@ async fn quota_exceeded_(address: String) -> anyhow::Result<()> {
     let mut replies = MessageStream::from(&caller);
     let other = connect(&address).await?;
     let mut other_replies = MessageStream::from(&other);
+    // `since` picks the replies to the calls from here on, among those that come out of the two
+    // streams.
+    let since = serial_now()?;
     let (other_callee, mut other_calls) = callee(&address).await?;
     let mut owner_changes = owner_changes(&other_callee).await?;
     let (callee, mut calls) = callee(&address).await?;
@@ -399,10 +408,10 @@ async fn quota_exceeded_(address: String) -> anyhow::Result<()> {
     // One more call, to either callee, from either client of the user, gets an error from the bus.
     for callee in [&callee, &other_callee] {
         let msg = call(callee, "Beyond", message::Flags::empty())?;
-        exceeds_quota(&caller, &mut replies, msg).await?;
+        exceeds_quota(&caller, &mut replies, since, msg).await?;
     }
     let msg = call(&callee, "Other", message::Flags::empty())?;
-    exceeds_quota(&other, &mut other_replies, msg).await?;
+    exceeds_quota(&other, &mut other_replies, since, msg).await?;
     // Nor does the user get another connection.
     ensure!(
         connect(&address).await.is_err(),
@@ -414,7 +423,7 @@ async fn quota_exceeded_(address: String) -> anyhow::Result<()> {
     callee
         .send(&Message::method_return(&first.header()).build(&())?)
         .await?;
-    let reply = next_reply(&mut replies).await?;
+    let reply = next_reply(&mut replies, since).await?;
     ensure!(
         reply.message_type() == message::Type::MethodReturn,
         "the caller got {reply:?}"
@@ -457,13 +466,14 @@ async fn quota_exceeded_(address: String) -> anyhow::Result<()> {
     gone(&mut owner_changes, &caller_name).await?;
     let late = connect(&address).await?;
     let mut late_replies = MessageStream::from(&late);
+    let late_since = serial_now()?;
     for _ in 0..room {
         late.send(&call(&callee, "Late", message::Flags::empty())?)
             .await?;
         expect_call(&mut calls, "Late").await?;
     }
     let msg = call(&callee, "Beyond", message::Flags::empty())?;
-    exceeds_quota(&late, &mut late_replies, msg).await?;
+    exceeds_quota(&late, &mut late_replies, late_since, msg).await?;
 
     Ok(())
 }
@@ -493,14 +503,16 @@ async fn gone(owner_changes: &mut MessageStream, name: &str) -> anyhow::Result<(
 }
 
 /// Have `conn` send `msg`, which the bus refuses, as the quota of the user of `conn` is exceeded,
-/// and take the error of the bus to it out of `replies`.
+/// and take the error of the bus to it out of `replies`. The error is the next reply there to a
+/// call of serial `since` or after.
 async fn exceeds_quota(
     conn: &Connection,
     replies: &mut MessageStream,
+    since: NonZeroU32,
     msg: Message,
 ) -> anyhow::Result<()> {
     conn.send(&msg).await?;
-    let error = next_reply(replies).await?;
+    let error = next_reply(replies, since).await?;
     let header = error.header();
     ensure!(
         header.message_type() == message::Type::Error
@@ -538,17 +550,39 @@ async fn callee(address: &str) -> anyhow::Result<(Connection, MessageStream)> {
     Ok((callee, calls))
 }
 
-/// The next reply, or error, in `msgs`.
-async fn next_reply(msgs: &mut MessageStream) -> anyhow::Result<Message> {
+/// The next reply, or error, in `msgs`, to a call of serial `since` or after.
+///
+/// The replies to the calls made before are left out. A stream made after a call returned can still
+/// yield the reply to that call, such as the reply to the `Hello` that the client sent as it
+/// connected. zbus hands a reply to its caller before it hands it to the streams. When the
+/// connection reads its socket on another thread, the caller can go on and make the stream in
+/// between.
+async fn next_reply(msgs: &mut MessageStream, since: NonZeroU32) -> anyhow::Result<Message> {
     loop {
         let msg = msgs.try_next().await?.context("no reply")?;
-        if matches!(
+        let is_reply = matches!(
             msg.message_type(),
             message::Type::MethodReturn | message::Type::Error
-        ) {
+        );
+        let earlier = msg
+            .header()
+            .reply_serial()
+            .is_some_and(|replied| replied < since);
+        if is_reply && !earlier {
             return Ok(msg);
         }
     }
+}
+
+/// A serial above those that zbus gave the messages built so far, and below those that it gives the
+/// messages built from now on.
+///
+/// It is the serial of a message built now, since zbus numbers the messages of a process in the
+/// order that they are built.
+fn serial_now() -> zbus::Result<NonZeroU32> {
+    let msg = Message::method_call(PATH, "Unsent").build(&())?;
+
+    Ok(msg.primary_header().serial_num())
 }
 
 /// Run `test` against a bus of its own, at an address that it is given, which keeps

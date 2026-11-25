@@ -2,7 +2,8 @@ sequenceDiagram
     participant old as busd that stops
     participant systemd
     systemd->>old: SIGTERM
-    Note over old: pauses its clients, and<br/>hands their connections over
+    Note over old: pauses its clients, and<br/>answers the calls that it took
+    Note over old: hands the connections<br/>of its clients over
     old->>systemd: FDSTORE busd/state (the memfd of the hand-over)
     old->>systemd: FDSTORE busd/fds (each queue socket)
     old->>systemd: BARRIER

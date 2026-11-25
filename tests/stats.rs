@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use std::{
     collections::{HashMap, HashSet},
     os::unix::net::UnixStream,
@@ -28,7 +30,7 @@ use zbus::{
 fn get_stats() {
     init_tracing();
 
-    zruntime::block_on(with_bus(get_stats_));
+    busd::testing::block_on(with_bus(get_stats_));
 }
 
 /// A client that authenticated but did not call `Hello`, and one that did not even authenticate,
@@ -39,7 +41,7 @@ fn get_stats() {
 fn incomplete_connections() {
     init_tracing();
 
-    zruntime::block_on(with_bus(incomplete_connections_));
+    busd::testing::block_on(with_bus(incomplete_connections_));
 }
 
 /// A client that becomes a monitor stays an active connection, and its match rules, and those that
@@ -51,7 +53,7 @@ fn incomplete_connections() {
 fn becoming_a_monitor() {
     init_tracing();
 
-    zruntime::block_on(with_bus(becoming_a_monitor_));
+    busd::testing::block_on(with_bus(becoming_a_monitor_));
 }
 
 /// `GetConnectionStats` counts the match rules and the names of one connection, and their peaks,
@@ -63,7 +65,7 @@ fn becoming_a_monitor() {
 fn get_connection_stats() {
     init_tracing();
 
-    zruntime::block_on(with_bus(get_connection_stats_));
+    busd::testing::block_on(with_bus(get_connection_stats_));
 }
 
 /// `GetAllMatchRules` lists the match rules of each connection, as many as `GetStats` counts, in a
@@ -75,7 +77,7 @@ fn get_connection_stats() {
 fn get_all_match_rules() {
     init_tracing();
 
-    zruntime::block_on(with_bus(get_all_match_rules_));
+    busd::testing::block_on(with_bus(get_all_match_rules_));
 }
 
 /// The bus introspects the three methods of the interface with the signatures of the
@@ -86,7 +88,7 @@ fn get_all_match_rules() {
 fn introspection() {
     init_tracing();
 
-    zruntime::block_on(with_bus(introspection_));
+    busd::testing::block_on(with_bus(introspection_));
 }
 
 async fn get_stats_(address: String) -> anyhow::Result<()> {

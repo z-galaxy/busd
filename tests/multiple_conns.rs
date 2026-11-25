@@ -1,3 +1,5 @@
+#![cfg(feature = "testing")]
+
 use busd::testing::{init_tracing, with_bus};
 use futures_util::future::join_all;
 use ntest::timeout;
@@ -10,7 +12,7 @@ use zbus::connection;
 fn multi_connect() {
     init_tracing();
 
-    zruntime::block_on(with_bus(|address| async move {
+    busd::testing::block_on(with_bus(|address| async move {
         multi_clients_connect(&address).await
     }));
 }
