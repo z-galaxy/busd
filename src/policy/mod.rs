@@ -184,7 +184,7 @@ impl Policy {
                 continue;
             };
             for (rule, position) in rules.iter().zip(first..) {
-                add_rule(rule, Rank { context, position }, set, &mut connect, ids);
+                set.add_rule(rule, Rank { context, position }, &mut connect, ids);
             }
         }
         connect.sort_by_key(|rule| std::cmp::Reverse(rule.rank));
@@ -397,63 +397,6 @@ impl fmt::Display for Facts<'_> {
     }
 }
 
-/// Add `rule`, of `rank`, to `set`, or to `connect` if it is a connect rule, unless it is left
-/// out.
-fn add_rule(
-    rule: &config::Rule,
-    rank: Rank,
-    set: &mut RuleSet,
-    connect: &mut Vec<ConnectRule>,
-    ids: &Ids,
-) {
-    let allow = rule.access == Access::Allow;
-    match &rule.operation {
-        Operation::Connect(target) => {
-            if !matches!(rank.context, Context::Default | Context::Mandatory) {
-                warn!(
-                    "Ignoring a connect rule outside the default and mandatory contexts: \
-                     {target:?}"
-                );
-                return;
-            }
-            let Some(target) = Target::new(target, ids) else {
-                warn!("Ignoring a connect rule of an unknown user or group: {target:?}");
-                return;
-            };
-            connect.push(ConnectRule {
-                rank,
-                allow,
-                target,
-            });
-        }
-        Operation::Own(ownership) => {
-            // The parser gives a name to every own rule that it keeps.
-            let Some(name) = &ownership.own else {
-                return;
-            };
-            set.own.push(OwnRule {
-                rank,
-                allow,
-                name: name.clone(),
-            });
-        }
-        Operation::Send(send) => {
-            let Some(rule) = MessageRule::new(rank, allow, &send.message, send.broadcast) else {
-                debug!("Ignoring a send rule about replies: {send:?}");
-                return;
-            };
-            set.send.add(send.destination.as_ref(), rule);
-        }
-        Operation::Receive(receive) => {
-            let Some(rule) = MessageRule::new(rank, allow, &receive.message, None) else {
-                debug!("Ignoring a receive rule about replies: {receive:?}");
-                return;
-            };
-            set.receive.add(receive.sender.as_ref(), rule);
-        }
-    }
-}
-
 /// The rank of a rule: by its context first, and then by its position in the configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
@@ -545,6 +488,64 @@ impl RuleSet {
         set.receive.sort();
 
         set
+    }
+
+    /// Add `rule`, of `rank`, to the set, or to `connect` if it is a connect rule, unless it is
+    /// left out.
+    fn add_rule(
+        &mut self,
+        rule: &config::Rule,
+        rank: Rank,
+        connect: &mut Vec<ConnectRule>,
+        ids: &Ids,
+    ) {
+        let allow = rule.access == Access::Allow;
+        match &rule.operation {
+            Operation::Connect(target) => {
+                if !matches!(rank.context, Context::Default | Context::Mandatory) {
+                    warn!(
+                        "Ignoring a connect rule outside the default and mandatory contexts: \
+                         {target:?}"
+                    );
+                    return;
+                }
+                let Some(target) = Target::new(target, ids) else {
+                    warn!("Ignoring a connect rule of an unknown user or group: {target:?}");
+                    return;
+                };
+                connect.push(ConnectRule {
+                    rank,
+                    allow,
+                    target,
+                });
+            }
+            Operation::Own(ownership) => {
+                // The parser gives a name to every own rule that it keeps.
+                let Some(name) = &ownership.own else {
+                    return;
+                };
+                self.own.push(OwnRule {
+                    rank,
+                    allow,
+                    name: name.clone(),
+                });
+            }
+            Operation::Send(send) => {
+                let Some(rule) = MessageRule::new(rank, allow, &send.message, send.broadcast)
+                else {
+                    debug!("Ignoring a send rule about replies: {send:?}");
+                    return;
+                };
+                self.send.add(send.destination.as_ref(), rule);
+            }
+            Operation::Receive(receive) => {
+                let Some(rule) = MessageRule::new(rank, allow, &receive.message, None) else {
+                    debug!("Ignoring a receive rule about replies: {receive:?}");
+                    return;
+                };
+                self.receive.add(receive.sender.as_ref(), rule);
+            }
+        }
     }
 
     /// The set, sorted and shared, or nothing if it has no rules.
