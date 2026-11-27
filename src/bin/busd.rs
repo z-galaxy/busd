@@ -98,7 +98,7 @@ async fn run(
     #[cfg(target_os = "linux")] passed: zoter::Passed,
 ) -> Result<()> {
     let mut args = Args::parse();
-    let config = read_config(&args, Path::new(SESSION_CONFIG))?;
+    let config = args.read_config(Path::new(SESSION_CONFIG))?;
 
     let address = args
         .address
@@ -142,7 +142,7 @@ async fn run(
 
     // `ReloadConfig` has the bus read its configuration again, for the policy of it.
     bus.set_reload(move || {
-        let config = read_config(&args, Path::new(SESSION_CONFIG))?;
+        let config = args.read_config(Path::new(SESSION_CONFIG))?;
 
         Ok(policy_of(&config))
     });
@@ -233,34 +233,36 @@ fn raise_fd_limit() -> rustix::io::Result<()> {
     setrlimit(Resource::Nofile, limit)
 }
 
-/// The configuration that `args` ask for.
-///
-/// The session configuration, at `session_config`, only has to exist if `--session` asks for it:
-/// without `--config`, `--session` or `--system`, the bus goes by its built-in defaults if there's
-/// no file there, as on a system without the reference implementation of D-Bus.
-fn read_config(args: &Args, session_config: &Path) -> Result<Config> {
-    let path = if args.system {
-        Path::new(SYSTEM_CONFIG)
-    } else if let Some(path) = &args.config {
-        path.as_path()
-    } else if args.session
-        || session_config
-            .try_exists()
-            .with_context(|| format!("failed to look for {}", session_config.display()))?
-    {
-        session_config
-    } else {
-        info!(
-            "configuration file {} doesn't exist, going by the defaults",
-            session_config.display(),
-        );
+impl Args {
+    /// The configuration that the arguments ask for.
+    ///
+    /// The session configuration, at `session_config`, only has to exist if `--session` asks for
+    /// it: without `--config`, `--session` or `--system`, the bus goes by its built-in defaults if
+    /// there's no file there, as on a system without the reference implementation of D-Bus.
+    fn read_config(&self, session_config: &Path) -> Result<Config> {
+        let path = if self.system {
+            Path::new(SYSTEM_CONFIG)
+        } else if let Some(path) = &self.config {
+            path.as_path()
+        } else if self.session
+            || session_config
+                .try_exists()
+                .with_context(|| format!("failed to look for {}", session_config.display()))?
+        {
+            session_config
+        } else {
+            info!(
+                "configuration file {} doesn't exist, going by the defaults",
+                session_config.display(),
+            );
 
-        return Ok(Config::default());
-    };
-    info!("reading configuration file {} ...", path.display());
+            return Ok(Config::default());
+        };
+        info!("reading configuration file {} ...", path.display());
 
-    Config::read_file(path)
-        .with_context(|| format!("failed to read configuration file {}", path.display()))
+        Config::read_file(path)
+            .with_context(|| format!("failed to read configuration file {}", path.display()))
+    }
 }
 
 /// The policy of `config`, for a bus that runs as the user of this process.
@@ -285,12 +287,12 @@ mod tests {
     use busd::config::Config;
     use clap::{CommandFactory, Parser};
 
-    use super::{read_config, Args};
+    use super::Args;
 
     #[test]
     fn missing_session_config_is_optional() {
         let args = Args::parse_from(["busd"]);
-        let config = read_config(&args, Path::new(MISSING)).unwrap();
+        let config = args.read_config(Path::new(MISSING)).unwrap();
 
         assert_eq!(config, Config::default());
     }
@@ -298,7 +300,7 @@ mod tests {
     #[test]
     fn missing_session_config_asked_for() {
         let args = Args::parse_from(["busd", "--session"]);
-        let error = read_config(&args, Path::new(MISSING)).unwrap_err();
+        let error = args.read_config(Path::new(MISSING)).unwrap_err();
 
         assert!(error.to_string().contains(MISSING), "{error:?}");
     }
@@ -307,7 +309,7 @@ mod tests {
     fn unreachable_session_config() {
         // Whether there's a file at this path can't be known, as its parent is a file.
         let args = Args::parse_from(["busd"]);
-        let error = read_config(&args, Path::new(UNREACHABLE)).unwrap_err();
+        let error = args.read_config(Path::new(UNREACHABLE)).unwrap_err();
 
         assert!(error.to_string().contains(UNREACHABLE), "{error:?}");
     }
@@ -316,7 +318,7 @@ mod tests {
     fn missing_config() {
         // The session configuration exists, so that `--config` has to take precedence over it.
         let args = Args::parse_from(["busd", "--config", MISSING]);
-        let error = read_config(&args, Path::new(SESSION)).unwrap_err();
+        let error = args.read_config(Path::new(SESSION)).unwrap_err();
 
         assert!(error.to_string().contains(MISSING), "{error:?}");
     }
@@ -324,7 +326,7 @@ mod tests {
     #[test]
     fn session_config() {
         let args = Args::parse_from(["busd"]);
-        let config = read_config(&args, Path::new(SESSION)).unwrap();
+        let config = args.read_config(Path::new(SESSION)).unwrap();
 
         assert_eq!(config, Config::read_file(SESSION).unwrap());
         assert_ne!(config, Config::default());
