@@ -78,7 +78,7 @@ impl Peers {
                 // The look and the seal take one borrow of the routing, as adding a client does, so
                 // that no client comes in between.
                 let mut routing = self.routing_mut();
-                if paused(&mut routing) {
+                if routing.all_paused() {
                     routing.sealed = true;
                     self.inner.sealed.notify(usize::MAX);
 
@@ -480,12 +480,12 @@ pub(crate) struct NameState {
     pub(crate) owners: Vec<(OwnedUniqueName, bool, bool)>,
 }
 
-/// Whether the task that served each peer of `routing`, and each monitor, gave the reader of its
-/// messages back, as the bus pauses.
-fn paused(routing: &mut Routing) -> bool {
-    routing
-        .clients_mut()
-        .all(|client| client.paused().is_some())
+impl Routing {
+    /// Whether the task that served each peer, and each monitor, gave the reader of its messages
+    /// back, as the bus pauses.
+    fn all_paused(&mut self) -> bool {
+        self.clients_mut().all(|client| client.paused().is_some())
+    }
 }
 
 impl Client {

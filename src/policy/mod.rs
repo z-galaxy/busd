@@ -127,6 +127,15 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// The policy of `config`, for a bus that runs as the user of this process, with the names of
+    /// users and groups resolved by [`Ids::read`].
+    ///
+    /// This blocks, as it looks the names of the users and groups of the policy up in the files of
+    /// the system.
+    pub fn of(config: &Config) -> Self {
+        Self::new(config, &Ids::read(), rustix::process::getuid().as_raw())
+    }
+
     /// The policy of `config`, the `<policy>` elements of the configuration in its order, for a
     /// bus that runs as the user `bus_uid`, with the names of users and groups resolved by `ids`.
     ///
@@ -175,7 +184,7 @@ impl Policy {
                 continue;
             };
             for (rule, position) in rules.iter().zip(first..) {
-                add_rule(rule, Rank { context, position }, set, &mut connect, ids);
+                set.add_rule(rule, Rank { context, position }, &mut connect, ids);
             }
         }
         connect.sort_by_key(|rule| std::cmp::Reverse(rule.rank));
@@ -262,7 +271,7 @@ impl PeerPolicy {
         let mut best = None;
         for set in &self.sets {
             for rule in &set.own {
-                if outranked(rule.rank, best) {
+                if rule.rank.outranked_by(best) {
                     break;
                 }
                 let matches = match &rule.name {
@@ -388,68 +397,18 @@ impl fmt::Display for Facts<'_> {
     }
 }
 
-/// Add `rule`, of `rank`, to `set`, or to `connect` if it is a connect rule, unless it is left
-/// out.
-fn add_rule(
-    rule: &config::Rule,
-    rank: Rank,
-    set: &mut RuleSet,
-    connect: &mut Vec<ConnectRule>,
-    ids: &Ids,
-) {
-    let allow = rule.access == Access::Allow;
-    match &rule.operation {
-        Operation::Connect(target) => {
-            if !matches!(rank.context, Context::Default | Context::Mandatory) {
-                warn!(
-                    "Ignoring a connect rule outside the default and mandatory contexts: \
-                     {target:?}"
-                );
-                return;
-            }
-            let Some(target) = Target::new(target, ids) else {
-                warn!("Ignoring a connect rule of an unknown user or group: {target:?}");
-                return;
-            };
-            connect.push(ConnectRule {
-                rank,
-                allow,
-                target,
-            });
-        }
-        Operation::Own(ownership) => {
-            // The parser gives a name to every own rule that it keeps.
-            let Some(name) = &ownership.own else {
-                return;
-            };
-            set.own.push(OwnRule {
-                rank,
-                allow,
-                name: name.clone(),
-            });
-        }
-        Operation::Send(send) => {
-            let Some(rule) = MessageRule::new(rank, allow, &send.message, send.broadcast) else {
-                debug!("Ignoring a send rule about replies: {send:?}");
-                return;
-            };
-            set.send.add(send.destination.as_ref(), rule);
-        }
-        Operation::Receive(receive) => {
-            let Some(rule) = MessageRule::new(rank, allow, &receive.message, None) else {
-                debug!("Ignoring a receive rule about replies: {receive:?}");
-                return;
-            };
-            set.receive.add(receive.sender.as_ref(), rule);
-        }
-    }
-}
-
 /// The rank of a rule: by its context first, and then by its position in the configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
     context: Context,
     position: usize,
+}
+
+impl Rank {
+    /// Whether a rule of this rank ranks below `best`, so that it can't change the answer.
+    fn outranked_by(self, best: Option<Verdict>) -> bool {
+        best.is_some_and(|best| best.rank > self)
+    }
 }
 
 /// The context of a rule, from the lowest rank up.
@@ -536,6 +495,64 @@ impl RuleSet {
         set.receive.sort();
 
         set
+    }
+
+    /// Add `rule`, of `rank`, to the set, or to `connect` if it is a connect rule, unless it is
+    /// left out.
+    fn add_rule(
+        &mut self,
+        rule: &config::Rule,
+        rank: Rank,
+        connect: &mut Vec<ConnectRule>,
+        ids: &Ids,
+    ) {
+        let allow = rule.access == Access::Allow;
+        match &rule.operation {
+            Operation::Connect(target) => {
+                if !matches!(rank.context, Context::Default | Context::Mandatory) {
+                    warn!(
+                        "Ignoring a connect rule outside the default and mandatory contexts: \
+                         {target:?}"
+                    );
+                    return;
+                }
+                let Some(target) = Target::new(target, ids) else {
+                    warn!("Ignoring a connect rule of an unknown user or group: {target:?}");
+                    return;
+                };
+                connect.push(ConnectRule {
+                    rank,
+                    allow,
+                    target,
+                });
+            }
+            Operation::Own(ownership) => {
+                // The parser gives a name to every own rule that it keeps.
+                let Some(name) = &ownership.own else {
+                    return;
+                };
+                self.own.push(OwnRule {
+                    rank,
+                    allow,
+                    name: name.clone(),
+                });
+            }
+            Operation::Send(send) => {
+                let Some(rule) = MessageRule::new(rank, allow, &send.message, send.broadcast)
+                else {
+                    debug!("Ignoring a send rule about replies: {send:?}");
+                    return;
+                };
+                self.send.add(send.destination.as_ref(), rule);
+            }
+            Operation::Receive(receive) => {
+                let Some(rule) = MessageRule::new(rank, allow, &receive.message, None) else {
+                    debug!("Ignoring a receive rule about replies: {receive:?}");
+                    return;
+                };
+                self.receive.add(receive.sender.as_ref(), rule);
+            }
+        }
     }
 
     /// The set, sorted and shared, or nothing if it has no rules.
@@ -630,7 +647,7 @@ impl MessageRules {
             }
         }
         for (prefix, rule) in &self.prefix {
-            if outranked(rule.rank, *best) {
+            if rule.rank.outranked_by(*best) {
                 break;
             }
             if names.iter().any(|name| covers(prefix, name.as_str())) && rule.matches(facts) {
@@ -644,7 +661,7 @@ impl MessageRules {
 /// Make `best` the verdict of the first of `rules` that matches `facts`, if it outranks `best`.
 fn find_first(rules: &[MessageRule], facts: &Facts<'_>, best: &mut Option<Verdict>) {
     for rule in rules {
-        if outranked(rule.rank, *best) {
+        if rule.rank.outranked_by(*best) {
             return;
         }
         if rule.matches(facts) {
@@ -768,11 +785,6 @@ fn holds(expected: &Option<String>, actual: Option<&str>) -> bool {
 fn covers(prefix: &str, name: &str) -> bool {
     name.strip_prefix(prefix)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-}
-
-/// Whether a rule of `rank` ranks below `best`, so that it can't change the answer.
-fn outranked(rank: Rank, best: Option<Verdict>) -> bool {
-    best.is_some_and(|best| best.rank > rank)
 }
 
 /// The answer of `best`, the verdict of the highest-ranking rule that matches, if any.

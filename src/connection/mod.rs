@@ -89,7 +89,7 @@ impl Connection {
     ) -> zbus::Result<(Reader, Self)> {
         let socket = Rc::new(UnixStream::from_std(&runtime::local()?, socket)?);
         let mut reader = Reader::new(socket.clone());
-        let fd_passing = handshake::authenticate(&mut reader, &socket, guid, uid).await?;
+        let fd_passing = reader.authenticate(guid, uid).await?;
 
         Ok((reader, Self::new(socket, unique_name, fd_passing, timeout)))
     }

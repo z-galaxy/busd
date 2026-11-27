@@ -2,7 +2,9 @@
 
 use std::{
     collections::VecDeque,
-    fmt, io, mem,
+    fmt,
+    future::poll_fn,
+    io, mem,
     os::fd::{AsFd, OwnedFd},
     pin::Pin,
     rc::Rc,
@@ -14,11 +16,15 @@ use futures_util::Stream;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use zbus::{
     message::{Header, PrimaryHeader},
-    Message,
+    Message, OwnedGuid,
 };
 use zruntime::{net::unix::UnixStream, Local};
 
-use super::socket;
+use super::{
+    handshake::{write_answer, Server},
+    socket,
+};
+use crate::trace;
 
 /// The reader of a client's messages.
 ///
@@ -195,6 +201,37 @@ impl Reader {
         poll(&mut fds, Some(&Timespec::default())).is_ok() && fds[0].revents().intersects(closed)
     }
 
+    /// Authenticate the client whose messages the reader reads, and return whether it asked to pass
+    /// file descriptors.
+    ///
+    /// The bus is the server of `guid`. It authenticates the client with the `EXTERNAL` mechanism,
+    /// as the user `uid` that its socket reports. What the client sent after `BEGIN` stays in the
+    /// reader, as the start of its first message.
+    ///
+    /// The bus answers each command of the client on the reader's socket, as zbus 6.4's server
+    /// answers it. A client that claims to be another user is rejected, and may try again. The
+    /// handshake fails, without an answer, on:
+    ///
+    /// - a line that holds no command that zbus knows, such as `AUTH` with a mechanism that zbus
+    ///   doesn't support;
+    /// - a line that isn't UTF-8;
+    /// - a first line that doesn't start with the 0 byte that a client sends first;
+    /// - a user that isn't a number;
+    /// - a line that doesn't end with `\r\n`, or that doesn't fit in 4 KiB;
+    /// - the fourth read of the handshake that brings file descriptors;
+    /// - EOF.
+    pub(super) async fn authenticate(&mut self, guid: &OwnedGuid, uid: u32) -> zbus::Result<bool> {
+        let mut server = Server::new(guid, uid);
+        loop {
+            let line = poll_fn(|cx| self.poll_line(cx)).await?;
+            let Some(answer) = server.answer_line(&line)? else {
+                return Ok(server.fd_passing());
+            };
+            trace!("Answering `{answer}`");
+            write_answer(&self.socket, &answer).await?;
+        }
+    }
+
     /// The next line of the handshake, without the `\r\n` that ends it, as soon as it is whole.
     ///
     /// The line is read into the same buffer as the messages. So the first message is read from
@@ -203,7 +240,7 @@ impl Reader {
     ///
     /// A line that has a `\n` without a `\r` before it is an error, and so is a line that doesn't
     /// fit in the 4 KiB buffer. EOF is an error too.
-    pub(super) fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<zbus::Result<Vec<u8>>> {
+    fn poll_line(&mut self, cx: &mut Context<'_>) -> Poll<zbus::Result<Vec<u8>>> {
         loop {
             let buffered = &self.buffer[self.start..self.end];
             if let Some(lf) = buffered.iter().position(|&byte| byte == b'\n') {
