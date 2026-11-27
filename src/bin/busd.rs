@@ -9,13 +9,7 @@ use std::{
     rc::Rc,
 };
 
-use busd::{
-    bus,
-    config::Config,
-    error, info,
-    policy::{Ids, Policy},
-    warn,
-};
+use busd::{bus, config::Config, error, info, policy::Policy, warn};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -106,7 +100,7 @@ async fn run(
         .or_else(|| config.listen.as_ref().map(ToString::to_string));
 
     // Before the bus serves anyone, as building the policy reads files.
-    let policy = Rc::new(policy_of(&config));
+    let policy = Rc::new(Policy::of(&config));
 
     // SIGTERM is what service managers, such as systemd, and `kill` send to stop a service. Taking
     // the signals over before the bus listens, and so before anyone can tell that it's ready, has
@@ -144,7 +138,7 @@ async fn run(
     bus.set_reload(move || {
         let config = args.read_config(Path::new(SESSION_CONFIG))?;
 
-        Ok(policy_of(&config))
+        Ok(Policy::of(&config))
     });
 
     {
@@ -263,14 +257,6 @@ impl Args {
         Config::read_file(path)
             .with_context(|| format!("failed to read configuration file {}", path.display()))
     }
-}
-
-/// The policy of `config`, for a bus that runs as the user of this process.
-///
-/// This blocks, as it looks the names of the users and groups of the policy up in the files of
-/// the system.
-fn policy_of(config: &Config) -> Policy {
-    Policy::new(config, &Ids::read(), rustix::process::getuid().as_raw())
 }
 
 const SESSION_CONFIG: &str = "/usr/share/dbus-1/session.conf";

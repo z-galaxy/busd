@@ -127,6 +127,15 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// The policy of `config`, for a bus that runs as the user of this process, with the names of
+    /// users and groups resolved by [`Ids::read`].
+    ///
+    /// This blocks, as it looks the names of the users and groups of the policy up in the files of
+    /// the system.
+    pub fn of(config: &Config) -> Self {
+        Self::new(config, &Ids::read(), rustix::process::getuid().as_raw())
+    }
+
     /// The policy of `config`, the `<policy>` elements of the configuration in its order, for a
     /// bus that runs as the user `bus_uid`, with the names of users and groups resolved by `ids`.
     ///
