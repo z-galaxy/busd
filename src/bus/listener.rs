@@ -274,7 +274,7 @@ fn replace_stale(
     if !is_socket {
         return Err(error);
     }
-    match probe(path)? {
+    match Probe::of(path)? {
         Probe::InUse => return Err(error),
         Probe::Gone => return UnixListener::bind_addr(addr),
         Probe::Stale => (),
@@ -291,28 +291,6 @@ fn replace_stale(
     UnixListener::bind_addr(addr)
 }
 
-/// What connecting to the socket at `path` tells of it.
-///
-/// The connection doesn't wait: a bus that listens on the socket but doesn't accept the connections
-/// that wait for it, as one that hangs, would have it wait for ever.
-#[cfg(target_os = "linux")]
-fn probe(path: &Path) -> io::Result<Probe> {
-    use rustix::{
-        io::{ioctl_fionbio, Errno},
-        net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType},
-    };
-
-    let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
-    ioctl_fionbio(&socket, true)?;
-    let addr = SocketAddrUnix::new(path)?;
-
-    io::Result::Ok(match connect(&socket, &addr) {
-        Err(Errno::CONNREFUSED) => Probe::Stale,
-        Err(Errno::NOENT) => Probe::Gone,
-        _ => Probe::InUse,
-    })
-}
-
 /// What connecting to a socket file tells of it.
 #[cfg(target_os = "linux")]
 enum Probe {
@@ -322,6 +300,30 @@ enum Probe {
     Stale,
     /// The file went in the meantime.
     Gone,
+}
+
+#[cfg(target_os = "linux")]
+impl Probe {
+    /// What connecting to the socket at `path` tells of it.
+    ///
+    /// The connection doesn't wait: a bus that listens on the socket but doesn't accept the
+    /// connections that wait for it, as one that hangs, would have it wait for ever.
+    fn of(path: &Path) -> io::Result<Self> {
+        use rustix::{
+            io::{ioctl_fionbio, Errno},
+            net::{connect, socket, AddressFamily, SocketAddrUnix, SocketType},
+        };
+
+        let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+        ioctl_fionbio(&socket, true)?;
+        let addr = SocketAddrUnix::new(path)?;
+
+        io::Result::Ok(match connect(&socket, &addr) {
+            Err(Errno::CONNREFUSED) => Self::Stale,
+            Err(Errno::NOENT) => Self::Gone,
+            _ => Self::InUse,
+        })
+    }
 }
 
 /// The socket that clients connect to, to reach a listener bound to `addr`.
