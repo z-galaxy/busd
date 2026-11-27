@@ -69,7 +69,7 @@ impl Outbox {
             [(_, recipient, share)] => {
                 let dropped = recipient.send(share.of(batch)).await;
 
-                with_recipient(recipient, dropped)
+                recipient.paired_with(dropped)
             }
             sends => {
                 let all = sends
@@ -80,7 +80,7 @@ impl Outbox {
                 sends
                     .iter()
                     .zip(all)
-                    .flat_map(|((_, recipient, _), dropped)| with_recipient(recipient, dropped))
+                    .flat_map(|((_, recipient, _), dropped)| recipient.paired_with(dropped))
                     .collect()
             }
         };
@@ -91,11 +91,11 @@ impl Outbox {
     }
 }
 
-/// `msgs`, each with `recipient`.
-fn with_recipient(recipient: &Recipient, msgs: Vec<Message>) -> Vec<(Recipient, Message)> {
-    msgs.into_iter()
-        .map(|msg| (recipient.clone(), msg))
-        .collect()
+impl Recipient {
+    /// `msgs`, each paired with a clone of the recipient.
+    fn paired_with(&self, msgs: Vec<Message>) -> Vec<(Self, Message)> {
+        msgs.into_iter().map(|msg| (self.clone(), msg)).collect()
+    }
 }
 
 /// The messages of a batch that a recipient gets.
