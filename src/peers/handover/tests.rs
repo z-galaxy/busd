@@ -435,7 +435,7 @@ fn pause_ends_once_the_clients_paused() {
                 .inner
                 .routing
                 .try_borrow_mut()
-                .is_ok_and(|mut routing| paused(&mut routing))
+                .is_ok_and(|mut routing| routing.all_paused())
         })
         .await;
         assert!(
@@ -569,7 +569,7 @@ fn monitor_that_goes_while_the_bus_pauses_holds_it_up_no_longer() {
                 .inner
                 .routing
                 .try_borrow_mut()
-                .is_ok_and(|mut routing| paused(&mut routing))
+                .is_ok_and(|mut routing| routing.all_paused())
         })
         .await;
         assert!(
