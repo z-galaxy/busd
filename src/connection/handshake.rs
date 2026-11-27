@@ -1,7 +1,10 @@
 //! The server end of the handshake that opens a client's connection: the authentication protocol of
 //! D-Bus, with the `EXTERNAL` mechanism only, as zbus's server goes through it.
+//!
+//! The reader of the client's messages runs the handshake, with `Reader::authenticate`: it reads
+//! the client's lines, has the [`Server`] answer each, and writes the answers back.
 
-use std::{future::poll_fn, io::IoSlice, os::fd::AsFd, str};
+use std::{io::IoSlice, os::fd::AsFd, str};
 
 use zbus::{
     connection::handshake::{AuthMechanism, Command},
@@ -9,45 +12,39 @@ use zbus::{
 };
 use zruntime::{net::unix::UnixStream, Local};
 
-use super::{socket, Reader};
+use super::socket;
 use crate::trace;
 
-/// Authenticate the client whose messages `reader` reads, and return whether it asked to pass file
-/// descriptors.
+/// The state of a client's handshake with the server of `guid`.
 ///
-/// The bus is the server of `guid`. It authenticates the client with the `EXTERNAL` mechanism, as
-/// the user `uid` that its socket reports. What the client sent after `BEGIN` stays in `reader`, as
-/// the start of its first message.
-///
-/// The bus answers each command of the client on `stream`, as zbus 6.4's server answers it. A
-/// client that claims to be another user is rejected, and may try again. The handshake fails,
-/// without an answer, on:
-///
-/// - a line that holds no command that zbus knows, such as `AUTH` with a mechanism that zbus
-///   doesn't support;
-/// - a line that isn't UTF-8;
-/// - a first line that doesn't start with the 0 byte that a client sends first;
-/// - a user that isn't a number;
-/// - a line that doesn't end with `\r\n`, or that doesn't fit in 4 KiB;
-/// - the fourth read of the handshake that brings file descriptors;
-/// - EOF.
-pub(super) async fn authenticate(
-    reader: &mut Reader,
-    stream: &UnixStream<Local>,
-    guid: &OwnedGuid,
+/// The server authenticates the user `uid`.
+pub(super) struct Server<'g> {
+    guid: &'g OwnedGuid,
     uid: u32,
-) -> zbus::Result<bool> {
-    let mut server = Server {
-        guid,
-        uid,
-        awaiting: Awaiting::Auth,
-        fd_passing: false,
-    };
-    let mut first = true;
-    loop {
-        let line = poll_fn(|cx| reader.poll_line(cx)).await?;
-        let command = match (first, line.split_first()) {
-            (false, _) => &line[..],
+    awaiting: Awaiting,
+    /// Whether the next line is the client's first, which starts with a 0 byte.
+    first: bool,
+    /// Whether the client asked to pass file descriptors.
+    fd_passing: bool,
+}
+
+impl<'g> Server<'g> {
+    /// The server of `guid`, which authenticates the user `uid`, before the client's first line.
+    pub(super) fn new(guid: &'g OwnedGuid, uid: u32) -> Self {
+        Self {
+            guid,
+            uid,
+            awaiting: Awaiting::Auth,
+            first: true,
+            fd_passing: false,
+        }
+    }
+
+    /// The answer to `line`, the client's next line without the `\r\n` that ends it, none once
+    /// the handshake is done.
+    pub(super) fn answer_line(&mut self, line: &[u8]) -> zbus::Result<Option<Command>> {
+        let command = match (self.first, line.split_first()) {
+            (false, _) => line,
             // The client sends a 0 byte ahead of its first command. The byte is not part of the
             // command.
             (true, Some((0, command))) => command,
@@ -57,31 +54,20 @@ pub(super) async fn authenticate(
                 ))
             }
         };
-        first = false;
+        self.first = false;
         let command: Command = str::from_utf8(command)
             .map_err(|e| zbus::Error::Handshake(e.to_string()))?
             .parse()?;
         trace!("The client sent `{command}` in its handshake");
-        let Some(answer) = server.answer(command)? else {
-            return Ok(server.fd_passing);
-        };
-        trace!("Answering `{answer}`");
-        write(stream, &answer).await?;
+
+        self.answer(command)
     }
-}
 
-/// The state of a client's handshake with the server of `guid`.
-///
-/// The server authenticates the user `uid`.
-struct Server<'g> {
-    guid: &'g OwnedGuid,
-    uid: u32,
-    awaiting: Awaiting,
     /// Whether the client asked to pass file descriptors.
-    fd_passing: bool,
-}
+    pub(super) fn fd_passing(&self) -> bool {
+        self.fd_passing
+    }
 
-impl Server<'_> {
     /// The answer to `command`, none once the handshake is done.
     fn answer(&mut self, command: Command) -> zbus::Result<Option<Command>> {
         let answer = match (self.awaiting, command) {
@@ -153,7 +139,7 @@ enum Awaiting {
 }
 
 /// Write `answer` to the client of `stream`, as a line.
-async fn write(stream: &UnixStream<Local>, answer: &Command) -> zbus::Result<()> {
+pub(super) async fn write_answer(stream: &UnixStream<Local>, answer: &Command) -> zbus::Result<()> {
     let line = format!("{answer}\r\n");
     let mut written = 0;
     while written < line.len() {
