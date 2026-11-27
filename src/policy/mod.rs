@@ -271,7 +271,7 @@ impl PeerPolicy {
         let mut best = None;
         for set in &self.sets {
             for rule in &set.own {
-                if outranked(rule.rank, best) {
+                if rule.rank.outranked_by(best) {
                     break;
                 }
                 let matches = match &rule.name {
@@ -402,6 +402,13 @@ impl fmt::Display for Facts<'_> {
 struct Rank {
     context: Context,
     position: usize,
+}
+
+impl Rank {
+    /// Whether a rule of this rank ranks below `best`, so that it can't change the answer.
+    fn outranked_by(self, best: Option<Verdict>) -> bool {
+        best.is_some_and(|best| best.rank > self)
+    }
 }
 
 /// The context of a rule, from the lowest rank up.
@@ -640,7 +647,7 @@ impl MessageRules {
             }
         }
         for (prefix, rule) in &self.prefix {
-            if outranked(rule.rank, *best) {
+            if rule.rank.outranked_by(*best) {
                 break;
             }
             if names.iter().any(|name| covers(prefix, name.as_str())) && rule.matches(facts) {
@@ -654,7 +661,7 @@ impl MessageRules {
 /// Make `best` the verdict of the first of `rules` that matches `facts`, if it outranks `best`.
 fn find_first(rules: &[MessageRule], facts: &Facts<'_>, best: &mut Option<Verdict>) {
     for rule in rules {
-        if outranked(rule.rank, *best) {
+        if rule.rank.outranked_by(*best) {
             return;
         }
         if rule.matches(facts) {
@@ -778,11 +785,6 @@ fn holds(expected: &Option<String>, actual: Option<&str>) -> bool {
 fn covers(prefix: &str, name: &str) -> bool {
     name.strip_prefix(prefix)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-}
-
-/// Whether a rule of `rank` ranks below `best`, so that it can't change the answer.
-fn outranked(rank: Rank, best: Option<Verdict>) -> bool {
-    best.is_some_and(|best| best.rank > rank)
 }
 
 /// The answer of `best`, the verdict of the highest-ranking rule that matches, if any.
