@@ -180,6 +180,10 @@ fn properties_of_the_bus() {
                 set(&("org.busd.NoSuch", "Features", &empty))?,
                 "UnknownInterface",
             ),
+            (
+                call_to(PATH, PROPERTIES, "Set").build(&(BUS_NAME, "Features"))?,
+                "InvalidArgs",
+            ),
         ] {
             let reply = answer(&conn, &call).await;
             let expected = format!("org.freedesktop.DBus.Error.{error}");
