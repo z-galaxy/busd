@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use zbus::{
     fdo::{Error, Result},
-    message::Header,
+    message::{Body, Header},
     names::{InterfaceName, MemberName},
     Message, Variant,
 };
@@ -48,7 +48,7 @@ impl Driver {
             }
             // None of the properties can be set.
             "Set" => {
-                let (interface, property, _): (InterfaceName<'_>, &str, Variant<'_>) = args(&body)?;
+                let (interface, property) = set_args(&body)?;
                 object.ensure_has(&interface)?;
 
                 Err(unknown_property(property))
@@ -80,6 +80,24 @@ fn value_of(property: &str) -> Variant<'static> {
     };
 
     Variant::from(values)
+}
+
+/// The interface and the property of the call of `Set` whose body is `body`, or the bus's error for
+/// a call with other arguments, as [`args`] gives it.
+///
+/// The value is left unread, as none of the properties can be set: deserialized as a
+/// [`Variant`](enum@Variant), an array in it would take 64 bytes for each of its elements on 64-bit
+/// targets, and a client could so have the bus take 64 times the memory of the arrays of bytes that
+/// it sends (z-galaxy/zbus#2175).
+fn set_args(body: &Body) -> Result<(InterfaceName<'_>, &str)> {
+    if body.signature() != "ssv" {
+        let error = zbus::Error::SignatureMismatch(body.signature().clone(), "`(ssv)`".into());
+
+        return Err(Error::InvalidArgs(error.to_string()));
+    }
+
+    body.deserialize_ignore_signature()
+        .map_err(|e| Error::InvalidArgs(e.to_string()))
 }
 
 impl Object {

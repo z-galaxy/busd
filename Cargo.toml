@@ -160,7 +160,7 @@ features = ["testing"]
 # zbus 6.6 adds API that busd needs. Until it is out, busd builds on a commit of zbus's main.
 [patch.crates-io.zbus]
 git = "https://github.com/z-galaxy/zbus"
-rev = "308526ae305923e9ab1b9a2cf883d94ac5b7587f"
+rev = "33da117fb4914f34caebb99d239ae264de299247"
 
 [profile.release]
 lto = "fat"

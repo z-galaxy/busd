@@ -14,10 +14,7 @@ use std::{
 use futures_util::Stream;
 #[cfg(target_os = "linux")]
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
-use zbus::{
-    message::{Header, PrimaryHeader},
-    Message, OwnedGuid,
-};
+use zbus::{message::PrimaryHeader, Message, OwnedGuid};
 use zruntime::{net::unix::UnixStream, Local};
 
 use super::{
@@ -363,16 +360,10 @@ impl Reader {
     /// The message of `bytes`, which hold exactly one message, with the file descriptors that its
     /// header counts, taken from the front of the waiting FDs.
     fn frame(&mut self, bytes: Vec<u8>) -> zbus::Result<Message> {
-        let count = if self.fds.is_empty() {
-            0
-        } else {
-            // Fewer FDs than the header counts are an error of the message.
-            let count = Header::parse(&bytes)?.unix_fds().unwrap_or(0) as usize;
-
-            count.min(self.fds.len())
-        };
-        let fds = self.fds.drain(..count).collect();
-        let mut taken = count;
+        // Fewer FDs than the header counts are an error of the message, which takes none of them.
+        let waiting = self.fds.len();
+        let msg = Message::from_parts(bytes, &mut self.fds)?;
+        let mut taken = waiting - self.fds.len();
         while let Some(set) = self.fd_sets.front_mut() {
             if *set > taken {
                 *set -= taken;
@@ -382,7 +373,7 @@ impl Reader {
             self.fd_sets.pop_front();
         }
 
-        Message::from_parts(bytes, fds)
+        Ok(msg)
     }
 }
 

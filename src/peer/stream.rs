@@ -181,14 +181,14 @@ fn add_sender(msg: &Message, sender: &UniqueName<'_>) -> zbus::Result<Message> {
     new.resize(body_offset, 0);
     new.extend_from_slice(body);
     // The copy carries duplicates of the FDs of `msg`, as with `with_sender`: `msg` goes with its
-    // own.
-    let fds = data
+    // own. They are as many as its header counts, as that of `msg` did.
+    let mut fds = data
         .fds()
         .iter()
         .map(|fd| fd.as_fd().try_clone_to_owned())
         .collect::<io::Result<_>>()?;
 
-    Message::from_parts(new, fds)
+    Message::from_parts(new, &mut fds)
 }
 
 /// The interface that the specification reserves for the signal that a library raises locally.
