@@ -245,11 +245,16 @@ impl Restore for Handover {
         let kept = table
             .iter()
             .map(|(len, count)| {
-                let (msg, after) = whole.split_at(*len);
+                let (bytes, after) = whole.split_at(*len);
                 whole = after;
-                let fds = fds.by_ref().take(*count).collect();
+                let mut fds: Vec<_> = fds.by_ref().take(*count).collect();
+                let msg = Message::from_parts(bytes.to_vec(), &mut fds).map_err(|_| malformed())?;
+                // The record counts as many FDs for the message as its header does.
+                if !fds.is_empty() {
+                    return Err(malformed());
+                }
 
-                Message::from_parts(msg.to_vec(), fds).map_err(|_| malformed())
+                Ok(msg)
             })
             .collect::<io::Result<_>>()?;
 
